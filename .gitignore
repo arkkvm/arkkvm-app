@@ -1,0 +1,7 @@
+/target
+/.vscode
+
+mise.toml
+
+arm-rockchip830-linux-uclibcgnueabihf/*
+!arm-rockchip830-linux-uclibcgnueabihf/.gitkeep

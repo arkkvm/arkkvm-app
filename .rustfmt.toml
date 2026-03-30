@@ -1,0 +1,6 @@
+edition = "2024"
+
+imports_granularity = "Module"
+reorder_imports = true
+group_imports = "StdExternalCrate"
+use_small_heuristics = "Max"

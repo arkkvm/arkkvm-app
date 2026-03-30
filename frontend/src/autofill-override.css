@@ -1,0 +1,13 @@
+
+/* Override default WebKit autofill styles */
+/* This prevents the browser from automatically filling input fields with yellow background */
+/* The technique uses an extremely long transition delay to effectively disable the autofill styling */
+/* Targets all autofill states: default, hover, focus and active */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+input:-webkit-autofill:active {
+  /* Set a very long delay before applying autofill styles */
+  -webkit-transition-delay: 999999s;
+  -webkit-transition: color 999999s ease-out, background-color 999999s ease-out;
+}

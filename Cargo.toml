@@ -1,0 +1,14 @@
+[workspace]
+members = ["arkkvm", "crates/rockchip_mpi_sys"]
+exclude = ["rust"]
+resolver = "2"
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+incremental = false
