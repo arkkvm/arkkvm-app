@@ -41,3 +41,19 @@ pub fn local_ip_v6() -> Option<IpAddr> {
         })
         .find(|ip| !ip.is_loopback())
 }
+
+pub fn is_link_local_ip() -> bool {
+    if let Some(IpAddr::V4(ip)) = local_ip() {
+        ip.is_link_local()
+    } else {
+        false
+    }
+}
+
+pub fn is_link_local_ip_v6() -> bool {
+    if let Some(IpAddr::V6(ip)) = local_ip_v6() {
+        ip.is_unicast_link_local()
+    } else {
+        false
+    }
+}

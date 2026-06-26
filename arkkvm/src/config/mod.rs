@@ -102,7 +102,7 @@ mod tests {
         // Test basic functionality
         let config = manager.get().await;
         assert_eq!(config.local_auth_mode, "noPassword");
-        assert_eq!(config.cloud_url, "https://api.jetkvm.com");
+        assert_eq!(config.cloud_url, "https://api.arkkvm.com");
     }
 
     #[tokio::test]

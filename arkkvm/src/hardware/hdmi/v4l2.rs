@@ -547,7 +547,7 @@ impl VideoBuffer {
     }
 }
 
-/// V4L2 ioctl wrapper (internal use)
+/// V4L2 ioctl wrapper (internal)
 /// Note: On 32-bit architectures, c_ulong is u32 and can be used directly
 /// On 64-bit architectures, c_ulong is u64, but ioctl's request parameter is still u32
 fn v4l2_ioctl(fd: RawFd, request: c_ulong, arg: *mut c_void) -> c_int {
@@ -555,7 +555,7 @@ fn v4l2_ioctl(fd: RawFd, request: c_ulong, arg: *mut c_void) -> c_int {
     unsafe { ioctl(fd, request as u32, arg) }
 }
 
-/// Query digital video timings (safe wrapper for VIDIOC_QUERY_DV_TIMINGS)
+/// Query digital video timings (safe wrapper around VIDIOC_QUERY_DV_TIMINGS)
 pub fn query_dv_timings(fd: RawFd) -> Result<v4l2_dv_timings> {
     let mut dv_timings = v4l2_dv_timings::default();
     if v4l2_ioctl(
@@ -571,7 +571,7 @@ pub fn query_dv_timings(fd: RawFd) -> Result<v4l2_dv_timings> {
     Ok(dv_timings)
 }
 
-/// Start video stream（VIDIOC_STREAMON）
+/// Start video stream (wrapper around VIDIOC_STREAMON)
 pub fn stream_on(fd: RawFd, buf_type: u32) -> Result<()> {
     let mut type_ = buf_type;
     if v4l2_ioctl(fd, VIDIOC_STREAMON, &mut type_ as *mut _ as *mut c_void) < 0 {
@@ -583,7 +583,7 @@ pub fn stream_on(fd: RawFd, buf_type: u32) -> Result<()> {
     Ok(())
 }
 
-/// Stop video stream（VIDIOC_STREAMOFF）
+/// Stop video stream (wrapper around VIDIOC_STREAMOFF)
 pub fn stream_off(fd: RawFd, buf_type: u32) -> Result<()> {
     let mut type_ = buf_type;
     if v4l2_ioctl(fd, VIDIOC_STREAMOFF, &mut type_ as *mut _ as *mut c_void) < 0 {
@@ -609,7 +609,7 @@ pub fn get_video_format(fd: RawFd) -> Result<(u32, u32)> {
     if v4l2_ioctl(fd, VIDIOC_G_FMT, &mut fmt as *mut _ as *mut c_void) < 0 {
         return Err(anyhow!("Failed to get format: {}", std::io::Error::last_os_error()));
     }
-
+    
     // Safely access union field
     let (width, height) = unsafe { (fmt.fmt.pix_mp.width, fmt.fmt.pix_mp.height) };
     if width == 0 || height == 0 {
@@ -629,7 +629,7 @@ pub fn set_video_format(fd: RawFd, width: u32, height: u32) -> Result<(u32, u32)
     if width == 0 || height == 0 {
         return Err(anyhow!("Invalid resolution: {}x{} (width and height must be > 0)", width, height));
     }
-
+    
     let mut fmt = v4l2_format {
         type_: V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
         fmt: v4l2_format_fmt {
@@ -646,7 +646,7 @@ pub fn set_video_format(fd: RawFd, width: u32, height: u32) -> Result<(u32, u32)
     if v4l2_ioctl(fd, VIDIOC_S_FMT, &mut fmt as *mut _ as *mut c_void) < 0 {
         return Err(anyhow!("Failed to set format: {}", std::io::Error::last_os_error()));
     }
-
+    
     // Verify actual resolution returned by driver (VIDIOC_S_FMT may modify resolution)
     // If driver returns different resolution (e.g., default 800x600), log warning
     let (actual_width, actual_height) = unsafe { (fmt.fmt.pix_mp.width, fmt.fmt.pix_mp.height) };
@@ -698,7 +698,7 @@ pub fn request_buffers(
         // Explicitly zero plane_buffer (ensure consistency with memset(&plane, 0, sizeof(plane)) in C code)
         // Using zeroed() is safer because write_bytes requires ensuring pointer is valid
         buffers[i].plane_buffer = unsafe { std::mem::zeroed() };
-
+        
         // Use buffers[i].plane_buffer (matches &buffers[i].plane_buffer in C code)
         // Completely zero buf structure, then set necessary fields (matches init_v4l2_buffer in C code)
         let mut buf = unsafe { std::mem::zeroed::<v4l2_buffer>() };
@@ -798,6 +798,28 @@ pub fn request_buffers(
     }
 
     Ok(buffers)
+}
+
+/// Release V4L2 capture buffers (`VIDIOC_REQBUFS` with `count = 0`).
+///
+/// Caller should call [`stream_off`] first when streaming was started, and release
+/// any DMA-BUF blocks (`mb_release_mb`) before this so the driver can free the queue.
+pub fn release_buffers(fd: RawFd) -> Result<()> {
+    let mut req = v4l2_requestbuffers {
+        count: 0,
+        type_: V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+        memory: V4L2_MEMORY_DMABUF,
+        ..Default::default()
+    };
+
+    if v4l2_ioctl(fd, VIDIOC_REQBUFS, &mut req as *mut _ as *mut c_void) < 0 {
+        return Err(anyhow!(
+            "Failed to release buffers: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    Ok(())
 }
 
 /// Dequeue buffer

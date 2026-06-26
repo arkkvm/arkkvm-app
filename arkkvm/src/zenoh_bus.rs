@@ -6,6 +6,8 @@ use zenoh::config::ZenohId;
 static ZENOH_SESSION: once_cell::sync::OnceCell<zenoh::Session> = once_cell::sync::OnceCell::new();
 static ZENOH_SESSION_MIC: once_cell::sync::OnceCell<zenoh::Session> =
     once_cell::sync::OnceCell::new();
+static ZENOH_SESSION_USB: once_cell::sync::OnceCell<zenoh::Session> =
+    once_cell::sync::OnceCell::new();
 
 pub fn get_session() -> zenoh::Session {
     ZENOH_SESSION.get().expect("Zenoh session not initialized").clone()
@@ -15,15 +17,28 @@ pub fn get_mic_session() -> zenoh::Session {
     ZENOH_SESSION_MIC.get().expect("Zenoh session not initialized").clone()
 }
 
+pub fn get_usb_session() -> zenoh::Session {
+    ZENOH_SESSION_USB.get().expect("Zenoh session not initialized").clone()
+}
+
+pub const KEY_EVENT_MIC_PROCESS: &str = "arkkvm/usb_devices/event/mic_process_state";
+pub const KEY_GET_MIC_PROCESS_STATE: &str = "arkkvm/usb_devices/query/get_mic_process_state";
+
+
 pub async fn init() -> Result<()> {
     let session = create("/tmp/zenoh.sock").await.expect("Failed to create zenoh session");
 
     let session_mic = create("/tmp/zenoh_mic.sock").await.expect("Failed to create mic zenoh session");
 
+    let session_usb = create("/tmp/zenoh_usb_devices.sock").await.expect("Failed to create usb zenoh session");
+    
     if let Err(e) = ZENOH_SESSION.set(session) {
         return Err(anyhow!("Failed to set zenoh session: {e:?}"));
     }
     if let Err(e) = ZENOH_SESSION_MIC.set(session_mic) {
+        return Err(anyhow!("Failed to set zenoh session: {e:?}"));
+    }
+    if let Err(e) = ZENOH_SESSION_USB.set(session_usb) {
         return Err(anyhow!("Failed to set zenoh session: {e:?}"));
     }
 
@@ -33,6 +48,7 @@ pub async fn init() -> Result<()> {
 pub async fn uninit() -> Result<()> {
     let _ = ZENOH_SESSION.get().expect("Zenoh session not initialized").close().await;
     let _ = ZENOH_SESSION_MIC.get().expect("Zenoh session not initialized").close().await;
+    let _ = ZENOH_SESSION_USB.get().expect("Zenoh session not initialized").close().await;
     Ok(())
 }
 

@@ -1,10 +1,14 @@
 use std::io::ErrorKind;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
+use base64::Engine;
 use reqwest::{Client, StatusCode};
+use rsa::pkcs8::DecodePublicKey;
+use rsa::rand_core::OsRng;
 use rsa::sha2::{Digest, Sha256};
+use rsa::{Oaep, RsaPublicKey};
 use salvo::http::HeaderValue;
 use tokio::io::AsyncReadExt;
 use tracing::{debug, error, info, warn};
@@ -15,10 +19,32 @@ use super::types::{
     TokenExchangeResponse,
 };
 use super::websocket::CloudWebSocketClient;
-use crate::cloud::OtaInfo;
+use crate::cloud::{OtaInfo, websocket};
 use crate::config::get_config_manager;
+use crate::config::types::CLOUD_API_URL;
 use crate::jsonrpc;
 use crate::module::rtc_response_params::OtaState;
+
+pub const PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvWvPLrqK9fvwcLPHnik2
+x73lcC9Nmv3rAain35tp9G/ULUTQeEOfQa5wT/Dlx8P61s3ZmFmvn3FopYK8CH85
+87dILdljOIXbPayeUEO/QWyLnfCqedx0hFHk7zbPNinVT1T6HFWGBKcJfvC6Slbh
+OysBeW2hzQlTRb23iz3nGiFiOSvl+fSTRV4ohicVzaNXWMA3fdbUEVW7n8JFk9F1
+80W/UfHcaC3wRrsF9bw6jBhPeT9z86hb7Kl6/JXSYjXslSfYfLZRsisFwRUTwApv
+M5VOWHvyVDm8Ks/e32smN+p4b79ktnNkMLOluier4j3kn9eU/ka95GK6Vnt98lqK
+wQIDAQAB
+-----END PUBLIC KEY-----";
+
+fn encrypt_device_id_rsa(device_id: &str) -> Result<String> {
+    let pub_key = RsaPublicKey::from_public_key_pem(PUBLIC_KEY)
+        .map_err(|e| anyhow!("PUBLIC_KEY parse: {}", e))?;
+    let mut rng = OsRng;
+    let ciphertext =
+        pub_key.encrypt(&mut rng, Oaep::new::<Sha256>(), device_id.as_bytes()).map_err(|e| {
+            anyhow!("device_id RSA encrypt: {}", e)
+        })?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&ciphertext))
+}
 
 static CLOUD_MANAGER: once_cell::sync::OnceCell<CloudManager> = once_cell::sync::OnceCell::new();
 
@@ -141,6 +167,7 @@ impl CloudManager {
 
             info!("Device deregistered, disconnecting from cloud");
             self.set_state(CloudConnectionState::NotConfigured);
+            self.disconnect_from_cloud().await;
             Ok(())
         } else {
             Err(anyhow!("Deregister request failed with status: {}", response.status()))
@@ -151,15 +178,17 @@ impl CloudManager {
         let config_manager = get_config_manager();
         let config = config_manager.get().await;
 
-        if config.cloud_url.is_empty() {
-            return Err(anyhow!("Cloud token or URL is not set"));
-        }
+        // if config.cloud_url.is_empty() {
+        //     return Err(anyhow!("Cloud token or URL is not set"));
+        // }
 
+        let device_id_enc = encrypt_device_id_rsa(&config.device_id)?;
         let response = match Client::new()
             .get(format!(
-                "{}/releases?prerelease={}&appVersion={}&systemVersion={}",
-                config.cloud_url,
+                "{}/releases?prerelease={}&deviceId={}&appVersion={}&systemVersion={}",
+                CLOUD_API_URL,
                 config.dev_channel_enabled,
+                device_id_enc,
                 app_version,
                 os_version,
             ))
@@ -169,7 +198,6 @@ impl CloudManager {
         {
             Ok(resp) => resp,
             Err(e) => {
-                error!("Failed to send OTA Requset: {:?}", &e);
                 return Err(anyhow!("Failed to send OTA Requset: {:?}", &e));
             }
         };
@@ -209,7 +237,7 @@ impl CloudManager {
 
         info!("Start to download file from {}", url);
 
-        // Get total size from the first request
+        // first request to get total size
         let total_size = {
             let response =
                 client.head(url).timeout(std::time::Duration::from_secs(30)).send().await?;
@@ -232,7 +260,7 @@ impl CloudManager {
             .await?;
 
         loop {
-            // Continue downloading from the breakpoint using a Range request
+            // resume download with Range request
             let mut request = client.get(url).timeout(std::time::Duration::from_secs(300));
 
             if downloaded > 0 {
@@ -292,7 +320,7 @@ impl CloudManager {
 
                 let progress = (downloaded as f64 / total_size as f64 * 100.0) as u32;
                 if downloaded % (1024 * 1024) < chunk.len() as u64 {
-                    // Record progress every MB
+                    // log once per MB
                     info!("Download progress: {}% ({}/{})", progress, downloaded, total_size);
                     jsonrpc::broadcast_ota_state(OtaState::system_download(
                         progress,
@@ -302,13 +330,13 @@ impl CloudManager {
                 }
             }
 
-            // If a retry is needed, continue the outer loop
+            // retry: continue outer loop
             if should_retry {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
 
-            // Download complete; check size
+            // download finished; verify size
             if downloaded >= total_size {
                 break;
             } else {
@@ -401,7 +429,6 @@ impl CloudManager {
     /// Start cloud connection loop
     pub async fn start_connection_loop(&self) -> Result<()> {
         info!("Starting cloud connection loop");
-
         loop {
             match self.get_state() {
                 CloudConnectionState::NotConfigured => {
@@ -481,8 +508,23 @@ impl CloudManager {
             return Err(anyhow!("Token exchange failed: {}", response.status()));
         }
 
+        // let url = response.url().to_string();
+        // let msg = response.text().await;
+        // info!("Token exchange url: {:?}, msg: {:?}", url, msg);
+        // Ok(TokenExchangeResponse { secret_token: "".to_owned() })
+
         let token_resp: TokenExchangeResponse = response.json().await?;
         Ok(token_resp)
+    }
+
+    /// Disconnect cloud WebSocket before network restart so the connection loop can reconnect.
+    pub async fn reconnect_after_network_change(&self) {
+        let state = self.get_state();
+        if matches!(state, CloudConnectionState::Connected | CloudConnectionState::Connecting) {
+            info!("Network restarting, disconnecting cloud WebSocket for reconnect");
+            self.disconnect_from_cloud().await;
+            self.set_state(CloudConnectionState::Disconnected);
+        }
     }
 
     /// Connect to cloud WebSocket
@@ -496,31 +538,35 @@ impl CloudManager {
         })?;
         let device_id = config.device_id.clone();
 
-        info!("Connecting to cloud WebSocket: {}", config.cloud_url);
+        // info!("Connecting to cloud WebSocket: {}", config.cloud_url);
         let mut client = CloudWebSocketClient::new(config.cloud_url, token, device_id);
 
         self.set_state(CloudConnectionState::Connected);
 
-        match client.connect().await {
-            Ok(_) => {
-                info!("Successfully connected to cloud");
-                Ok(())
-            }
+        let result = match client.connect().await {
+            Ok(_) => Ok(()),
             Err(e) => {
-                // Check if it's UnexpectedEof error
                 if let Some(io_err) = e.downcast_ref::<std::io::Error>()
                     && io_err.kind() == ErrorKind::UnexpectedEof
                 {
-                    info!(
-                        "WebSocket connection closed by peer without close_notify (UnexpectedEof)"
+                    warn!(
+                        "WebSocket connection closed by peer without close_notify (UnexpectedEof) e: {:?}",
+                        &io_err
                     );
-                    self.set_state(CloudConnectionState::Disconnected);
-                    return Ok(());
+                    Ok(())
+                } else {
+                    Err(e)
                 }
-
-                self.set_state(CloudConnectionState::Disconnected);
-                Err(e)
             }
+        };
+
+        self.set_state(CloudConnectionState::Disconnected);
+        result
+    }
+
+    async fn disconnect_from_cloud(&self) {
+        if let Err(e) = websocket::cloud_ws_close().await {
+            error!("Failed to disconnect from cloud: {}", e);
         }
     }
 

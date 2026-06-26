@@ -316,7 +316,7 @@ mod tests {
         // Loading non-existent file should return default config
         let config = persistence.load().await.unwrap();
         assert_eq!(config.local_auth_mode, "noPassword");
-        assert_eq!(config.cloud_url, "https://api.jetkvm.com");
+        assert_eq!(config.cloud_url, "https://api.arkkvm.com");
     }
 
     #[tokio::test]

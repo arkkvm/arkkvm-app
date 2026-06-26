@@ -10,6 +10,16 @@ pub const MAX_KEYS_PER_STEP: usize = 10;
 pub const MIN_STEP_DELAY: u32 = 50;
 pub const MAX_STEP_DELAY: u32 = 2000;
 
+#[cfg(feature = "env_dev")]
+pub const CLOUD_API_URL: &str = "https://api-tst.arkkvm.com";
+#[cfg(feature = "env_dev")]
+pub const CLOUD_APP_URL: &str = "https://app-tst.arkkvm.com";
+
+#[cfg(not(feature = "env_dev"))]
+pub const CLOUD_API_URL: &str = "https://api.arkkvm.com";
+#[cfg(not(feature = "env_dev"))]
+pub const CLOUD_APP_URL: &str = "https://app.arkkvm.com";
+
 /// Wake-on-LAN device configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WakeOnLanDevice {
@@ -89,9 +99,9 @@ impl Default for UsbConfig {
         Self {
             vendor_id: "0x1d6b".to_string(),  // The Linux Foundation
             product_id: "0x0104".to_string(), // Multifunction Composite Gadget
-            serial_number: String::new(),
+            serial_number: crate::hardware::hw::get_device_id(),
             manufacturer: "ArkKVM".to_string(),
-            product: "ArkKVM USB Emulation Device".to_string(),
+            product: "Multifunction Composite Gadget".to_string(),
         }
     }
 }
@@ -115,9 +125,124 @@ impl Default for UsbDevices {
             relative_mouse: true,
             keyboard: true,
             mass_storage_vm: true,
-            mass_storage_ft: false,
+            mass_storage_ft: true,
             microphone: false,
             camera: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum IpV4Mod {
+    #[serde(rename = "dhcp")]
+    Dhcp,
+    #[serde(rename = "static")]
+    Static,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum IpV6Mod {
+    #[serde(rename = "slaac")]
+    Slaac,
+    #[serde(rename = "static")]
+    Static,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StaticIpConfig {
+    #[serde(rename = "ipAddress")]
+    pub ip_address: String,
+    #[serde(rename = "subnetMask")]
+    pub subnet_mask: String,
+    #[serde(rename = "gateway")]
+    pub gateway: String,
+    #[serde(rename = "dnsServers")]
+    pub dns_servers: Vec<String>,
+}
+
+/// Static IPv4/IPv6 for VLAN endpoints (`static_ipv4` / `static_ipv6` use camelCase fields).
+pub type VlanStaticIpConfig = StaticIpConfig;
+
+/// Per-VLAN endpoint configuration (Primary or Secondary)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VlanEndpointConfig {
+    pub vlan_id: u16,
+    pub ipv4_mode: IpV4Mod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6_mode: Option<IpV6Mod>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_ipv4: Option<VlanStaticIpConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_ipv6: Option<VlanStaticIpConfig>,
+}
+
+/// VLAN (802.1Q) settings
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct VlanSettings {
+    pub vlan_enabled: bool,
+    #[serde(
+        rename = "primaryVlan",
+        alias = "primary_vlan",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub primary_vlan: Option<VlanEndpointConfig>,
+    #[serde(
+        rename = "secondaryVlan",
+        alias = "secondary_vlan",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub secondary_vlan: Option<VlanEndpointConfig>,
+}
+
+impl<'de> Deserialize<'de> for VlanSettings {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct VlanSettingsHelper {
+            vlan_enabled: bool,
+            #[serde(rename = "primaryVlan", alias = "primary_vlan", default)]
+            primary_vlan: Option<VlanEndpointConfig>,
+            #[serde(rename = "secondaryVlan", alias = "secondary_vlan", default)]
+            secondary_vlan: Option<VlanEndpointConfig>,
+            #[serde(rename = "secondaryVlans", default)]
+            secondary_vlans: Option<Vec<VlanEndpointConfig>>,
+        }
+
+        let helper = VlanSettingsHelper::deserialize(deserializer)?;
+        let secondary_vlan = if helper.secondary_vlan.is_some() {
+            helper.secondary_vlan
+        } else if let Some(vlans) = helper.secondary_vlans {
+            match vlans.len() {
+                0 => None,
+                1 => Some(vlans.into_iter().next().expect("length checked")),
+                count => {
+                    return Err(serde::de::Error::custom(format!(
+                        "secondaryVlans must contain at most one entry, got {count}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(Self {
+            vlan_enabled: helper.vlan_enabled,
+            primary_vlan: helper.primary_vlan,
+            secondary_vlan,
+        })
+    }
+}
+
+impl Default for VlanSettings {
+    fn default() -> Self {
+        Self {
+            vlan_enabled: false,
+            primary_vlan: None,
+            secondary_vlan: None,
         }
     }
 }
@@ -132,9 +257,13 @@ pub struct NetworkConfig {
     #[serde(default, deserialize_with = "deserialize_null_as_none")]
     pub domain: Option<String>,
     #[serde(default = "default_ipv4_mode")]
-    pub ipv4_mode: String,
+    pub ipv4_mode: IpV4Mod,
+    #[serde(default)]
+    pub static_ipv4: Option<StaticIpConfig>,
     #[serde(default = "default_ipv6_mode")]
-    pub ipv6_mode: String,
+    pub ipv6_mode: IpV6Mod,
+    #[serde(default)]
+    pub static_ipv6: Option<StaticIpConfig>,
     #[serde(default = "default_lldp_mode")]
     pub lldp_mode: String,
     #[serde(default)]
@@ -149,6 +278,8 @@ pub struct NetworkConfig {
     pub time_sync_disable_fallback: bool,
     #[serde(default = "default_time_sync_parallel")]
     pub time_sync_parallel: u32,
+    #[serde(default)]
+    pub vlan_settings: VlanSettings,
 }
 
 fn deserialize_null_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -167,11 +298,11 @@ where
     Ok(opt.unwrap_or_default())
 }
 
-fn default_ipv4_mode() -> String {
-    "dhcp".to_string()
+fn default_ipv4_mode() -> IpV4Mod {
+    IpV4Mod::Dhcp
 }
-fn default_ipv6_mode() -> String {
-    "slaac".to_string()
+fn default_ipv6_mode() -> IpV6Mod {
+    IpV6Mod::Slaac
 }
 fn default_lldp_mode() -> String {
     "basic".to_string()
@@ -193,7 +324,9 @@ impl Default for NetworkConfig {
             http_proxy: None,
             domain: None,
             ipv4_mode: default_ipv4_mode(),
+            static_ipv4: None,
             ipv6_mode: default_ipv6_mode(),
+            static_ipv6: None,
             lldp_mode: default_lldp_mode(),
             lldp_tx_tlvs: vec![
                 "chassis".to_string(),
@@ -206,6 +339,7 @@ impl Default for NetworkConfig {
             time_sync_ordering: vec!["ntp".to_string(), "http".to_string()],
             time_sync_disable_fallback: false,
             time_sync_parallel: default_time_sync_parallel(),
+            vlan_settings: VlanSettings::default(),
         }
     }
 }
@@ -281,6 +415,9 @@ pub struct Config {
     // USB configuration
     pub usb_config: UsbConfig,
     pub usb_devices: UsbDevices,
+    /// arkkvm_mic subprocess + virtual_mic pipeline; `None` = legacy config (migrated on load).
+    #[serde(default, alias = "microphoneEmulation")]
+    pub microphone_emulation: Option<bool>,
     pub audio_playback: bool,
     pub file_transfer_target: FileTransferTarget,
 
@@ -297,16 +434,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            #[cfg(feature = "env_dev")]
-            cloud_url: "https://ark-kvm-api-tst.jianguodata.com".to_string(),
-            #[cfg(feature = "env_dev")]
-            cloud_app_url: "https://ark-kvm-app-tst.jianguodata.com".to_string(),
-
-            #[cfg(not(feature = "env_dev"))]
-            cloud_url: "https://api.arkkvm.com".to_string(),
-            #[cfg(not(feature = "env_dev"))]
-            cloud_app_url: "https://app.arkkvm.com".to_string(),
-
+            cloud_url: CLOUD_API_URL.to_string(),
+            cloud_app_url: CLOUD_APP_URL.to_string(),
             cloud_token: None,
             google_identity: None,
             dev_channel_enabled: false,
@@ -333,6 +462,7 @@ impl Default for Config {
             tls_mode: TlsMode::Disabled,
             usb_config: UsbConfig::default(),
             usb_devices: UsbDevices::default(),
+            microphone_emulation: Some(false),
             audio_playback: true,
             file_transfer_target: FileTransferTarget::Kvm,
             network_config: NetworkConfig::default(),
@@ -343,6 +473,19 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn effective_microphone_emulation(&self) -> bool {
+        self.microphone_emulation.unwrap_or(false)
+    }
+
+    /// One-time upgrade: legacy configs only had `usb_devices.microphone` for device + process.
+    pub fn migrate_microphone_emulation(&mut self) -> bool {
+        if self.microphone_emulation.is_some() {
+            return false;
+        }
+        self.microphone_emulation = Some(self.usb_devices.microphone);
+        true
+    }
+
     /// Validate the entire configuration
     pub fn validate(&mut self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();

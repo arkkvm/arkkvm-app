@@ -383,9 +383,7 @@ impl DataChannelManager {
                 // crate::webrtc::trigger_ota_state_update().await;
                 crate::webrtc::trigger_video_state_update().await;
                 crate::webrtc::trigger_usb_state_update().await;
-
-                let state = crate::hardware::usb::get_current_usb_state().await;
-                crate::jsonrpc::broadcast_usb_state(state).await;
+                crate::webrtc::trigger_keyboard_led_state_update().await;
 
                 // Also emit session count update now that the channel is open
                 crate::webrtc::on_active_sessions_changed().await;

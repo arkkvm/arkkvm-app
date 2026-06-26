@@ -1,16 +1,21 @@
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::process::{Child, Command, Stdio};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+use std::io::{self, ErrorKind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use parking_lot::{Mutex, RwLock};
 use rustix::fs::{Mode as FileMode, OFlags, fcntl_getfl, fcntl_setfl, open};
 use rustix::io::{Errno, dup, read, write};
+use rustix::process::{ioctl_tiocsctty, setsid};
 use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 use rustix::termios::{Winsize, tcsetwinsize};
 use serde::{Deserialize, Serialize};
+use tokio::io::unix::AsyncFd;
+use tokio::io::Interest;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -123,26 +128,37 @@ impl PtyChildProcess {
         let stdout_file = slave_file.try_clone().context("Failed to clone slave fd for stdout")?;
         let stderr_file = slave_file;
 
-        // Convert to Stdio using safe method
-        let child = cmd
-            .stdin(Stdio::from(stdin_file))
-            .stdout(Stdio::from(stdout_file))
-            .stderr(Stdio::from(stderr_file))
-            .spawn()
-            .context("Failed to start shell process")?;
+        cmd.stdin(Stdio::from(stdin_file));
+        cmd.stdout(Stdio::from(stdout_file));
+        cmd.stderr(Stdio::from(stderr_file));
+
+        // New session + controlling terminal so job control and INTR (^C) match an SSH-like PTY
+        // (foreground process group / isig semantics on the slave).
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                setsid().map_err(std::io::Error::from)?;
+                ioctl_tiocsctty(std::io::stdin().as_fd()).map_err(std::io::Error::from)?;
+                Ok(())
+            });
+        }
+
+        let child = cmd.spawn().context("Failed to start shell process")?;
 
         Ok(child)
     }
 }
 
-/// Thread-safe output forwarder with comprehensive error handling using parking_lot
+/// Forwards PTY output to the DataChannel; uses `AsyncFd` so the reactor wakes
+/// the task only when readable (no sleep-based polling when idle).
 struct OutputForwarder {
     handle: Option<JoinHandle<Result<()>>>,
     shutdown_tx: mpsc::UnboundedSender<()>,
 }
 
 impl OutputForwarder {
-    /// Create and start a new output forwarder using rustix for I/O and parking_lot for thread safety
+    /// Reads from a non-blocking PTY in a Tokio task: wait for readiness from
+    /// the reactor, then drain reads until EAGAIN.
     fn start(
         state: Arc<RwLock<TerminalState>>,
         data_channel: Arc<RTCDataChannel>,
@@ -157,7 +173,7 @@ impl OutputForwarder {
             g.ptmx.as_ref().map(dup).transpose()
         };
 
-        let handle = tokio::task::spawn_blocking(move || -> Result<()> {
+        let handle = tokio::spawn(async move {
             let ptmx = match ptmx_dup {
                 Ok(Some(fd)) => fd,
                 _ => {
@@ -169,61 +185,102 @@ impl OutputForwarder {
                 }
             };
 
-            let rt = tokio::runtime::Handle::current();
+            let async_fd = match AsyncFd::with_interest(ptmx, Interest::READABLE) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    warn!(
+                        "AsyncFd PTY registration failed for channel {:?}: {}",
+                        channel_id, e
+                    );
+                    bail!("failed to register PTY with reactor: {}", e);
+                }
+            };
+
             let mut buf = [0u8; 1024];
             let mut error_count = 0u32;
             const MAX_ERRORS: u32 = 5;
 
-            debug!("Output reader thread started for channel {:?}", channel_id);
+            debug!("Output reader task started for channel {:?}", channel_id);
 
-            loop {
+            'outer: loop {
                 if shutdown_flag.load(Ordering::Relaxed) {
                     break;
                 }
-                if shutdown_rx.try_recv().is_ok() {
-                    break;
-                }
 
-                match read(&ptmx, &mut buf) {
-                    Ok(0) => {
-                        debug!("PTY EOF reached for channel {:?}", channel_id);
+                tokio::select! {
+                    biased;
+                    msg = shutdown_rx.recv() => {
+                        let _ = msg;
                         break;
                     }
-                    Ok(n) => {
-                        error_count = 0;
-                        let data = buf[..n].to_vec();
-                        let ch = data_channel.clone();
-                        rt.spawn(async move {
-                            if let Err(e) = ch.send(&data.into()).await {
-                                warn!(
-                                    "Failed to send pty output for channel {:?}: {}",
-                                    channel_id, e
-                                );
+                    r = async_fd.readable() => {
+                        let mut guard = match r {
+                            Ok(g) => g,
+                            Err(e) => {
+                                error!("PTY readable poll failed on channel {:?}: {}", channel_id, e);
+                                break;
                             }
-                        });
-                    }
-                    Err(err) => {
-                        if err == Errno::AGAIN {
-                            std::thread::sleep(Duration::from_millis(1));
-                            continue;
+                        };
+
+                        'drain: loop {
+                            if shutdown_flag.load(Ordering::Relaxed) {
+                                break 'outer;
+                            }
+
+                            match guard.try_io(|io_ref| -> io::Result<usize> {
+                                let fd = io_ref.get_ref();
+                                loop {
+                                    match read(fd, &mut buf) {
+                                        Ok(n) => return Ok(n),
+                                        Err(Errno::INTR) => continue,
+                                        Err(Errno::AGAIN) => {
+                                            return Err(io::Error::from(ErrorKind::WouldBlock));
+                                        }
+                                        Err(err) => {
+                                            return Err(io::Error::other(err.to_string()));
+                                        }
+                                    }
+                                }
+                            }) {
+                                Ok(Ok(0)) => {
+                                    debug!("PTY EOF reached for channel {:?}", channel_id);
+                                    break 'outer;
+                                }
+                                Ok(Ok(n)) => {
+                                    error_count = 0;
+                                    let data = buf[..n].to_vec();
+                                    if let Err(e) =
+                                        data_channel.send(&data.into()).await
+                                    {
+                                        warn!(
+                                            "Failed to send pty output for channel {:?}: {}",
+                                            channel_id, e
+                                        );
+                                    }
+                                    continue 'drain;
+                                }
+                                Ok(Err(e)) => {
+                                    error_count += 1;
+                                    error!(
+                                        "Failed to read from pty for channel {:?}: {} (error {}/{})",
+                                        channel_id,
+                                        e,
+                                        error_count,
+                                        MAX_ERRORS
+                                    );
+                                    if error_count >= MAX_ERRORS {
+                                        bail!("Too many consecutive read errors");
+                                    }
+                                    break 'outer;
+                                }
+                                Err(_would_block) => break 'drain,
+                            }
                         }
-                        if err == Errno::INTR {
-                            continue;
-                        }
-                        error_count += 1;
-                        error!(
-                            "Failed to read from pty for channel {:?}: {} (error {}/{})",
-                            channel_id, err, error_count, MAX_ERRORS
-                        );
-                        if error_count >= MAX_ERRORS {
-                            bail!("Too many consecutive read errors");
-                        }
-                        break; // exit loop on non-EAGAIN errors
                     }
                 }
             }
 
-            info!("Output reader thread exiting for channel {:?}", channel_id);
+            info!("Output reader task exiting for channel {:?}", channel_id);
             Ok(())
         });
 
@@ -340,6 +397,7 @@ impl TerminalHandler {
     async fn on_open(&self) -> Result<()> {
         self.shutdown_flag.store(false, Ordering::Relaxed);
         let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-i");
         let (ptmx, child) = self.start_pty_with_command(&mut cmd)?;
 
         {
@@ -407,6 +465,7 @@ impl TerminalHandler {
             return Ok(());
         }
 
+        debug!("msg isString: {}, context: {:?}", msg.is_string, msg.data);
         // Handle string messages for terminal resize
         if msg.is_string {
             let text = String::from_utf8(msg.data.to_vec())
@@ -431,8 +490,9 @@ impl TerminalHandler {
                             return Ok(());
                         }
                     }
-                    Err(_) => {
+                    Err(e) => {
                         // Not a valid terminal size JSON, continue to write as data
+                        error!("terminal msg: {maybe_json}, error: {e:?}");
                     }
                 }
             }

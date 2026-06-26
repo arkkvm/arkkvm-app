@@ -17,10 +17,10 @@ use crate::config::types::UISwitch;
 use crate::hardware::usb;
 use crate::jsonrpc::handlers;
 use crate::middleware::{
-    auth_middleware, csrf_middleware, developer_auth_middleware, public_middleware,
+    self, auth_middleware, csrf_middleware, developer_auth_middleware, public_middleware, security_middleware
 };
 use crate::module::rtc_request_params::SettingSwitchParams;
-use crate::ota;
+use crate::{common, ota};
 use crate::state::AppState;
 use crate::{
     tls::{self, TlsMode},
@@ -119,6 +119,7 @@ pub async fn init() -> anyhow::Result<JoinHandle<()>> {
     // io.ns("/", handle_session_connect);
 
     let app = Router::new()
+        .hoop(security_middleware)
         .push(init_protected_routes().await?)
         .push(init_public_routes().await?)
         .push(init_developer_routes().await?)
@@ -267,13 +268,13 @@ pub async fn init_static_routes() -> anyhow::Result<Router> {
     let local_serve_dir = "/userdata/arkkvm/frontend";
 
     router = if let Some(serve_dir) = option_env!("ARKKVM_SERVE_DIR") {
-        println!("Serving frontend from: ARKKVM_SERVE_DIR({})", serve_dir);
+        info!("Serving frontend from: ARKKVM_SERVE_DIR({})", serve_dir);
         router.get(StaticDir::new(serve_dir).fallback("index.html"))
     } else if std::fs::exists(local_serve_dir).unwrap_or(false) {
-        println!("Serving frontend from: local directory({})", local_serve_dir);
+        info!("Serving frontend from: local directory({})", local_serve_dir);
         router.get(StaticDir::new(local_serve_dir).fallback("index.html"))
     } else {
-        println!("Serving frontend from: embedded assets");
+        info!("Serving frontend from: embedded assets");
         router.get(static_embed::<FrontendAssets>().fallback("index.html"))
     };
 
@@ -288,6 +289,9 @@ async fn handle_login_local(
     req: &mut Request,
     res: &mut Response,
 ) -> Result<Json<ApiResponse>, StatusError> {
+    #[cfg(not(feature = "env_unsafe"))]
+    validate_setup_origin_referer(req)?;
+    
     let config_manager = get_config_manager();
     let config = config_manager.get().await;
 
@@ -319,26 +323,20 @@ async fn handle_login_local(
         return Err(StatusError::internal_server_error().brief("Failed to save configuration"));
     }
 
-    // Set auth cookie (7 days expiry, HttpOnly, SameSite)
-    let cookie = Cookie::build(("authToken", auth_token.clone()))
-        .max_age(time::Duration::days(7))
-        .path("/")
-        .http_only(true)
-        .secure(false)
-        .same_site(SameSite::Lax)
-        .build();
-    let set_cookie = cookie.to_string();
-    res.headers_mut()
-        .append("Set-Cookie", salvo::http::HeaderValue::from_str(&set_cookie).unwrap());
-
+    set_token(req, res, auth_token.as_str());
+    
     // Return CSRF token in header and body so frontend can use it without a separate request
     res.headers_mut()
         .insert("X-CSRF-Token", salvo::http::HeaderValue::from_str(&csrf_token).unwrap());
+
     Ok(Json(ApiResponse { message: "Login successful".to_string(), csrf_token: Some(csrf_token) }))
 }
 
 #[endpoint]
-async fn handle_logout(res: &mut Response) -> Result<Json<ApiResponse>, StatusError> {
+async fn handle_logout(req: &mut Request, res: &mut Response) -> Result<Json<ApiResponse>, StatusError> {
+    #[cfg(not(feature = "env_unsafe"))]
+    validate_setup_origin_referer(req)?;
+
     let config_manager = get_config_manager();
 
     config_manager
@@ -346,17 +344,7 @@ async fn handle_logout(res: &mut Response) -> Result<Json<ApiResponse>, StatusEr
         .await
         .map_err(|_| StatusError::internal_server_error().brief("Failed to save configuration"))?;
 
-    // Clear auth cookie by setting it to expire immediately
-    let cookie = Cookie::build(("authToken", ""))
-        .max_age(time::Duration::seconds(-1))
-        .path("/")
-        .http_only(true)
-        .secure(false)
-        .same_site(SameSite::Lax)
-        .build();
-    let set_cookie = cookie.to_string();
-    res.headers_mut()
-        .append("Set-Cookie", salvo::http::HeaderValue::from_str(&set_cookie).unwrap());
+    clear_token(req, res);
 
     Ok(Json(ApiResponse { message: "Logout successful".to_string(), csrf_token: None }))
 }
@@ -366,6 +354,9 @@ async fn create_password_local(
     req: &mut Request,
     res: &mut Response,
 ) -> Result<Json<ApiResponse>, StatusError> {
+    #[cfg(not(feature = "env_unsafe"))]
+    validate_setup_origin_referer(req)?;
+
     let config_manager = get_config_manager();
     let config = config_manager.get().await;
 
@@ -410,19 +401,11 @@ async fn create_password_local(
         .map_err(|_| StatusError::internal_server_error().brief("Failed to save configuration"))?;
 
     // Set auth cookie
-    let cookie = Cookie::build(("authToken", auth_token.clone()))
-        .max_age(time::Duration::days(7))
-        .path("/")
-        .http_only(true)
-        .secure(false)
-        .same_site(SameSite::Lax)
-        .build();
-    let set_cookie = cookie.to_string();
-    res.headers_mut()
-        .append("Set-Cookie", salvo::http::HeaderValue::from_str(&set_cookie).unwrap());
+    set_token(req, res, auth_token.as_str());
 
     res.headers_mut()
         .insert("X-CSRF-Token", salvo::http::HeaderValue::from_str(&csrf_token).unwrap());
+    
     Ok(Json(ApiResponse {
         message: "Password set successfully".to_string(),
         csrf_token: Some(csrf_token),
@@ -434,6 +417,9 @@ async fn modify_password_local(
     req: &mut Request,
     res: &mut Response,
 ) -> Result<Json<ApiResponse>, StatusError> {
+    #[cfg(not(feature = "env_unsafe"))]
+    validate_setup_origin_referer(req)?;
+
     let config_manager = get_config_manager();
     let config = config_manager.get().await;
 
@@ -455,7 +441,7 @@ async fn modify_password_local(
     }
 
     if !config_manager.validate_password(&change_req.old_password).await {
-        return Err(StatusError::unauthorized().brief("Incorrect old password"));
+        return Err(StatusError::bad_request().brief("Incorrect old password"));
     }
 
     // Hash new password using bcrypt
@@ -478,19 +464,11 @@ async fn modify_password_local(
         })?;
 
     // Set new auth cookie
-    let cookie = Cookie::build(("authToken", new_auth_token.clone()))
-        .max_age(time::Duration::days(7))
-        .path("/")
-        .http_only(true)
-        .secure(false)
-        .same_site(SameSite::Lax)
-        .build();
-    let set_cookie = cookie.to_string();
-    res.headers_mut()
-        .append("Set-Cookie", salvo::http::HeaderValue::from_str(&set_cookie).unwrap());
+    set_token(req, res, new_auth_token.as_str());
 
     res.headers_mut()
         .insert("X-CSRF-Token", salvo::http::HeaderValue::from_str(&csrf_token).unwrap());
+    
     Ok(Json(ApiResponse {
         message: "Password updated successfully".to_string(),
         csrf_token: Some(csrf_token),
@@ -502,6 +480,9 @@ async fn disable_local_password(
     req: &mut Request,
     res: &mut Response,
 ) -> Result<Json<ApiResponse>, StatusError> {
+    #[cfg(not(feature = "env_unsafe"))]
+    validate_setup_origin_referer(req)?;
+
     let config_manager = get_config_manager();
     let config = config_manager.get().await;
 
@@ -523,7 +504,7 @@ async fn disable_local_password(
     }
 
     if !config_manager.validate_password(&login_req.password).await {
-        return Err(StatusError::unauthorized().brief("Incorrect password"));
+        return Err(StatusError::bad_request().brief("Incorrect password"));
     }
 
     config_manager
@@ -540,16 +521,7 @@ async fn disable_local_password(
         .map_err(|_| StatusError::internal_server_error().brief("Failed to save configuration"))?;
 
     // Clear auth cookie
-    let cookie = Cookie::build(("authToken", ""))
-        .max_age(time::Duration::seconds(-1))
-        .path("/")
-        .http_only(true)
-        .secure(false)
-        .same_site(SameSite::Lax)
-        .build();
-    let set_cookie = cookie.to_string();
-    res.headers_mut()
-        .append("Set-Cookie", salvo::http::HeaderValue::from_str(&set_cookie).unwrap());
+    clear_token(req, res);
 
     Ok(Json(ApiResponse {
         message: "Password disabled successfully".to_string(),
@@ -558,7 +530,10 @@ async fn disable_local_password(
 }
 
 #[endpoint]
-async fn handle_device() -> Result<Json<LocalDeviceResponse>, StatusError> {
+async fn handle_device(req: &mut Request) -> Result<Json<LocalDeviceResponse>, StatusError> {
+    #[cfg(not(feature = "env_unsafe"))]
+    validate_setup_origin_referer(req)?;
+
     let config_manager = get_config_manager();
     let config = config_manager.get().await;
 
@@ -570,7 +545,10 @@ async fn handle_device() -> Result<Json<LocalDeviceResponse>, StatusError> {
 }
 
 #[endpoint]
-async fn handle_device_status() -> Result<Json<DeviceStatusResponse>, StatusError> {
+async fn handle_device_status(req: &mut Request) -> Result<Json<DeviceStatusResponse>, StatusError> {
+    #[cfg(not(feature = "env_unsafe"))]
+    validate_setup_origin_referer(req)?;
+
     let config_manager = get_config_manager();
     let is_setup = config_manager.is_setup().await;
 
@@ -694,17 +672,6 @@ async fn handle_device_setup(
         return Err(StatusError::bad_request().brief("Invalid localAuthMode"));
     }
 
-    // let usb_manager = get_usb_manager();
-    // let mut usb_manager = usb_manager.write().await;
-    // let Some(usb_manager) = usb_manager.as_mut() else {
-    //     return Err(StatusError::bad_request().brief("USB manager not initialized"));
-    // };
-
-    // let _ = usb_manager.set_oobe_device_settings(&setup_req).await.map_err(|e| {
-    //     StatusError::internal_server_error()
-    //         .brief(format!("Failed to save virtual device configs: {}", e))
-    // })?;
-
     if let Err(e) = handlers::set_audio_playback(SettingSwitchParams {
         enabled: setup_req.audio_playback.unwrap_or(false),
     })
@@ -727,13 +694,24 @@ async fn handle_device_setup(
             .brief(format!("Failed to config auto update: {:?}", &e)));
     }
 
+    let mic = setup_req.microphone_emulation.unwrap_or(false);
     let mut devices = config_manager.get_usb_devices().await;
     devices.camera = setup_req.camera_emulation.unwrap_or(false);
-    devices.microphone = setup_req.microphone_emulation.unwrap_or(false);
+    devices.microphone = mic;
     devices.mass_storage_ft = setup_req.file_transfer.unwrap_or(false);
+    if let Err(e) = config_manager.set_microphone_emulation(mic).await {
+        return Err(StatusError::internal_server_error()
+            .brief(format!("Failed to save microphone emulation: {:?}", &e)));
+    }
     if let Err(e) = usb::reboot_usb_manager(None, Some(devices)).await {
         return Err(StatusError::internal_server_error()
             .brief(format!("Failed to config usb devices: {:?}", &e)));
+    }
+    if mic {
+        if let Err(e) = crate::services::init_virtual_mic_service().await {
+            return Err(StatusError::internal_server_error()
+                .brief(format!("Failed to start virtual mic: {:?}", &e)));
+        }
     }
 
     config_manager
@@ -768,16 +746,8 @@ async fn handle_device_setup(
             .ok_or_else(|| StatusError::internal_server_error().brief("Failed to save config"))?;
 
         // Set auth cookie
-        let cookie = Cookie::build(("authToken", auth_token.clone()))
-            .max_age(time::Duration::days(7))
-            .path("/")
-            .http_only(true)
-            .secure(false)
-            .same_site(SameSite::Lax)
-            .build();
-        let set_cookie = cookie.to_string();
-        res.headers_mut()
-            .append("Set-Cookie", salvo::http::HeaderValue::from_str(&set_cookie).unwrap());
+        set_token(req, res, auth_token.as_str());
+        
         res.headers_mut()
             .insert("X-CSRF-Token", salvo::http::HeaderValue::from_str(&csrf_token).unwrap());
     } else {
@@ -799,6 +769,9 @@ async fn handle_device_setup(
 
 #[endpoint]
 async fn handle_cloud_register(req: &mut Request) -> Result<Json<ApiResponse>, StatusError> {
+    #[cfg(not(feature = "env_unsafe"))]
+    validate_setup_origin_referer(req)?;
+
     // let _app_state = GLOBAL_APP_STATE.get().ok_or_else(StatusError::internal_server_error)?;
     let cloud_manager = crate::cloud::manager::get_cloud_manager();
 
@@ -824,7 +797,10 @@ async fn handle_cloud_register(req: &mut Request) -> Result<Json<ApiResponse>, S
 }
 
 #[endpoint]
-async fn handle_cloud_status() -> Result<Json<CloudStateResponse>, StatusError> {
+async fn handle_cloud_status(req: &mut Request) -> Result<Json<CloudStateResponse>, StatusError> {
+    #[cfg(not(feature = "env_unsafe"))]
+    validate_setup_origin_referer(req)?;
+
     // let _app_state = GLOBAL_APP_STATE.get().ok_or_else(StatusError::internal_server_error)?;
     let cloud_manager = crate::cloud::CloudManager::new();
 
@@ -1239,7 +1215,7 @@ async fn handle_webrtc_websocket(
     let device_metadata = serde_json::json!({
         "type": "device-metadata",
         "data": {
-            "deviceVersion": env!("CARGO_PKG_VERSION")
+            "deviceVersion": common::get_app_version(false),
         }
     });
 
@@ -1252,16 +1228,17 @@ async fn handle_webrtc_websocket(
         .clone();
 
     while let Some(msg) = ws.recv().await {
-        let msg = if let Ok(msg) = msg {
-            msg
-        } else {
-            info!("WebRTC WebSocket connection {} closed", connection_id);
-            break;
+        let msg = match msg {
+            Ok(msg) => msg,
+            Err(e) => {
+                warn!("WebRTC WebSocket connection {} closed by error: {}", connection_id, e);
+                break;
+            }
         };
 
         if msg.is_text() {
             if let Ok(text) = msg.as_str() {
-                if let Err(e) = handle_webrtc_websocket_message(
+                match handle_webrtc_websocket_message(
                     text,
                     &connection_id,
                     &source,
@@ -1270,13 +1247,21 @@ async fn handle_webrtc_websocket(
                 )
                 .await
                 {
-                    warn!("[ws={}] Failed to handle WebRTC message: {}", connection_id, e);
+                    Ok(should_close) => {
+                        if should_close {
+                            info!("[ws={}] Client requested WebSocket close", connection_id);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[ws={}] Failed to handle WebRTC message: {}", connection_id, e);
+                    }
                 }
             } else {
                 warn!("[ws={}] Failed to convert WebSocket message to string", connection_id);
             }
         } else if msg.is_close() {
-            info!("WebRTC WebSocket connection {} closed", connection_id);
+            info!("WebRTC WebSocket connection {} closed by peer", connection_id);
             break;
         } else if msg.is_ping() {
             let ping_data = msg.as_bytes().to_vec();
@@ -1321,10 +1306,10 @@ async fn handle_webrtc_websocket_message(
     source: &str,
     app_state: &Arc<AppState>,
     ws: &mut WebSocket,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     if message == "ping" {
         ws.send(Message::text("pong")).await?;
-        return Ok(());
+        return Ok(false);
     }
 
     let parsed: serde_json::Value = match serde_json::from_str(message) {
@@ -1402,6 +1387,10 @@ async fn handle_webrtc_websocket_message(
                     }
                 }
             }
+            "client-closing" => {
+                info!("[ws={}] Received client-closing from {}", connection_id, source);
+                return Ok(true);
+            }
             _ => {
                 warn!(
                     "[ws={}] Unknown message type '{}' from {}. Full message: {}",
@@ -1413,10 +1402,50 @@ async fn handle_webrtc_websocket_message(
         warn!("[ws={}] WebSocket message missing 'type' field: {}", connection_id, message);
     }
 
-    Ok(())
+    Ok(false)
 }
 
 /// Get the global application state
 pub fn get_global_app_state() -> Arc<AppState> {
     GLOBAL_APP_STATE.get_or_init(|| Arc::new(AppState::new())).clone()
+}
+
+fn set_token(req: &mut Request, res: &mut Response, auth_token: &str) {
+    let is_https = middleware::request_is_https(req);
+
+    // Set auth cookie (7 days expiry, HttpOnly, SameSite)
+    let cookie = Cookie::build(("authToken", auth_token))
+        .max_age(time::Duration::days(7))
+        .path("/")
+        .http_only(true)
+        .secure(is_https)
+        .same_site(SameSite::Strict)
+        .build();
+    let set_cookie_auth = cookie.to_string();
+
+    res.headers_mut()
+        .append("Set-Cookie", salvo::http::HeaderValue::from_str(&set_cookie_auth).unwrap());
+}
+
+/// Clear session cookies. Emit both Secure and non-Secure variants so logout works
+/// after HTTP-only or HTTPS-only logins (or switching between them on LAN).
+fn clear_token(_req: &mut Request, res: &mut Response) {
+    for secure in [false, true] {
+        append_expired_cookie(res, "authToken", secure);
+    }
+}
+
+/// Expire a session cookie. `secure` must match how the cookie was originally set.
+fn append_expired_cookie(res: &mut Response, name: &str, secure: bool) {
+    let cookie = Cookie::build((name, ""))
+        .max_age(time::Duration::seconds(-1))
+        .path("/")
+        .http_only(true)
+        .secure(secure)
+        .same_site(SameSite::Strict)
+        .build();
+    res.headers_mut().append(
+        "Set-Cookie",
+        salvo::http::HeaderValue::from_str(&cookie.to_string()).unwrap(),
+    );
 }

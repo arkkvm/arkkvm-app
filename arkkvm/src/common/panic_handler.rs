@@ -101,7 +101,7 @@ fn init_signal_handlers() {
             
             // Create signal handler action
             let mut sa: sigaction = std::mem::zeroed();
-            sa.sa_sigaction = signal_handler as usize;
+            sa.sa_sigaction = signal_handler as *const () as usize;
             sa.sa_flags = SA_SIGINFO;
             libc::sigemptyset(&mut sa.sa_mask);
             

@@ -1,40 +1,11 @@
 use anyhow::{Context, Result, bail};
 use once_cell::sync::OnceCell;
-use regex::Regex;
 use rustix::fs::{Mode, OFlags, open};
 use rustix::io::{read, write};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 static DEVICE_ID: OnceCell<String> = OnceCell::new();
-
-pub fn extract_serial_number() -> Result<String> {
-    let file = open("/proc/cpuinfo", OFlags::RDONLY, Mode::empty())
-        .context("Failed to open /proc/cpuinfo")?;
-
-    let mut content = Vec::new();
-    let mut buffer = [0u8; 4096];
-
-    loop {
-        match read(&file, &mut buffer) {
-            Ok(0) => break,
-            Ok(n) => content.extend_from_slice(&buffer[..n]),
-            Err(e) => return Err(e).context("Failed to read /proc/cpuinfo"),
-        }
-    }
-
-    let content = String::from_utf8(content).context("Failed to parse /proc/cpuinfo as UTF-8")?;
-
-    let r = Regex::new(r"Serial\s*:\s*(\S+)").context("Failed to compile regex")?;
-
-    if let Some(matches) = r.captures(&content)
-        && matches.len() >= 2
-    {
-        return Ok(matches[1].to_string());
-    }
-
-    bail!("No serial number found in /proc/cpuinfo")
-}
 
 pub fn read_otp_entropy() -> Result<Vec<u8>> {
     let file = open("/sys/bus/nvmem/devices/rockchip-otp0/nvmem", OFlags::RDONLY, Mode::empty())
@@ -60,7 +31,7 @@ pub fn read_otp_entropy() -> Result<Vec<u8>> {
 
 pub fn get_device_id() -> String {
     DEVICE_ID
-        .get_or_init(|| match extract_serial_number() {
+        .get_or_init(|| match common::device::extract_serial_number() {
             Ok(serial) => {
                 debug!("Extracted device serial number: {}", serial);
                 serial

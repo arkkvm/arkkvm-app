@@ -81,20 +81,20 @@ pub fn load_or_init_ca() -> anyhow::Result<(Issuer<'static, KeyPair>, String)> {
     Ok((issuer, ca_cert_pem))
 }
 
-/// Use the given CA to sign and generate the server certificate
+/// Issue and generate a server certificate signed by the given CA
 pub fn generate_server_cert(
     issuer: &Issuer<'_, KeyPair>,
     domains: Vec<String>,
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
-    // Create parameters for the server certificate
+    // server certificate parameters
     let mut params = CertificateParams::new(domains.clone())?;
 
-    // Set the subject distinguished name (DN) for the server certificate
+    // distinguished name
     let mut distinguished_name = DistinguishedName::new();
     distinguished_name.push(rcgen::DnType::CommonName, "ARKKVM");
     params.distinguished_name = distinguished_name;
 
-    // Set Subject Alternative Names (SAN)
+    // subject alternative names (SAN)
     let mut san = Vec::new();
     for domain in domains {
         san.push(SanType::DnsName(domain.try_into()?));
@@ -102,14 +102,14 @@ pub fn generate_server_cert(
     san.push(SanType::IpAddress("127.0.0.1".parse()?));
     params.subject_alt_names = san;
 
-    // Set the server certificate validity period (e.g., 1 year)
+    // validity period (e.g. 1 year)
     params.not_before = OffsetDateTime::now_utc();
     params.not_after = OffsetDateTime::now_utc() + Duration::days(365);
 
-    // Generate a new key pair for the server
+    // new server key pair
     let server_key_pair = KeyPair::generate()?;
 
-    // Sign the server certificate using the CA
+    // sign server cert with CA
     let server_cert = params.signed_by(&server_key_pair, issuer)?;
 
     let server_cert_pem = server_cert.pem();
@@ -124,20 +124,20 @@ mod tests {
 
     #[test]
     fn test_generate_ca_and_server_cert() {
-        // Load or initialize CA
-        let (issuer, ca_cert_pem) = load_or_init_ca().expect("Failed to initialize/load CA");
+        // load or initialize CA
+        let (issuer, ca_cert_pem) = load_or_init_ca().expect("failed to init/load CA");
 
         info!("CA certificate PEM:\n{}", ca_cert_pem);
 
         let domains = vec!["arkkvm.dev".to_string(), "localhost".to_string()];
         let (server_cert_pem, server_key_pem) =
-            generate_server_cert(&issuer, domains).expect("Failed to generate server certificate");
+            generate_server_cert(&issuer, domains).expect("failed to generate server certificate");
 
-        info!("\nSuccessfully generated and signed the server certificate!");
+        info!("\nServer certificate generated and signed successfully.");
         info!("Server certificate PEM:\n{}", server_cert_pem);
         info!("Server private key PEM:\n{}", server_key_pem);
 
-        // Simple assertions to validate PEM format
+        // basic PEM format assertions
         assert!(ca_cert_pem.contains("-----BEGIN CERTIFICATE-----"));
         assert!(server_cert_pem.contains("-----BEGIN CERTIFICATE-----"));
         assert!(server_key_pem.contains("-----BEGIN PRIVATE KEY-----"));

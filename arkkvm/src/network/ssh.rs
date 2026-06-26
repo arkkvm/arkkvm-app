@@ -125,7 +125,7 @@ async fn clear_ssh_key() -> Result<()> {
 // SSHD service management
 // =====================
 
-/// Start sshd service
+/// Start sshd
 pub async fn start_sshd() -> Result<()> {
     if !Path::new(SSHD_PATH).exists() {
         return Err(anyhow!("SSHD init script not found: {}", SSHD_PATH));
@@ -147,7 +147,7 @@ pub async fn start_sshd() -> Result<()> {
     }
 }
 
-/// Stop sshd service
+/// Stop sshd
 pub async fn stop_sshd() -> Result<()> {
     if !Path::new(SSHD_PATH).exists() {
         return Err(anyhow!("SSHD init script not found: {}", SSHD_PATH));
@@ -169,7 +169,7 @@ pub async fn stop_sshd() -> Result<()> {
     }
 }
 
-/// Restart sshd service
+/// Restart sshd
 pub async fn restart_sshd() -> Result<()> {
     if !Path::new(SSHD_PATH).exists() {
         return Err(anyhow!("SSHD init script not found: {}", SSHD_PATH));

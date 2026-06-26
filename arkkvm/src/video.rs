@@ -98,10 +98,12 @@ pub async fn ensure_video_pipeline_started() -> anyhow::Result<()> {
 
 pub async fn attach_webrtc_sink(track: Arc<TrackLocalStaticSample>) {
     *VIDEO_SINK.write().await = Some(track);
+    info!("video webrtc sink attached");
 }
 
 pub async fn detach_webrtc_sink() {
     *VIDEO_SINK.write().await = None;
+    info!("video webrtc sink detached");
 }
 
 pub async fn equal_webrtc_sink(track: Arc<TrackLocalStaticSample>) -> bool {
@@ -114,6 +116,10 @@ pub async fn equal_webrtc_sink(track: Arc<TrackLocalStaticSample>) -> bool {
 }
 
 async fn video_frame_writer(mut rx: mpsc::Receiver<FramePacket>) {
+    const VIDEO_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+    const VIDEO_WRITE_FAIL_DETACH_THRESHOLD: u32 = 3;
+    let mut consecutive_write_failures: u32 = 0;
+
     // let mut last_ts: Option<u64> = None;
     // let mut last_time: Option<Instant> = None;
     while let Some((data, pts_us, fps)) = rx.recv().await {
@@ -130,14 +136,42 @@ async fn video_frame_writer(mut rx: mpsc::Receiver<FramePacket>) {
         // };
         // last_time = Some(Instant::now());
 
-        if let Some(track) = VIDEO_SINK.read().await.as_ref() {
+        let mut should_detach_sink = false;
+        if let Some(track) = VIDEO_SINK.read().await.clone() {
             // data is already Bytes, no conversion needed
             let capture_time = UNIX_EPOCH + Duration::from_micros(pts_us);
             let sample = Sample { data, duration: Duration::from_millis((1000.0 / fps) as u64), timestamp: capture_time, ..Default::default() };
-            if let Err(e) = track.write_sample(&sample).await {
-                warn!("error writing video sample: {}", e);
-                VIDEO_DROP_COUNTER.inc();
+            match tokio::time::timeout(VIDEO_WRITE_TIMEOUT, track.write_sample(&sample)).await {
+                Ok(Ok(())) => {
+                    consecutive_write_failures = 0;
+                }
+                Ok(Err(e)) => {
+                    consecutive_write_failures = consecutive_write_failures.saturating_add(1);
+                    warn!("error writing video sample: {}", e);
+                    VIDEO_DROP_COUNTER.inc();
+                }
+                Err(_) => {
+                    consecutive_write_failures = consecutive_write_failures.saturating_add(1);
+                    warn!(
+                        "timed out writing video sample after {:?}",
+                        VIDEO_WRITE_TIMEOUT
+                    );
+                    VIDEO_DROP_COUNTER.inc();
+                }
             }
+
+            if consecutive_write_failures > VIDEO_WRITE_FAIL_DETACH_THRESHOLD {
+                warn!(
+                    "detaching video sink after {} consecutive write failures",
+                    consecutive_write_failures
+                );
+                should_detach_sink = true;
+                consecutive_write_failures = 0;
+            }
+        }
+
+        if should_detach_sink {
+            detach_webrtc_sink().await;
         }
 
         // last_ts = Some(pts_us);
@@ -145,10 +179,10 @@ async fn video_frame_writer(mut rx: mpsc::Receiver<FramePacket>) {
     error!("video frame writer stopped");
 }
 
-pub fn on_frame_received(data: Bytes, pts_us: u64, fps: f64) {
+pub fn on_frame_received(data: &[u8], pts_us: u64, fps: f64) {
     if let Some(tx) = VIDEO_FRAME_TX.get() {
-        if let Err(e) = tx.try_send((data, pts_us, fps)) {
-            warn!("Failed to send video frame: {:?}", e);
+        if let Err(e) = tx.try_send((Bytes::copy_from_slice(data), pts_us, fps)) {
+            // warn!("Failed to send video frame: {:?}", e);
             VIDEO_DROP_COUNTER.inc();
         }
     }
@@ -275,6 +309,7 @@ pub async fn stop_native_video() {
     
     if let Some(capture) = capture_guard.as_ref() {
         capture.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(2000)).await;
         *capture_guard = None;
     }
 

@@ -1,0 +1,212 @@
+syntax = "proto3";
+
+package arkkvm.usb_devices.v1;
+
+// Device function switches (mirrors config::DeviceSwitches).
+message DeviceSwitches {
+  bool hid_kb_rel_enabled = 1; // keyboard + relative mouse (single HID function)
+  bool hid_abs_enabled = 2;
+  reserved 3;
+  reserved "hid_rel_enabled";
+  bool ums_vm_enabled = 4;
+  bool ums_ft_enabled = 5;
+  bool uac1_enabled = 6;
+  bool uvc_enabled = 7;
+} 
+
+enum UMS_VM_TYPE{
+    UNKNOWN = 0;
+    VM_CD_ROM = 1;
+    VM_DISK= 2;
+}
+
+message UsbDeviceInfo{
+  DeviceSwitches switches = 1;
+  UMS_VM_TYPE ums_vm_type = 2;
+  string ums_vm_path = 3;
+  string ums_ft_path = 4;
+}
+
+// message DeviceSwitches{
+//   optional bool hid_kb_rel_enabled = 1;
+//   optional bool hid_abs_enabled = 2;
+//   optional bool ums_vm_enabled = 3;
+//   optional bool ums_ft_enabled = 4;
+//   optional bool uac1_enabled = 5;
+//   optional bool uvc_enabled = 6;
+// }
+// message SwitchPatch {
+//   oneof patch {
+//     DeviceSwitches full = 1;
+//     PartialSwitchPatch partial = 2;
+//   }
+// }
+
+message ApplySwitchesRequest {
+  UsbDeviceInfo usbInfo = 1;
+}
+
+message ApplySwitchesResponse {
+  bool ok = 1;
+  DeviceSwitches applied = 2;
+  optional string error = 3;
+}
+
+message RuntimeUsbConfig {
+  string vendor_id = 1;
+  string product_id = 2;
+  string serial_number = 3;
+  string manufacturer = 4;
+  string product = 5;
+}
+
+enum ApplyErrorCode {
+  APPLY_ERROR_CODE_UNSPECIFIED = 0;
+  APPLY_ERROR_CODE_USB_GADGET_BUSY = 1;
+  APPLY_ERROR_CODE_INVALID_ARGUMENT = 2;
+  APPLY_ERROR_CODE_INTERNAL = 3;
+}
+
+message ApplyRuntimeConfigRequest {
+  RuntimeUsbConfig usb_config = 1;
+  UsbDeviceInfo usb_info = 2;
+  string reason = 3;
+  string request_id = 4;
+  bool mic_process_enabled = 5;
+}
+
+message SetMicProcessRequest {
+  bool enabled = 1;
+}
+
+message SetMicProcessResponse {
+  bool ok = 1;
+  optional string error = 2;
+}
+
+// arkkvm_mic subprocess lifecycle (published by usb_devices sidecar).
+message MicProcessStateEvent {
+  bool running = 1;
+}
+
+message GetMicProcessStateRequest {}
+
+message GetMicProcessStateResponse {
+  bool ok = 1;
+  bool running = 2;
+  optional string error = 3;
+}
+
+message ApplyRuntimeConfigResponse {
+  bool ok = 1;
+  DeviceSwitches applied = 2;
+  optional string error = 3;
+  ApplyErrorCode error_code = 4;
+  bool retryable = 5;
+  UsbDeviceInfo applied_usb_info = 6;
+}
+
+message GetSwitchesRequest {}
+
+message GetSwitchesResponse {
+  bool ok = 1;
+  DeviceSwitches applied = 2;
+  optional string error = 3;
+}
+
+// 键盘报告
+message KeyboardReportParams {
+  uint32 modifier = 1;      // 键盘修饰键（Ctrl / Shift / Alt 等）
+  bytes  keys = 2;  // 当前按下的键值列表
+}
+
+// 绝对鼠标报告
+message AbsMouseReportParams {
+  int32 x = 1;              // 绝对 X 坐标
+  int32 y = 2;              // 绝对 Y 坐标
+  uint32 buttons = 3;       // 鼠标按键状态
+  bool by_user = 4;          // 是否由用户触发（true）还是程序模拟（false）
+}
+
+// 相对鼠标报告
+message RelMouseReportParams {
+  int32 dx = 1;             // X 方向偏移
+  int32 dy = 2;             // Y 方向偏移
+  uint32 buttons = 3;       // 鼠标按键状态
+  bool by_user = 4;          // 是否由用户触发（true）还是程序模拟（false）
+}
+
+// 键盘状态（LED 灯状态）
+message KeyboardState {
+  bool num_lock = 1;
+  bool caps_lock = 2;
+  bool scroll_lock = 3;
+  bool compose = 4;
+  bool kana = 5;
+}
+
+message WheelReportParams{
+  uint32 wheel_y =1;
+}
+
+// UMS 虚拟存储独立控制（挂载/卸载/查询），不触发 gadget 重建。
+enum UmsTarget {
+  UMS_TARGET_UNSPECIFIED = 0;
+  UMS_VM = 1;
+  UMS_FT = 2;
+}
+
+enum UmsOperation {
+  UMS_OP_UNSPECIFIED = 0;
+  UMS_MOUNT = 1;
+  UMS_UNMOUNT = 2;
+  UMS_SWITCH_VM_MODE = 3;
+  UMS_GET_MOUNT_STATE = 4;
+}
+
+message UmsControlRequest {
+  UmsOperation operation = 1;
+  UmsTarget target = 2;
+  string image_path = 3;
+  UMS_VM_TYPE vm_type = 4;
+}
+
+message UmsControlResponse {
+  bool ok = 1;
+  optional string error = 2;
+  bool mounted = 3;
+  string mounted_path = 4;
+  // VM LUN 当前模式（仅 UMS_GET_MOUNT_STATE + UMS_VM 时有效）
+  UMS_VM_TYPE vm_type = 5;
+}
+
+// UDC 物理连接状态（sysfs 原始小写字符串，如 "configured"）
+message UdcStatus {
+  string state = 1;
+}
+
+message GetUdcStatusRequest {}
+
+message GetUdcStatusResponse {
+  bool ok = 1;
+  string state = 2;
+  optional string error = 3;
+}
+
+message GetUsbEmulationStateRequest {}
+
+message GetUsbEmulationStateResponse {
+  bool ok = 1;
+  bool enabled = 2;
+  optional string error = 3;
+}
+
+message SetUsbEmulationStateRequest {
+  bool enabled = 1;
+}
+
+message SetUsbEmulationStateResponse {
+  bool ok = 1;
+  bool enabled = 2;
+  optional string error = 3;
+}

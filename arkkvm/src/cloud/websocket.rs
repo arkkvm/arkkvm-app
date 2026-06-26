@@ -4,6 +4,7 @@ use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
+use tokio::sync::watch;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -12,8 +13,9 @@ use tracing::{debug, error, info, warn};
 
 use super::oidc::OidcAuthenticator;
 use super::types::WebRTCSessionRequest;
+use super::WEBSOCKET_PING_INTERVAL;
 use crate::config::get_config_manager;
-use crate::ota;
+use crate::{common, ota};
 
 // Global write channel for cloud WS
 static CLOUD_WS_TX: tokio::sync::OnceCell<
@@ -28,11 +30,19 @@ pub async fn cloud_ws_set_tx(tx: Option<tokio::sync::mpsc::UnboundedSender<Messa
 pub async fn cloud_ws_send_json(value: &serde_json::Value) -> anyhow::Result<()> {
     let cell = CLOUD_WS_TX.get_or_init(|| async { RwLock::new(None) }).await;
     if let Some(tx) = cell.read().await.as_ref() {
-        let _ = tx.send(Message::Text(value.to_string().as_str().into()));
+        tx.send(Message::Text(value.to_string().as_str().into()))?;
         Ok(())
     } else {
         anyhow::bail!("cloud ws tx not available")
     }
+}
+
+pub async fn cloud_ws_close() -> Result<()> {
+    let cell = CLOUD_WS_TX.get_or_init(|| async { RwLock::new(None) }).await;
+    if let Some(tx) = cell.read().await.as_ref() {
+        tx.send(Message::Close(None))?;
+    }
+    Ok(())
 }
 
 /// Cloud WebSocket client for handling cloud connections
@@ -56,77 +66,120 @@ impl CloudWebSocketClient {
         // Build handshake request with headers
         let mut req = ws_url.clone().into_client_request()?;
         {
-            let device_version = serde_json::to_value(ota::get_current_version().await?)?.to_string();
+            let current_version = ota::get_current_version(false).await?;
+            let app_version = current_version.app_version.clone();
+            let web_version = current_version.web_version.clone();
+
             let headers = req.headers_mut();
             headers.insert("X-Device-ID", HeaderValue::from_str(&self.device_id)?);
-            headers.insert("X-App-Version", HeaderValue::from_static(env!("CARGO_PKG_VERSION")));
+            headers.insert("X-App-Version", HeaderValue::from_str(app_version.as_str())?);
             headers
                 .insert("Authorization", HeaderValue::from_str(&format!("Bearer {}", self.token))?);
-            headers.insert("x-cloud-version", HeaderValue::from_str(device_version.as_str())?);
+            headers.insert("x-web-version", HeaderValue::from_str(web_version.as_str())?);
+            headers.insert("X-ignore-ping", HeaderValue::from_str("true")?);
         }
 
         // Connect with request (no initial auth message)
         let (ws_stream, _) = connect_async(req).await?;
-        let (write, read) = ws_stream.split();
+        let (mut write, mut read) = ws_stream.split();
+        info!("Cloud WebSocket connection established");
 
         // Create channel for sending messages
         let (write_tx, mut write_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
         self.write_tx = Some(write_tx.clone());
         cloud_ws_set_tx(Some(write_tx.clone())).await;
 
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
         // Spawn task to handle outgoing messages
-        let mut w = write;
+        let shutdown_tx_write = shutdown_tx.clone();
         let write_task = tokio::spawn(async move {
             while let Some(msg) = write_rx.recv().await {
-                if let Err(e) = w.send(msg).await {
+                let is_close = matches!(&msg, Message::Close(_));
+                if is_close {
+                    info!("WebSocket connection closed by device");
+                }
+                if let Err(e) = write.send(msg).await {
                     error!("Failed to send message to cloud: {}", e);
+                    let _ = shutdown_tx_write.send(true);
+                    break;
+                }
+                if is_close {
+                    break;
+                }
+            }
+        });
+
+        let shutdown_tx_ping = shutdown_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(WEBSOCKET_PING_INTERVAL).await;
+                if write_tx.send(Message::Ping(bytes::Bytes::new())).is_err() {
+                    warn!("Failed to send ping to cloud: channel closed");
+                    let _ = shutdown_tx_ping.send(true);
                     break;
                 }
             }
         });
 
         // Handle incoming messages
-        let mut read_handle = read;
-        while let Some(msg) = read_handle.next().await {
-            match msg {
-                Ok(msg) => match msg {
-                    Message::Text(text) => {
-                        if let Err(e) = self.handle_message(&text).await {
-                            error!("Failed to handle message: {}", e);
-                        }
-                    }
-                    Message::Close(_) => {
-                        info!("WebSocket connection closed by server");
+        info!("Cloud WebSocket Starting to handle incoming messages");
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    if changed.is_ok() && *shutdown_rx.borrow_and_update() {
+                        info!("WebSocket write path failed, closing read loop");
                         break;
                     }
-                    Message::Ping(data) => {
-                        if let Some(tx) = &self.write_tx {
-                            let _ = tx.send(Message::Pong(data));
-                        }
-                    }
-                    _ => {}
-                },
-                Err(e) => {
-                    // Special handling for UnexpectedEof
-                    match e {
-                        Error::Io(io_err) if io_err.kind() == ErrorKind::UnexpectedEof => {
-                            info!(
-                                "WebSocket connection closed by peer without close_notify (UnexpectedEof)"
-                            );
-                            return Err(io_err.into());
-                        }
-                        Error::ConnectionClosed => {
-                            info!("WebSocket connection closed by peer");
-                            break;
-                        }
-                        _ => {
-                            error!("WebSocket error: {}", e);
-                            return Err(e.into());
+                }
+                msg = read.next() => {
+                    match msg {
+                        None => break,
+                        Some(Ok(msg)) => match msg {
+                            Message::Text(text) => {
+                                if let Err(e) = self.handle_message(&text).await {
+                                    error!("Failed to handle message: {}", e);
+                                }
+                            }
+                            Message::Close(_) => {
+                                info!("WebSocket connection closed by server");
+                                break;
+                            }
+                            Message::Ping(data) => {
+                                if let Some(tx) = &self.write_tx {
+                                    let _ = tx.send(Message::Pong(data));
+                                }
+                            }
+                            _ => {}
+                        },
+                        Some(Err(e)) => {
+                            match e {
+                                Error::Io(io_err) if io_err.kind() == ErrorKind::UnexpectedEof => {
+                                    info!(
+                                        "WebSocket connection closed by peer without close_notify (UnexpectedEof)"
+                                    );
+                                    write_task.abort();
+                                    cloud_ws_set_tx(None).await;
+                                    return Err(io_err.into());
+                                }
+                                Error::ConnectionClosed => {
+                                    info!("WebSocket connection closed by peer");
+                                    break;
+                                }
+                                _ => {
+                                    error!("WebSocket error: {}", e);
+                                    write_task.abort();
+                                    cloud_ws_set_tx(None).await;
+                                    return Err(e.into());
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+        info!("Cloud WebSocket connection closed");
 
         // Cancel the write task
         write_task.abort();
@@ -137,7 +190,7 @@ impl CloudWebSocketClient {
     /// Handle incoming WebSocket messages
     async fn handle_message(&self, message: &str) -> Result<()> {
         let parsed: Value = serde_json::from_str(message).map_err(|e| {
-            error!("Failed to parse WebSocket message: {}", e);
+            error!("Failed to parse WebSocket message: {}, message: {}", e, message);
             anyhow::anyhow!("Invalid JSON message: {}", e)
         })?;
 
@@ -260,7 +313,7 @@ impl CloudWebSocketClient {
         // Add session to app state
         info!("Cloud WebRTC session created successfully with id: {}", &session_id);
         // app_state.add_session(session).await;
-        // app_state.set_current_session_id(Some(session_id)).await;
+        app_state.set_current_session_id(Some(session_id)).await;
         Ok(())
     }
 

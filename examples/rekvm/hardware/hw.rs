@@ -36,16 +36,6 @@ async fn main() -> Result<()> {
 async fn test_device_id_extraction() -> Result<()> {
     info!("Testing device ID extraction...");
 
-    match hw::extract_serial_number() {
-        Ok(serial) => {
-            info!("✅ Successfully extracted device serial: {}", serial);
-        }
-        Err(e) => {
-            warn!("⚠️  Failed to extract device serial: {}", e);
-            // This is expected on non-RV1106 devices
-        }
-    }
-
     // Test cached device ID
     let device_id = hw::get_device_id();
     info!("📱 Device ID (cached): {}", device_id);

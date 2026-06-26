@@ -18,8 +18,9 @@ use tokio::process::Command;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use crate::cloud::manager::get_cloud_manager;
+use crate::cloud::manager::{PUBLIC_KEY, get_cloud_manager};
 use crate::cloud::{CloudManager, OtaInfo};
+use crate::common;
 use crate::config::get_config_manager;
 use crate::hardware::usb;
 use crate::jsonrpc::handlers::RebootParams;
@@ -32,16 +33,6 @@ const OTA_PACKAGE_ROOT_PATH: &str = "/ota/img";
 const OTA_CLI: &str = "rk_ota";
 const OTA_WAIT_TIME: Duration = Duration::from_mins(20);
 const SLEEP_TIME: Duration = Duration::from_mins(1);
-
-const PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvWvPLrqK9fvwcLPHnik2
-x73lcC9Nmv3rAain35tp9G/ULUTQeEOfQa5wT/Dlx8P61s3ZmFmvn3FopYK8CH85
-87dILdljOIXbPayeUEO/QWyLnfCqedx0hFHk7zbPNinVT1T6HFWGBKcJfvC6Slbh
-OysBeW2hzQlTRb23iz3nGiFiOSvl+fSTRV4ohicVzaNXWMA3fdbUEVW7n8JFk9F1
-80W/UfHcaC3wRrsF9bw6jBhPeT9z86hb7Kl6/JXSYjXslSfYfLZRsisFwRUTwApv
-M5VOWHvyVDm8Ks/e32smN+p4b79ktnNkMLOluier4j3kn9eU/ka95GK6Vnt98lqK
-wQIDAQAB
------END PUBLIC KEY-----";
 
 lazy_static::lazy_static! {
     static ref OTA_INFO: Arc<RwLock<Option<OtaInfo>>> = Arc::new(RwLock::new(None));
@@ -98,7 +89,7 @@ pub async fn set_auto_update(enabled: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn on_power_on() {
+pub async fn check_ota_update_finished() {
     if Path::new(OTA_PACKAGE_ROOT_PATH).exists() {
         info!("OTA Update Finished, Try Lock System");
         match Command::new(OTA_CLI).args(["--misc=now"]).output().await {
@@ -125,13 +116,24 @@ pub async fn on_power_on() {
     }
 }
 
+pub async fn power_on_ota_update() {
+    if get_auto_update().await {
+        AUTO_UPDATE_SWITCH.store(true, std::sync::atomic::Ordering::Relaxed);
+        let ota_info = check_update(false).await;
+        info!("Power on update: Get OTA info: {:?}", ota_info);
+    }
+    else {
+        warn!("Power on update: Auto update is disabled");
+    }
+}
+
 pub async fn check_update(by_user: bool) -> Result<UpdateInfo> {
     let auto_update = get_auto_update().await;
     if !by_user && !auto_update {
         return Err(anyhow!("Auto update is disabled"));
     }
 
-    let current_version = get_current_version().await?;
+    let current_version = get_current_version(false).await?;
     let manager = get_cloud_manager();
     let ota_info = match manager
         .get_ota_info(current_version.system_version.as_str(), current_version.app_version.as_str())
@@ -180,12 +182,10 @@ pub async fn try_update_by_user() -> Result<()> {
     Ok(())
 }
 
-pub async fn get_current_version() -> Result<VersionInfo> {
-    let system_out = Command::new("cat").args(["/etc/version/system"]).output().await?;
-    let app_out = Command::new("cat").args(["/etc/version/app"]).output().await?;
-    let system_version = String::from_utf8(system_out.stdout)?.replace("\n", "");
-    let app_version = String::from_utf8(app_out.stdout)?.replace("\n", "");
-    let web_version = CloudManager::get_web_version_info().await.unwrap_or_default();
+pub async fn get_current_version(is_show: bool) -> Result<VersionInfo> {
+    let system_version = common::get_system_version().await?;
+    let app_version = common::get_app_version(is_show);
+    let web_version = common::get_web_version(is_show).await;
     Ok(VersionInfo { app_version, system_version, web_version })
 }
 
@@ -256,7 +256,7 @@ fn run_loop() {
                 break;
             } else {
                 let remaining = time.signed_duration_since(now);
-                warn!("run_loop: Still waiting, time remaining: {:?}", remaining);
+                debug!("run_loop: Still waiting, time remaining: {:?}", remaining);
             }
 
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -376,10 +376,7 @@ fn ready_update(by_user: bool) {
                         let mut do_update = true;
                         if get_current_session().await.is_some() {
                             info!("ready_update: Active session detected, checking USB input time");
-                            let elapsed = match usb::get_hid() {
-                                Some(hid) => hid.get_last_user_input_time_offset().await,
-                                None => u64::MAX,
-                            };
+                            let elapsed = usb::seconds_since_last_user_input();
                             info!(
                                 "ready_update: Last input msg was {:?} ago (wait time: {:?})",
                                 elapsed, OTA_WAIT_TIME

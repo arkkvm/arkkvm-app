@@ -1,114 +1,114 @@
-//! Path Resolution Demonstration
+//! Path resolution demo
 //!
-//! This example demonstrates RemoteFs path resolution and shows how the frontend should correctly use absolute paths.
+//! Demonstrates RemoteFs path resolution and how the frontend should use absolute paths.
 
 use anyhow::Result;
 use arkkvm::hardware::fs_remote::RemoteFs;
 use tracing::{error, info, warn};
 
-/// Path resolution demonstration
+/// Demonstrate path resolution
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
+    // init logging
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
-
-    info!("RemoteFs Path Resolution Demonstration");
+    
+    info!("RemoteFs path resolution demo");
     info!("=============================");
-    info!("This demo shows how the frontend accesses the mounted file system using absolute paths");
+    info!("This demo shows how the frontend can use absolute paths on the mounted filesystem");
     info!();
-
-    // Create a RemoteFs instance
+    
+    // create RemoteFs instance
     let mut fs_manager = RemoteFs::new();
-
-    info!("Default configuration:");
-    info!("  Image file path: {}", fs_manager.image_path().display());
-    info!("  Mount point: {}", fs_manager.mount_point().display());
+    
+    info!("Default config:");
+    info!("  image path: {}", fs_manager.image_path().display());
+    info!("  mount point: {}", fs_manager.mount_point().display());
     info!();
-
-    // Attempt to mount (may fail because there is no image file)
+    
+    // try mount (may fail if no image file exists)
     match fs_manager.mount().await {
         Ok(_) => {
-            info!("✅ Successfully mounted file system");
+            info!("✅ filesystem mounted");
             info!();
-
-            // Path resolution demo
+            
+            // path resolution demo
             info!("Path resolution demo:");
-            info!("The frontend can use any of the following path formats, and they will be resolved correctly:");
+            info!("The frontend may use any of the following path forms; all are resolved correctly:");
             info!();
-
+            
             let test_paths = vec![
-                ("/", "Root directory"),
-                ("/test.txt", "File under root directory"),
-                ("/documents/readme.txt", "File under subdirectory"),
-                ("/documents/subdir/file.txt", "File in a deep directory"),
-                ("test.txt", "Relative path file"),
-                ("documents/readme.txt", "Relative path subdirectory file"),
+                ("/", "root directory"),
+                ("/test.txt", "file at root"),
+                ("/documents/readme.txt", "file in subdirectory"),
+                ("/documents/subdir/file.txt", "file in nested directory"),
+                ("test.txt", "relative path file"),
+                ("documents/readme.txt", "relative path in subdirectory"),
             ];
-
+            
             for (path, description) in test_paths {
                 info!("  📁 {} -> {}", path, description);
             }
-
+            
             info!();
-            info!("All paths starting with '/' will be automatically converted to paths relative to the mount point:");
+            info!("Paths starting with '/' are converted relative to the mount point:");
             info!("  '/test.txt' -> '{}/test.txt'", fs_manager.mount_point().display());
             info!("  '/documents/file.txt' -> '{}/documents/file.txt'", fs_manager.mount_point().display());
             info!();
-
-            // Actually test some file operations
-            info!("File operation test:");
-
-            // Write file (using an absolute path)
-            let content = "This is a test file created using an absolute path.\n";
+            
+            // file operation tests
+            info!("File operation tests:");
+            
+            // write file (absolute path)
+            let content = "Test file created via absolute path.\n";
             match fs_manager.write_file_as_string("/demo_file.txt", content).await {
                 Ok(_) => {
-                    info!("✅ Successfully created file using absolute path '/demo_file.txt'");
-
-                    // Read file for verification
+                    info!("✅ created '/demo_file.txt' via absolute path");
+                    
+                    // read back
                     match fs_manager.read_file_as_string("/demo_file.txt").await {
                         Ok(read_content) => {
-                            info!("✅ Successfully read file contents: {}", read_content.trim());
+                            info!("✅ read file content: {}", read_content.trim());
                         }
-                        Err(e) => error!("❌ Failed to read file: {}", e),
+                        Err(e) => error!("❌ failed to read file: {}", e),
                     }
                 }
-                Err(e) => error!("❌ Failed to create file: {}", e),
+                Err(e) => error!("❌ failed to create file: {}", e),
             }
-
-            // Create directory (using an absolute path)
+            
+            // create directory (absolute path)
             match fs_manager.create_directory("/demo_dir").await {
                 Ok(_) => {
-                    info!("✅ Successfully created directory using absolute path '/demo_dir'");
-
-                    // Create a file inside the directory
-                    match fs_manager.write_file_as_string("/demo_dir/nested_file.txt", "Nested file content").await {
+                    info!("✅ created '/demo_dir' via absolute path");
+                    
+                    // nested file
+                    match fs_manager.write_file_as_string("/demo_dir/nested_file.txt", "nested file content").await {
                         Ok(_) => {
-                            info!("✅ Successfully created nested file in the absolute-path directory");
-
-                            // List directory contents
+                            info!("✅ created nested file under absolute path directory");
+                            
+                            // list directory
                             match fs_manager.list_directory("/demo_dir").await {
                                 Ok(entries) => {
-                                    info!("✅ Directory contents ({} items):", entries.len());
+                                    info!("✅ directory entries ({}):", entries.len());
                                     for entry in entries {
                                         let entry_type = if entry.is_directory { "📁" } else { "📄" };
                                         info!("  {} {}", entry_type, entry.name);
                                     }
                                 }
-                                Err(e) => error!("❌ Failed to list directory: {}", e),
+                                Err(e) => error!("❌ failed to list directory: {}", e),
                             }
                         }
-                        Err(e) => error!("❌ Failed to create nested file: {}", e),
+                        Err(e) => error!("❌ failed to create nested file: {}", e),
                     }
                 }
-                Err(e) => error!("❌ Failed to create directory: {}", e),
+                Err(e) => error!("❌ failed to create directory: {}", e),
             }
-
-            // Test path validation
+            
+            // path validation tests
             info!();
-            info!("Path validation test:");
-
+            info!("Path validation tests:");
+            
             let unsafe_paths = vec![
                 "./file.txt",
                 "../file.txt",
@@ -117,28 +117,28 @@ async fn main() -> Result<()> {
                 "/dir/./file.txt",
                 "/dir/../file.txt",
             ];
-
+            
             for unsafe_path in unsafe_paths {
-                match fs_manager.write_file_as_string(unsafe_path, "Test content").await {
-                    Ok(_) => error!("❌ Insecure path '{}' was incorrectly allowed", unsafe_path),
-                    Err(e) => info!("✅ Correctly rejected insecure path '{}': {}", unsafe_path, e),
+                match fs_manager.write_file_as_string(unsafe_path, "test content").await {
+                    Ok(_) => error!("❌ unsafe path '{}' was incorrectly allowed", unsafe_path),
+                    Err(e) => info!("✅ correctly rejected unsafe path '{}': {}", unsafe_path, e),
                 }
             }
-
-            // Test mixed path formats
+            
+            // mixed path formats
             info!();
-            info!("Mixed path format test:");
-
-            // Create a file using a relative path
-            match fs_manager.write_file_as_string("relative_file.txt", "Relative path file").await {
-                Ok(_) => info!("✅ Successfully created file using relative path 'relative_file.txt'"),
-                Err(e) => error!("❌ Failed to create relative path file: {}", e),
+            info!("Mixed path format tests:");
+            
+            // relative path file
+            match fs_manager.write_file_as_string("relative_file.txt", "relative path file").await {
+                Ok(_) => info!("✅ created 'relative_file.txt' via relative path"),
+                Err(e) => error!("❌ failed to create relative path file: {}", e),
             }
-
-            // List the root directory; it should show all created files
+            
+            // list root
             match fs_manager.list_directory("/").await {
                 Ok(entries) => {
-                    info!("✅ Root directory contents ({} items):", entries.len());
+                    info!("✅ root directory entries ({}):", entries.len());
                     for entry in entries {
                         let entry_type = if entry.is_directory { "📁" } else { "📄" };
                         let size_info = if entry.is_file && entry.size > 0 {
@@ -149,43 +149,43 @@ async fn main() -> Result<()> {
                         info!("  {} {}{}", entry_type, entry.name, size_info);
                     }
                 }
-                Err(e) => error!("❌ Failed to list root directory: {}", e),
+                Err(e) => error!("❌ failed to list root directory: {}", e),
             }
-
-            // Clean up test files
+            
+            // cleanup
             info!();
             info!("Cleaning up test files...");
             let _ = fs_manager.delete_file("/demo_file.txt").await;
             let _ = fs_manager.delete_file("/demo_dir/nested_file.txt").await;
             let _ = fs_manager.delete_directory("/demo_dir").await;
             let _ = fs_manager.delete_file("relative_file.txt").await;
-
-            // Unmount
+            
+            // unmount
             match fs_manager.unmount().await {
-                Ok(_) => info!("✅ Successfully unmounted file system"),
-                Err(e) => error!("❌ Failed to unmount file system: {}", e),
+                Ok(_) => info!("✅ filesystem unmounted"),
+                Err(e) => error!("❌ failed to unmount filesystem: {}", e),
             }
         }
         Err(e) => {
-            warn!("⚠️ Mount failed (this is normal if the image file does not exist): {}", e);
+            warn!("⚠️  mount failed (expected if no image file exists): {}", e);
             info!();
-            info!("💡 Notes on path resolution and validation:");
-            info!("   - The frontend can safely use absolute paths (e.g., '/', '/file.txt', '/dir/file.txt')");
-            info!("   - These paths are automatically converted to paths relative to the mount point");
-            info!("   - The frontend does not need to know the actual mount point path");
-            info!("   - Relative paths also work properly");
-            info!("   - Insecure paths (e.g., './file.txt', '../file.txt') are automatically rejected");
-            info!("   - This prevents path traversal attacks and ensures file operations stay within the mounted file system");
+            info!("💡 Path resolution and validation notes:");
+            info!("   - Frontend may safely use absolute paths (e.g. '/', '/file.txt', '/dir/file.txt')");
+            info!("   - These are converted relative to the mount point automatically");
+            info!("   - Frontend does not need to know the actual mount point path");
+            info!("   - Relative paths work as well");
+            info!("   - Unsafe paths (e.g. './file.txt', '../file.txt') are rejected");
+            info!("   - Prevents path traversal; file ops stay within the mounted filesystem");
             info!();
-            info!("💡 To run the full demo, make sure you have an available image file");
+            info!("💡 For the full demo, ensure a usable image file is available");
         }
     }
-
+    
     info!();
     info!("=============================");
-    info!("Path resolution demo completed");
-    info!("💡 The frontend can now safely use absolute paths to access the file system");
-    info!("💡 Insecure paths are automatically rejected to keep the system safe");
-
+    info!("Path resolution demo complete");
+    info!("💡 Frontend may safely use absolute paths to access the filesystem");
+    info!("💡 Unsafe paths are rejected to keep the system secure");
+    
     Ok(())
 }

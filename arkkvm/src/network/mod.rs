@@ -27,10 +27,42 @@ use libc::{
 pub mod settings;
 pub mod ssh;
 pub mod mdns;
+pub mod static_ip_config;
+pub mod vlan;
+
+const DHCP_RENEW_PATH: &str = "/etc/init.d/S15dhcpcd";
 
 static LINE_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$").expect("invalid udhcpc info regex")
 });
+static NETWORK_INTERFACE: Lazy<NetworkInterfaceState> = Lazy::new(|| NetworkInterfaceState::default());
+
+/// Query live network state for an arbitrary interface (e.g. eth0.40).
+pub async fn get_interface_network_state(interface_name: &str) -> RpcNetworkState {
+    NetworkInterfaceState::new(interface_name)
+        .rpc_get_network_state()
+        .await
+}
+
+pub fn check_valid_ipv4(address: &str) -> bool {
+    match address.parse::<std::net::Ipv4Addr>() {
+        Ok(address) => !address.is_unspecified(),
+        Err(e) => {
+            warn!("Invalid IPv4 address: {}", address);
+            false
+        }
+    }
+}
+
+pub fn check_valid_ipv6(address: &str) -> bool {
+    match address.parse::<std::net::Ipv6Addr>() {
+        Ok(address) => !address.is_unspecified(),
+        Err(e) => {
+            warn!("Invalid IPv6 address: {}", address);
+            false
+        }
+    }
+}
 
 fn split_space(s: &str) -> Vec<String> {
     s.split_whitespace().map(|v| v.to_string()).collect()
@@ -128,7 +160,7 @@ pub enum IPv6AddressType {
 }
 
 /// Determine if a ULA address is stable
-///
+/// 
 /// Criteria for stable addresses (in priority order):
 /// 1. IFA_F_TEMPORARY flag (0x80) indicates temporary address, definitely not stable
 /// 2. IFA_F_PERMANENT flag (0x02) indicates permanent address, definitely stable
@@ -143,7 +175,7 @@ pub fn is_stable_ula_address(
     // Linux kernel flag definitions
     const IFA_F_PERMANENT: u8 = 0x02;  // Permanent address
     const IFA_F_TEMPORARY: u8 = 0x80;  // Temporary address (privacy address)
-
+    
     // First check flags (most reliable method)
     if let Some(flags_val) = flags {
         // If IFA_F_TEMPORARY is set, definitely not stable
@@ -160,7 +192,7 @@ pub fn is_stable_ula_address(
             return true;
         }
     }
-
+    
     // If flags are not set, use other criteria
     // Check lifetime: if valid_lifetime > 7 days, usually considered stable
     if let Some(valid_until) = valid_lifetime {
@@ -173,11 +205,11 @@ pub fn is_stable_ula_address(
             }
         }
     }
-
+    
     // Check address format
     if let Ok(ip) = ip_str.parse::<std::net::Ipv6Addr>() {
         let octets = ip.octets();
-
+        
         // Check if it's a simplified address (primary addresses are usually more stable)
         // If the last 64 bits (interface identifier) are small, it might be a primary address
         let interface_id = u64::from_be_bytes([
@@ -188,14 +220,14 @@ pub fn is_stable_ula_address(
         if interface_id < 0x10000 {
             return true;
         }
-
+        
         // Check EUI-64 format: MAC address with FF:FE inserted in the middle
         // EUI-64 formatted addresses are usually stable
         if octets[11] == 0xff && octets[12] == 0xfe {
             return true;
         }
     }
-
+    
     // Default: if flags is None, default to stable
     // Because in most cases, ULA addresses are stable by default
     flags.is_none()
@@ -276,7 +308,7 @@ fn ipv6_address_state(
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RpcIPv6Address {
     address: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -360,25 +392,27 @@ pub struct DhcpLease {
     pub lease_expiry: Option<DateTime<Utc>>,
     #[serde(default)]
     pub is_empty: Option<HashMap<String, bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv4_addresses: Option<Vec<String>>,
 }
 
 // Remove UdhcpcEnv, directly use DhcpLease to deserialize environment variables via alias
 #[derive(Serialize, Deserialize, Debug)]
 pub struct RpcNetworkState {
-    interface_name: String,
-    mac_address: String,
+    pub interface_name: String,
+    pub mac_address: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    ipv4: Option<String>,
+    pub ipv4: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    ipv6: Option<String>,
+    pub ipv6: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    ipv6_link_local: Option<String>,
+    pub ipv6_link_local: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    ipv4_addresses: Option<Vec<String>>,
+    pub ipv4_addresses: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    ipv6_addresses: Option<Vec<RpcIPv6Address>>,
+    pub ipv6_addresses: Option<Vec<RpcIPv6Address>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    dhcp_lease: Option<DhcpLease>,
+    pub dhcp_lease: Option<DhcpLease>,
 }
 
 pub struct NetworkInterfaceState {
@@ -392,6 +426,11 @@ impl Default for NetworkInterfaceState {
 }
 
 impl NetworkInterfaceState {
+
+    pub fn get_instance() -> &'static Lazy<NetworkInterfaceState> {
+        &NETWORK_INTERFACE
+    }
+
     pub fn new(interface_name: &str) -> Self {
         NetworkInterfaceState {
             interface_name: interface_name.to_string(),
@@ -399,28 +438,28 @@ impl NetworkInterfaceState {
     }
 
     pub async fn rpc_get_network_state(&self) -> RpcNetworkState {
-        let ipv4_addresses = self.get_ipv4_addresses();
+        let ipv4_addresses = self.get_ipv4_addresses().await;
         let ipv6_addresses = self.get_ipv6_addresses().await;
-
-        let ipv4 = self.get_ipv4_address();
+        
+        let ipv4 = self.get_ipv4_address().await;
         let ipv6 = self.get_ipv6_address();
         let ipv6_link_local = self.get_ipv6_link_local_address();
-
+        
         RpcNetworkState {
             interface_name: self.interface_name.clone(),
             mac_address: self.mac_address(),
             ipv4,
             ipv6,
             ipv6_link_local,
-            ipv4_addresses: if ipv4_addresses.is_empty() {
-                None
-            } else {
-                Some(ipv4_addresses)
+            ipv4_addresses: if ipv4_addresses.is_empty() { 
+                None 
+            } else { 
+                Some(ipv4_addresses) 
             },
-            ipv6_addresses: if ipv6_addresses.is_empty() {
-                None
-            } else {
-                Some(ipv6_addresses)
+            ipv6_addresses: if ipv6_addresses.is_empty() { 
+                None 
+            } else { 
+                Some(ipv6_addresses) 
             },
             dhcp_lease: self.get_dhcp_lease().await,
         }
@@ -436,8 +475,20 @@ impl NetworkInterfaceState {
         }
     }
 
-    fn get_ipv4_address(&self) -> Option<String> {
-        let interfaces = if_addrs::get_if_addrs().ok()?;
+    async fn get_ipv4_address(&self) -> Option<String> {
+        self.get_ipv4_addresses().await.into_iter().next()
+    }
+
+    async fn get_ipv4_addresses(&self) -> Vec<String> {
+        let mut addrs = self.get_ipv4_addresses_if_addrs();
+        if addrs.is_empty() {
+            addrs = get_ipv4_addresses_via_ip(&self.interface_name).await;
+        }
+        addrs
+    }
+
+    fn get_ipv4_addresses_if_addrs(&self) -> Vec<String> {
+        let interfaces = if_addrs::get_if_addrs().unwrap_or(vec![]);
         interfaces
             .into_iter()
             .filter(|iface| iface.name == self.interface_name)
@@ -445,7 +496,7 @@ impl NetworkInterfaceState {
                 IfAddr::V4(addr) => Some(addr.ip.to_string()),
                 _ => None,
             })
-            .next()
+            .collect()
     }
 
     fn get_ipv6_address(&self) -> Option<String> {
@@ -487,18 +538,6 @@ impl NetworkInterfaceState {
             .next()
     }
 
-    fn get_ipv4_addresses(&self) -> Vec<String> {
-        let interfaces = if_addrs::get_if_addrs().unwrap_or(vec![]);
-        interfaces
-            .into_iter()
-            .filter(|iface| iface.name == self.interface_name)
-            .filter_map(|iface| match iface.addr {
-                IfAddr::V4(addr) => Some(addr.ip.to_string()),
-                _ => None,
-            })
-            .collect()
-    }
-
     pub async fn get_ipv6_addresses(&self) -> Vec<RpcIPv6Address> {
         let interfaces = if_addrs::get_if_addrs().unwrap_or(vec![]);
 
@@ -524,7 +563,7 @@ impl NetworkInterfaceState {
                     });
 
                     let address_type = classify_ipv6_address(&ip_str);
-
+                    
                     // Determine if address is stable
                     let is_stable = if address_type == IPv6AddressType::UniqueLocal {
                         Some(is_stable_ula_address(&ip_str, flags_opt, valid_opt))
@@ -551,118 +590,32 @@ impl NetworkInterfaceState {
     }
 
     pub async fn get_dhcp_lease(&self) -> Option<DhcpLease> {
-        let info_path = format!("/run/udhcpc.{}.info", &self.interface_name);
-        let content = match fs::read_to_string(&info_path).await {
-            Ok(c) => c,
-            Err(err) => {
-                warn!(
-                    "Failed to read DHCP lease info from {}: {}",
-                    info_path, err
-                );
-                return None;
-            }
-        };
+        let content = read_udhcpc_info_file(&self.interface_name).await?;
+        parse_dhcp_lease_from_info(&content).await
+    }
 
-        let parsed_pairs = parse_udhcpc_info(&content);
-        if parsed_pairs.is_empty() {
-            return None;
-        }
-
-        let mut lease: DhcpLease = match envy::from_iter(parsed_pairs) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(
-                    "Failed to parse DhcpLease from {}: {:?}",
-                    info_path, e
-                );
-                return None
-            },
-        };
-
-        if let Some(netmask) = lease.netmask.as_mut() {
-            if let Ok(prefix) = netmask.parse::<u8>() {
-                *netmask = cidr_to_netmask(prefix);
-            }
-        }
-
-        // Check if at least one field exists
-        let has_any = lease.ip.is_some()
-            || lease.netmask.is_some()
-            || lease.broadcast.is_some()
-            || lease.ttl.is_some()
-            || lease.mtu.is_some()
-            || lease.hostname.is_some()
-            || lease.domain.is_some()
-            || lease.bootp_next_server.is_some()
-            || lease.bootp_server_name.is_some()
-            || lease.bootp_file.is_some()
-            || lease.timezone.is_some()
-            || lease.routers.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
-            || lease.dns_servers.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
-            || lease.ntp_servers.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
-            || lease.lpr_servers.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
-            || lease._time_servers.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
-            || lease._name_servers.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
-            || lease._log_servers.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
-            || lease._cookie_servers.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
-            || lease._wins_servers.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
-            || lease._swap_server.is_some()
-            || lease.bootsize.is_some()
-            || lease.root_path.is_some()
-            || lease.lease.is_some()
-            || lease.dhcp_type.is_some()
-            || lease.server_id.is_some()
-            || lease.reason.is_some()
-            || lease.tftp.is_some()
-            || lease.bootfile.is_some()
-            || lease.uptime.is_some();
-
-        if !has_any { return None; }
-
-        // Calculate lease_expiry: prefer using uptime to derive time, then add lease
-        if let Some(lease_secs) = lease.lease {
-            let now = Utc::now();
-            if let Some(obtain_uptime) = lease.uptime {
-                if let Some(current_uptime) = get_system_uptime_seconds().await {
-                    let elapsed = (current_uptime as i64) - (obtain_uptime as i64);
-                    let obtained_time = now - Duration::seconds(elapsed.max(0));
-                    lease.lease_expiry = Some(obtained_time + Duration::seconds(lease_secs as i64));
-                } else {
-                    lease.lease_expiry = Some(now + Duration::seconds(lease_secs as i64));
-                }
-            } else {
-                lease.lease_expiry = Some(now + Duration::seconds(lease_secs as i64));
-            }
-        }
-
-        // Build is_empty map
-        lease.is_empty = Some(build_is_empty_map(&lease));
-
-        Some(lease)
+    /// VLAN-only: build DHCP info from runtime network state, not udhcpc .info files.
+    pub async fn get_dhcp_lease_from_interface(&self) -> Option<DhcpLease> {
+        build_dhcp_lease_from_runtime(&self.interface_name).await
     }
 
     pub async fn renew_dhcp_lease(&self) -> Result<()> {
-        info!("DHCP lease renewal requested for interface: {}", self.interface_name);
-
-        let output = Command::new("udhcpc")
-            .arg("-i")
-            .arg(&self.interface_name)
-            .arg("renew")
+        info!("DHCP lease renewal requested");
+        
+        let output = Command::new(DHCP_RENEW_PATH)
+            .arg("restart")
             .output()
             .await
-            .context("Failed to execute udhcpc renew command")?;
-
+            .context("Failed to execute DHCP RENEW command")?;
+        
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let err_msg = format!(
-                "udhcpc renew failed for interface {}: {}",
-                self.interface_name, stderr
-            );
-            error!("{}", err_msg);
+            let err_msg = format!("DHCP renew failed: {}", stderr);
+            error!("{}", &err_msg);
             return Err(anyhow::anyhow!(err_msg));
         }
-
-        info!("udhcpc renew command completed successfully for interface: {}", self.interface_name);
+        
+        info!("DHCP renew command completed successfully");
         Ok(())
     }
 
@@ -685,7 +638,7 @@ impl NetworkInterfaceState {
     }
 
     /// Get stable unique local IPv6 address (ULA)
-    ///
+    /// 
     /// Stable addresses are usually based on EUI-64 format, have long lifetime,
     /// and are suitable as fixed device identifiers
     pub async fn get_stable_unique_local_ipv6_address(&self) -> Option<String> {
@@ -751,8 +704,315 @@ fn parse_udhcpc_info(content: &str) -> Vec<(String, String)> {
     }).collect()
 }
 
+struct Ipv4IfaceEntry {
+    ip: String,
+    prefix: u8,
+}
+
+/// Apply a staged VLAN lease to an interface; still reads udhcpc .info, separate from API display path.
+pub(crate) async fn read_dhcp_lease_from_udhcpc_info(interface_name: &str) -> Option<DhcpLease> {
+    let content = read_udhcpc_info_file(interface_name).await?;
+    parse_dhcp_lease_from_info(&content).await
+}
+
+async fn read_udhcpc_info_file(interface_name: &str) -> Option<String> {
+    for path in [
+        format!("/run/udhcpc.{}.info", interface_name),
+        format!("/var/run/udhcpc.{}.info", interface_name),
+    ] {
+        match fs::read_to_string(&path).await {
+            Ok(content) if !content.trim().is_empty() => return Some(content),
+            Ok(_) => continue,
+            Err(err) => {
+                warn!(
+                    "Failed to read DHCP lease info from {}: {}",
+                    path, err
+                );
+            }
+        }
+    }
+    None
+}
+
+async fn parse_dhcp_lease_from_info(content: &str) -> Option<DhcpLease> {
+    let parsed_pairs = parse_udhcpc_info(content);
+    if parsed_pairs.is_empty() {
+        return None;
+    }
+
+    let mut lease: DhcpLease = match envy::from_iter(parsed_pairs) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Failed to parse DhcpLease from udhcpc info: {:?}", e);
+            return None;
+        }
+    };
+
+    if let Some(netmask) = lease.netmask.as_mut() {
+        if let Ok(prefix) = netmask.parse::<u8>() {
+            *netmask = cidr_to_netmask(prefix);
+        }
+    }
+
+    let has_any = lease.ip.is_some()
+        || lease.netmask.is_some()
+        || lease.broadcast.is_some()
+        || lease.ttl.is_some()
+        || lease.mtu.is_some()
+        || lease.hostname.is_some()
+        || lease.domain.is_some()
+        || lease.bootp_next_server.is_some()
+        || lease.bootp_server_name.is_some()
+        || lease.bootp_file.is_some()
+        || lease.timezone.is_some()
+        || lease.routers.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+        || lease.dns_servers.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+        || lease.ntp_servers.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+        || lease.lpr_servers.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+        || lease._time_servers.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+        || lease._name_servers.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+        || lease._log_servers.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+        || lease._cookie_servers.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+        || lease._wins_servers.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+        || lease._swap_server.is_some()
+        || lease.bootsize.is_some()
+        || lease.root_path.is_some()
+        || lease.lease.is_some()
+        || lease.dhcp_type.is_some()
+        || lease.server_id.is_some()
+        || lease.reason.is_some()
+        || lease.tftp.is_some()
+        || lease.bootfile.is_some()
+        || lease.uptime.is_some();
+
+    if !has_any {
+        return None;
+    }
+
+    if let Some(lease_secs) = lease.lease {
+        let now = Utc::now();
+        if let Some(obtain_uptime) = lease.uptime {
+            if let Some(current_uptime) = get_system_uptime_seconds().await {
+                let elapsed = (current_uptime as i64) - (obtain_uptime as i64);
+                let obtained_time = now - Duration::seconds(elapsed.max(0));
+                lease.lease_expiry =
+                    Some(obtained_time + Duration::seconds(lease_secs as i64));
+            } else {
+                lease.lease_expiry = Some(now + Duration::seconds(lease_secs as i64));
+            }
+        } else {
+            lease.lease_expiry = Some(now + Duration::seconds(lease_secs as i64));
+        }
+    }
+
+    lease.is_empty = Some(build_is_empty_map(&lease));
+    Some(lease)
+}
+
+async fn build_dhcp_lease_from_runtime(interface_name: &str) -> Option<DhcpLease> {
+    let entries = get_ipv4_entries_via_ip(interface_name).await;
+    let primary = entries.first()?;
+    let netmask = cidr_to_netmask(primary.prefix);
+    let broadcast = ipv4_broadcast(&primary.ip, primary.prefix);
+    let gateway = get_gateway_for_interface(interface_name, &primary.ip).await;
+    let dns_servers = read_ipv4_dns_servers_from_resolv_conf().await;
+    let hostname = read_system_hostname().await;
+    let ipv4_addresses: Vec<String> = entries.iter().map(|entry| entry.ip.clone()).collect();
+
+    let mut lease = DhcpLease {
+        ip: Some(primary.ip.clone()),
+        netmask: Some(netmask),
+        broadcast,
+        ttl: None,
+        mtu: None,
+        hostname,
+        domain: None,
+        bootp_next_server: gateway.clone(),
+        bootp_server_name: None,
+        bootp_file: None,
+        timezone: None,
+        routers: gateway.as_ref().map(|gw| vec![gw.clone()]),
+        dns_servers,
+        ntp_servers: None,
+        lpr_servers: None,
+        _time_servers: None,
+        _name_servers: None,
+        _log_servers: None,
+        _cookie_servers: None,
+        _wins_servers: None,
+        _swap_server: None,
+        bootsize: None,
+        root_path: None,
+        lease: None,
+        dhcp_type: None,
+        server_id: gateway,
+        reason: None,
+        tftp: None,
+        bootfile: None,
+        uptime: None,
+        lease_expiry: None,
+        is_empty: None,
+        ipv4_addresses: Some(ipv4_addresses),
+    };
+    lease.is_empty = Some(build_is_empty_map(&lease));
+    Some(lease)
+}
+
+async fn get_ipv4_addresses_via_ip(interface_name: &str) -> Vec<String> {
+    get_ipv4_entries_via_ip(interface_name)
+        .await
+        .into_iter()
+        .map(|entry| entry.ip)
+        .collect()
+}
+
+async fn get_ipv4_entries_via_ip(interface_name: &str) -> Vec<Ipv4IfaceEntry> {
+    let output = match Command::new("ip")
+        .args(["-4", "-o", "addr", "show", "dev", interface_name])
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut entries = Vec::new();
+    for line in stdout.lines() {
+        let Some(inet_idx) = line.split_whitespace().position(|part| part == "inet") else {
+            continue;
+        };
+        let parts: Vec<_> = line.split_whitespace().collect();
+        let Some(cidr) = parts.get(inet_idx + 1) else {
+            continue;
+        };
+        let Some((ip, prefix)) = cidr.split_once('/') else {
+            continue;
+        };
+        let Ok(prefix) = prefix.parse::<u8>() else {
+            continue;
+        };
+        entries.push(Ipv4IfaceEntry {
+            ip: ip.to_string(),
+            prefix,
+        });
+    }
+    entries
+}
+
+async fn get_gateway_for_interface(interface_name: &str, src_ip: &str) -> Option<String> {
+    if let Ok(output) = Command::new("ip")
+        .args(["route", "show", "default", "dev", interface_name])
+        .output()
+        .await
+    {
+        if output.status.success() {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if let Some(gw) = parse_via_gateway(line) {
+                    return Some(gw);
+                }
+            }
+        }
+    }
+
+    if let Ok(output) = Command::new("ip")
+        .args(["route", "get", "1.0.0.1", "from", src_ip, "iif", interface_name])
+        .output()
+        .await
+    {
+        if output.status.success() {
+            let line = String::from_utf8_lossy(&output.stdout);
+            if let Some(gw) = parse_via_gateway(&line) {
+                return Some(gw);
+            }
+        }
+    }
+
+    if let Ok(output) = Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .await
+    {
+        if output.status.success() {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if let Some(gw) = parse_via_gateway(line) {
+                    return Some(gw);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_via_gateway(line: &str) -> Option<String> {
+    let parts: Vec<_> = line.split_whitespace().collect();
+    for (idx, part) in parts.iter().enumerate() {
+        if *part == "via" {
+            return parts.get(idx + 1).map(|value| value.to_string());
+        }
+    }
+    None
+}
+
+async fn read_ipv4_dns_servers_from_resolv_conf() -> Option<Vec<String>> {
+    let servers = read_dns_servers_from_resolv_conf()
+        .await?
+        .into_iter()
+        .filter(|server| server.parse::<std::net::Ipv4Addr>().is_ok())
+        .collect::<Vec<_>>();
+    if servers.is_empty() {
+        None
+    } else {
+        Some(servers)
+    }
+}
+
+async fn read_dns_servers_from_resolv_conf() -> Option<Vec<String>> {
+    let content = fs::read_to_string("/etc/resolv.conf").await.ok()?;
+    let servers: Vec<String> = content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            line.strip_prefix("nameserver ")
+                .map(|server| server.trim().to_string())
+        })
+        .filter(|server| !server.is_empty())
+        .collect();
+    if servers.is_empty() {
+        None
+    } else {
+        Some(servers)
+    }
+}
+
+async fn read_system_hostname() -> Option<String> {
+    let hostname = fs::read_to_string("/etc/hostname")
+        .await
+        .ok()?
+        .trim()
+        .to_string();
+    if hostname.is_empty() {
+        None
+    } else {
+        Some(hostname)
+    }
+}
+
+fn ipv4_broadcast(ip: &str, prefix: u8) -> Option<String> {
+    let ip = ip.parse::<std::net::Ipv4Addr>().ok()?;
+    let prefix = prefix.min(32);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        (!0u32) << (32 - u32::from(prefix))
+    };
+    let broadcast = u32::from(ip) | !mask;
+    Some(std::net::Ipv4Addr::from(broadcast).to_string())
+}
+
 fn cidr_to_netmask(prefix: u8) -> String {
-    // CIDR prefix length range is 0-32
+    // CIDR prefix length is 0-32
     let prefix = prefix.min(32);
     let mask: u32 = if prefix == 0 { 0 } else { (!0u32) << (32 - (prefix as u32)) };
     let b1 = ((mask >> 24) & 0xFF) as u8;
@@ -942,7 +1202,7 @@ async fn query_ipv6_rtnetlink(interface: &str) -> Result<
 
                                     rta_off += rta_align(rta.nla_len as usize);
                                 }
-
+                                
                                 if let Some(ip) = ip_addr {
                                     out.insert(ip, (scope, valid, preferred, flags));
                                 }

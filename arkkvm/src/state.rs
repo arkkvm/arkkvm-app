@@ -55,7 +55,14 @@ impl AppState {
             let mut sessions = self.sessions.write().await;
             let removed = sessions.remove(session_id);
             let count = sessions.len();
-            info!("Removed session, and session length is now {}", count);
+            if removed.is_some() {
+                info!("Removed session {}, and session length is now {}", session_id, count);
+            } else {
+                debug!(
+                    "Skip remove_session for already-removed session {}, session length is {}",
+                    session_id, count
+                );
+            }
             (removed, count)
         };
 

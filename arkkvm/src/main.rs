@@ -6,11 +6,17 @@ use tokio::signal;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 6)]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
-    let (guard, log_level_handle) = common::log::init_log();
+    let (guard, log_level_handle) = match common::log::init_log() {
+        Ok(result) => (result.0, result.1),
+        Err(e) => {
+            println!("Failed to initialize log: {:?}", e);
+            return Err(e);
+        }
+    };
     
     // Print application logo
     common::log::print_logo();
@@ -33,24 +39,26 @@ async fn main() -> anyhow::Result<()> {
 
     network::settings::init_network_settings().await;
 
-    arkkvm::time_sync::sync_time(config).await;
-
     tls::init().await?;
     webrtc::init_webrtc_api().await?;
 
     zenoh_bus::init().await?;
     services::init_audio_service(config.get_audio_quality().await).await?;
     hardware::init().await?;
+    services::init_usb_service().await?;
     services::init_gui_pipeline()?;
 
-    // Initialize USB manager and start USB state/LED event pipeline
-    
     let usb_config = config.get_usb_config().await;
     let devices = config.get_usb_devices().await;
-    usb::init_usb(usb_config, devices).await?;
-    
-    // Initialize virtual mic service
-    let _ = services::init_virtual_mic_service().await;
+    if let Err(e) = usb::reconcile_usb_runtime(usb_config, devices, "init").await {
+        error!("Initial usb runtime sync failed: {:?}", e);
+    } else {
+        let state = services::usb::ensure_usb_state().await;
+        arkkvm::jsonrpc::broadcast_usb_state(state).await;
+    }
+
+    // Initialize virtual mic service when enabled in saved config
+    let _ = services::init_virtual_mic_from_config().await;
 
     // Initialize display (lvgl rotation, static contents, backlight tickers)
     // display::init_display().await?;
@@ -67,6 +75,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Start cloud connection loop
     tokio::spawn(async {
+        arkkvm::time_sync::sync_time(config).await;
+        ota::power_on_ota_update().await;
+
         let cloud_manager = cloud::manager::get_cloud_manager();
         if let Err(e) = cloud_manager.start_connection_loop().await {
             error!("Cloud connection loop failed: {}", e);
@@ -74,9 +85,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     tokio::spawn(async {
-        ota::on_power_on().await;
-        let ota_info = ota::check_update(false).await;
-        info!("Get OTA info: {:?}", ota_info);
+        ota::check_ota_update_finished().await;
     });
 
     // Start File Transter

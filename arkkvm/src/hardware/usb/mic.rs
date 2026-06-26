@@ -1,267 +1,202 @@
-//! Microphone audio output: keep the arkkvm_mic child process alive via a watchdog thread, and forward audio data through Zenoh.
+//! Virtual microphone PCM forwarding to `arkkvm_mic` via Zenoh.
 //!
-//! ## Responsibility Breakdown
-//!
-//! - **DaemonHandle**: a "handle + single operation" wrapper for the child process. It only is responsible for:
-//!   - Holding the `Child` and its running state;
-//!   - Providing single operations: `start` / `stop` / `check_status` / `is_running`;
-//!   - Not including the monitoring loop or restart policy.
-//!
-//! - **Watchdog thread**: lifecycle monitoring and automatic restart for the child process. It only is responsible for:
-//!   - Starting the child process once during initialization via DaemonHandle;
-//!   - Polling `DaemonHandle::check_status()` at a fixed interval;
-//!   - When the process exits, restarting by calling `DaemonHandle::start` according to the policy (with delay), with no upper limit on restart attempts;
-//!   - Not directly holding `Child`; all start/stop/check operations are done via DaemonHandle.
+//! The `arkkvm_mic` subprocess lifecycle is managed by the `usb_devices` sidecar.
+//! This module queues PCM in an mpsc channel; the sender task always reads frames
+//! and only publishes when both sidecar reports the process running and a Zenoh peer
+//! is present on the mic session.
 
-use std::process::{Command, Child};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
-use tracing::{debug, error, info, warn};
+use prost::Message;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
+use zenoh::bytes::ZBytes;
 
-use crate::zenoh_bus;
+use crate::proto::v1::{GetMicProcessStateRequest, GetMicProcessStateResponse, MicProcessStateEvent};
+use crate::zenoh_bus::{self, KEY_EVENT_MIC_PROCESS, KEY_GET_MIC_PROCESS_STATE};
 
-const ARKKVM_MIC_NAME: &str = "arkkvm_mic";
-const ARKKVM_MIC_PATH: &str = "/oem/usr/bin/arkkvm_mic";
+const MIC_DATA_KEY: &str = "arkkvm_mic/data";
+const RETRY_INTERVAL: Duration = Duration::from_millis(500);
+const ZENOH_USB_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 
-pub enum AudioOutputError {
-    Success = 0,
-    ErrorInit = -1,
-    ErrorSystem = -2,
-    ErrorMemory = -3,
-    ErrorInvalidHandle = -4,
-    ErrorOutput = -5,
-    ErrorParam = -6,
-    ErrorFile = -7,
+struct MicSinkState {
+    sidecar_running: AtomicBool,
+    peer_present: AtomicBool,
+}
+
+impl MicSinkState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            sidecar_running: AtomicBool::new(false),
+            peer_present: AtomicBool::new(false),
+        })
+    }
+
+    fn is_ready(&self) -> bool {
+        self.sidecar_running.load(Ordering::Acquire) && self.peer_present.load(Ordering::Acquire)
+    }
+}
+
+async fn probe_peers(session: &zenoh::Session) -> bool {
+    let peers: Vec<_> = session.info().peers_zid().await.collect();
+    debug!(peer_count = peers.len(), ?peers, "mic session peers_zid probe");
+    !peers.is_empty()
+}
+
+async fn query_mic_process_running() -> Option<bool> {
+    let session = zenoh_bus::get_usb_session();
+    let req = GetMicProcessStateRequest {};
+    let mut buf = Vec::new();
+    req.encode(&mut buf).ok()?;
+
+    let replies = session
+        .get(KEY_GET_MIC_PROCESS_STATE)
+        .payload(ZBytes::from(buf))
+        .timeout(ZENOH_USB_QUERY_TIMEOUT)
+        .await
+        .ok()?;
+
+    let reply = replies.recv_async().await.ok()?;
+    let sample = reply.into_result().ok()?;
+    let bytes = sample.payload().to_bytes();
+    let resp = GetMicProcessStateResponse::decode(bytes.as_ref()).ok()?;
+    if resp.ok {
+        Some(resp.running)
+    } else {
+        warn!(
+            "get_mic_process_state rejected: {}",
+            resp.error.unwrap_or_default()
+        );
+        None
+    }
+}
+
+async fn sync_sidecar_running(state: &MicSinkState) {
+    match query_mic_process_running().await {
+        Some(running) => {
+            state.sidecar_running.store(running, Ordering::Release);
+            info!(running, "mic process state synced from sidecar query");
+        }
+        None => warn!("failed to query initial mic process state from sidecar"),
+    }
+}
+
+fn spawn_mic_process_subscriber(state: Arc<MicSinkState>, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let session = zenoh_bus::get_usb_session();
+        let subscriber = match session.declare_subscriber(KEY_EVENT_MIC_PROCESS).await {
+            Ok(sub) => sub,
+            Err(e) => {
+                warn!("failed to subscribe mic process state: {}", e);
+                return;
+            }
+        };
+
+        info!("subscribed to {}", KEY_EVENT_MIC_PROCESS);
+        sync_sidecar_running(&state).await;
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!("mic process state subscriber cancelled");
+                    break;
+                }
+                sample = subscriber.recv_async() => {
+                    let sample = match sample {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!("mic process state subscriber closed: {}", e);
+                            break;
+                        }
+                    };
+                    let bytes = sample.payload().to_bytes();
+                    match MicProcessStateEvent::decode(bytes.as_ref()) {
+                        Ok(evt) => {
+                            state.sidecar_running.store(evt.running, Ordering::Release);
+                        }
+                        Err(e) => warn!("invalid MicProcessStateEvent: {}", e),
+                    }
+                }
+            }
+        }
+    });
+}
+
+struct AudioOutputInner {
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    cancel: CancellationToken,
 }
 
 pub struct AudioOutput {
-    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    daemon_handle: Option<Arc<DaemonHandle>>,
-}
-
-/// Child process handle and single-operation wrapper (**does not** handle the monitoring loop or restart policy).
-///
-/// Responsibilities: holds `Child`, maintains `is_running`, and provides **single** operations for the child process:
-/// - `start`: start once;
-/// - `stop`: stop once;
-/// - `check_status`: check once whether it is still running and update `is_running`;
-/// - `is_running`: read-only query.
-///
-/// It only holds fields that may need locked mutation; `is_running` / `program_name` are stored outside to reduce lock contention on the read path.
-struct DaemonHandleInner {
-    child: Option<Child>,
-    program_path: String,
-    args: Option<Vec<String>>,
-}
-
-/// Called by the **watchdog thread** in the loop to invoke `check_status()` and restart via `start()` based on the result.
-struct DaemonHandle {
-    inner: Mutex<DaemonHandleInner>,
-    is_running: AtomicBool,
-    /// Set on Drop; once detected by the watchdog thread, it exits the loop and stops restarting the child process.
-    shutdown_requested: AtomicBool,
-    program_name: String,
-}
-
-impl DaemonHandle {
-    fn new(program_name: &str, program_path: &str, args: Option<Vec<String>>) -> Self {
-        Self {
-            inner: Mutex::new(DaemonHandleInner {
-                child: None,
-                program_path: program_path.to_string(),
-                args,
-            }),
-            is_running: AtomicBool::new(false),
-            shutdown_requested: AtomicBool::new(false),
-            program_name: program_name.to_string(),
-        }
-    }
-
-    /// Request shutdown: called in Drop; the watchdog thread will exit on the next loop iteration and stop restarting.
-    fn request_shutdown(&self) {
-        self.shutdown_requested.store(true, Ordering::Release);
-    }
-
-    fn is_shutdown_requested(&self) -> bool {
-        self.shutdown_requested.load(Ordering::Acquire)
-    }
-
-    /// Query the current cached running state only (lock-free; reads the atomic value).
-    fn is_running(&self) -> bool {
-        self.is_running.load(Ordering::Acquire)
-    }
-
-    /// Start the child process once (using program_path and args configured at build-time); if already running, return success immediately.
-    fn start(&self) -> bool {
-        if self.is_running.load(Ordering::Acquire) {
-            warn!("Process {} is already running", self.program_name);
-            return true;
-        }
-
-        let mut guard = self.inner.lock().unwrap();
-        let mut cmd = Command::new(&guard.program_path);
-        if let Some(ref args) = guard.args {
-            cmd.args(args);
-        }
-        match cmd.spawn() {
-            Ok(child) => {
-                guard.child = Some(child);
-                self.is_running.store(true, Ordering::Release);
-                info!("Successfully started process: {}", self.program_name);
-                true
-            }
-            Err(e) => {
-                error!("Failed to start process {}: {:?}", self.program_name, e);
-                false
-            }
-        }
-    }
-
-    /// Stop the child process once (kill it and wait for it to exit, then clear the handle).
-    fn stop(&self) {
-        let mut guard = self.inner.lock().unwrap();
-        if let Some(mut child) = guard.child.take() {
-            if let Err(e) = child.kill() {
-                error!("Failed to kill process {}: {:?}", self.program_name, e);
-            } else {
-                info!("Successfully stopped process: {}", self.program_name);
-            }
-            self.is_running.store(false, Ordering::Release);
-            let _ = child.wait();
-        }
-    }
-
-    /// Check once whether the process is still running (`try_wait`), update the atomic `is_running`, and return whether it is running.
-    fn check_status(&self) -> bool {
-        let mut guard = self.inner.lock().unwrap();
-        let running = if let Some(child) = &mut guard.child {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    debug!("Process {} exited with status: {:?}", self.program_name, status);
-                    false
-                }
-                Ok(None) => true,
-                Err(e) => {
-                    error!("Failed to check process status {}: {:?}", self.program_name, e);
-                    false
-                }
-            }
-        } else {
-            false
-        };
-        self.is_running.store(running, Ordering::Release);
-        running
-    }
+    inner: Arc<AudioOutputInner>,
 }
 
 impl AudioOutput {
-    pub fn new(handle: tokio::runtime::Handle) -> Self {
-        let daemon_handle = Arc::new(DaemonHandle::new(
-            ARKKVM_MIC_NAME,
-            ARKKVM_MIC_PATH,
-            None,
-        ));
-        let daemon_handle_clone = Arc::clone(&daemon_handle);
-
-        // Watchdog thread: only responsible for "lifecycle monitoring + policy-based automatic restart"; all child process operations go through DaemonHandle.
-        thread::spawn(move || {
-            info!("arkkvm_mic daemon thread started");
-            if !daemon_handle_clone.start() {
-                error!("Failed to start arkkvm_mic on initialization");
-                return;
-            }
-
-            let mut restart_count: u64 = 0;
-            const RESTART_DELAY: Duration = Duration::from_secs(1);
-
-            loop {
-                thread::sleep(Duration::from_millis(500));
-
-                if daemon_handle_clone.is_shutdown_requested() {
-                    info!("arkkvm_mic daemon thread exiting: shutdown requested");
-                    break;
-                }
-
-                let should_restart = !daemon_handle_clone.check_status();
-
-                if should_restart {
-                    if daemon_handle_clone.is_shutdown_requested() {
-                        info!("arkkvm_mic daemon thread exiting: shutdown requested (no restart)");
-                        break;
-                    }
-                    restart_count += 1;
-                    warn!("arkkvm_mic process died, restarting (attempt #{})...", restart_count);
-
-                    thread::sleep(RESTART_DELAY);
-
-                    if daemon_handle_clone.start() {
-                        info!("Successfully restarted arkkvm_mic");
-                    } else {
-                        error!("Failed to restart arkkvm_mic");
-                    }
-                } else {
-                    restart_count = 0;
-                }
-            }
-            info!("arkkvm_mic daemon thread stopped");
-        });
-
+    pub fn new() -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-        let daemon_handle_for_sender = Arc::clone(&daemon_handle);
-        handle.spawn(async move {
+        let state = MicSinkState::new();
+        let cancel = CancellationToken::new();
+        let cancel_sub = cancel.clone();
+        let cancel_sender = cancel.clone();
+
+        spawn_mic_process_subscriber(Arc::clone(&state), cancel_sub);
+
+        tokio::spawn(async move {
             info!("mic sender started");
             let session = zenoh_bus::get_mic_session();
-            while let Some(data) = rx.recv().await {
-                if !daemon_handle_for_sender.is_running() {
-                    warn!("arkkvm_mic is not running, dropping audio data ({} bytes)", data.len());
-                    continue;
-                }
+            let mut retry_interval = tokio::time::interval(RETRY_INTERVAL);
+            retry_interval.tick().await;
+            state
+                .peer_present
+                .store(probe_peers(&session).await, Ordering::Release);
 
-                // info!("send mic data size: {}", data.len());
-                let value = zenoh::bytes::ZBytes::from(data);
-                if let Err(e) = session.put("arkkvm_mic/data", value).await {
-                    error!("Failed to send mic data: {:?}", e);
+            loop {
+                tokio::select! {
+                    _ = cancel_sender.cancelled() => {
+                        info!("mic sender cancelled");
+                        break;
+                    }
+                    data = rx.recv() => {
+                        let Some(data) = data else {
+                            break;
+                        };
+                        if state.is_ready() {
+                            let value = ZBytes::from(data);
+                            if let Err(e) = session.put(MIC_DATA_KEY, value).await {
+                                warn!("mic data put failed: {}", e);
+                                state.peer_present.store(false, Ordering::Release);
+                            }
+                        }
+                    }
+                    _ = retry_interval.tick() => {
+                        let present = probe_peers(&session).await;
+                        state.peer_present.store(present, Ordering::Release);
+                    }
                 }
             }
             info!("mic sender stopped");
         });
 
         Self {
-            tx,
-            daemon_handle: Some(daemon_handle),
+            inner: Arc::new(AudioOutputInner { tx, cancel }),
         }
     }
 
-    /// Send audio data (slice-based). Reusing the caller's buffer avoids allocations on the hot path.
+    pub fn shutdown(&self) {
+        self.inner.cancel.cancel();
+    }
+
     pub fn send_data(&self, data: &[u8]) {
-        // if !self.is_process_running() {
-        //     warn!("arkkvm_mic is not running, skipping audio data ({} bytes)", data.len());
-        //     return;
-        // }
-
-        if let Err(e) = self.tx.try_send(data.to_vec()) {
-            error!("Failed to queue audio data: {:?}", e);
-        }
-    }
-
-    /// Return whether the child process is running. It only reads cached state (refreshed periodically by the watchdog thread via check_status), not real-time detection.
-    pub fn is_process_running(&self) -> bool {
-        match self.daemon_handle.as_ref() {
-            Some(daemon) => daemon.is_running(),
-            None => false,
-        }
-    }
-
-}
-
-impl Drop for AudioOutput {
-    fn drop(&mut self) {
-        if let Some(handle) = &self.daemon_handle {
-            handle.request_shutdown();
-            handle.stop();
+        if let Err(e) = self.inner.tx.try_send(data.to_vec()) {
+            match e {
+                TrySendError::Full(_) => {}
+                TrySendError::Closed(_) => {
+                    warn!("mic sender channel closed");
+                }
+            }
         }
     }
 }

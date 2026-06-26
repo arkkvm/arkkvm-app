@@ -11,6 +11,7 @@ use tracing::{error, info};
 
 use crate::jsonrpc;
 use crate::network::RpcIPv6Address;
+use crate::network::vlan::{self, VlanConfigReport, VlanIpv6AddressesEntry};
 
 const SOCKET_PATH: &str = "/tmp/arkkvm_ui.sock";
 
@@ -19,7 +20,7 @@ lazy_static::lazy_static! {
     pub static ref RUNNING: AtomicBool = AtomicBool::new(true);
 }
 
-// Configuration data structures
+// Config data structures
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub orientation: i32,
@@ -47,6 +48,8 @@ pub enum Command {
     SetDarkScreenTime(i32),
     SetSleepTime(i32),
     ReportIpv6Addresses(String),
+    ReportVlanConfig(String),
+    ReportVlanIpv6Addresses(String),
 }
 
 impl Command {
@@ -58,6 +61,10 @@ impl Command {
             Command::SetDarkScreenTime(value) => format!("DARK_SCREEN_TIME={}", value),
             Command::SetSleepTime(value) => format!("SLEEP_TIME={}", value),
             Command::ReportIpv6Addresses(addresses) => format!("REPORT_IPV6_ADDRESSES={}", addresses),
+            Command::ReportVlanConfig(config) => format!("REPORT_VLAN_CONFIG={}", config),
+            Command::ReportVlanIpv6Addresses(addresses) => {
+                format!("REPORT_VLAN_IPV6_ADDRESSES={}", addresses)
+            }
         }
     }
 }
@@ -84,7 +91,7 @@ pub fn init() -> anyhow::Result<()> {
 
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
-
+        
         let ipc_client = Arc::new(Mutex::new(IpcClient::new(SOCKET_PATH)));
         if let Err(e) = GUI_PIPELINE.set(ipc_client.clone()) {
             error!("Failed to set GUI_PIPELINE: {:?}", e);
@@ -97,9 +104,21 @@ pub fn init() -> anyhow::Result<()> {
             }
 
             {
+                let mut client = ipc_client.lock().await;
                 let ipv6_addresses = jsonrpc::handlers::get_ipv6_addresses().await;
-                if let Err(e) = ipc_client.lock().await.set_ipv6_addresses(&ipv6_addresses).await {
+                if let Err(e) = client.set_ipv6_addresses(&ipv6_addresses).await {
                     error!("Failed to set IPv6 addresses: {:?}", e);
+                }
+                let vlan_config = vlan::get_effective_vlan_config_report().await;
+                if let Err(e) = client.set_vlan_config(&vlan_config).await {
+                    error!("Failed to set VLAN config: {:?}", e);
+                }
+                let vlan_ipv6_addresses = vlan::get_effective_vlan_ipv6_addresses_report().await;
+                if let Err(e) = client
+                    .set_vlan_ipv6_addresses(&vlan_ipv6_addresses)
+                    .await
+                {
+                    error!("Failed to set VLAN IPv6 addresses: {:?}", e);
                 }
             }
 
@@ -159,7 +178,7 @@ pub async fn set_dark_screen_time(seconds: i32) -> Result<()> {
     Ok(())
 }
 
-    // IPC client struct
+// IPC client
 #[derive(Debug)]
 pub struct IpcClient {
     socket_path: String,
@@ -173,18 +192,18 @@ impl IpcClient {
     }
 
     async fn send_command(&self, command: Command) -> Result<String> {
-        // Connect to the Unix domain socket server
+        // connect to Unix domain socket server
         let mut stream = UnixStream::connect(&self.socket_path).await?;
 
-        // Build the command string
+        // build command string
         let command_str = command.to_protocol_string();
 
-        // Set an overall timeout for the entire read/write operation (e.g., 5 seconds)
+        // overall read/write timeout (e.g. 5 seconds)
         match timeout(Duration::from_secs(5), async {
-            // Send the command to the server
+            // send command to server
             stream.write_all(command_str.as_bytes()).await?;
 
-            // Read the server response
+            // read server response
             let mut buffer = vec![0; 1024];
             let n = stream.read(&mut buffer).await?;
 
@@ -202,11 +221,11 @@ impl IpcClient {
         }
     }
 
-    // Fetch server configuration
+    // fetch server config
     pub async fn get_config(&self) -> Result<ServerConfig> {
         let response = self.send_command(Command::GetConfig).await?;
 
-        // Parse response format: ORIENTATION=1,LUMINANCE=80,DARK_SCREEN_TIME=30,SLEEP_TIME=300
+        // response format: ORIENTATION=1,LUMINANCE=80,DARK_SCREEN_TIME=30,SLEEP_TIME=300
         let config_parts: Vec<&str> = response.split(',').collect();
 
         let mut config = ServerConfig::default();
@@ -236,7 +255,34 @@ impl IpcClient {
         }
     }
 
-    // Set screen orientation
+    pub async fn set_vlan_config(&self, vlan_config: &VlanConfigReport) -> Result<()> {
+        let response = self
+            .send_command(Command::ReportVlanConfig(serde_json::to_string(vlan_config)?))
+            .await?;
+        if response == "OK" {
+            Ok(())
+        } else {
+            Err(anyhow!("Server returned error: {}", response).into())
+        }
+    }
+
+    pub async fn set_vlan_ipv6_addresses(
+        &self,
+        vlan_ipv6_addresses: &[VlanIpv6AddressesEntry],
+    ) -> Result<()> {
+        let response = self
+            .send_command(Command::ReportVlanIpv6Addresses(serde_json::to_string(
+                vlan_ipv6_addresses,
+            )?))
+            .await?;
+        if response == "OK" {
+            Ok(())
+        } else {
+            Err(anyhow!("Server returned error: {}", response).into())
+        }
+    }
+
+    // set screen orientation
     pub async fn set_orientation(&self, orientation: i32) -> Result<()> {
         let response = self
             .send_command(Command::SetOrientation(orientation))
@@ -248,7 +294,7 @@ impl IpcClient {
         }
     }
 
-    // Set screen luminance
+    // set screen brightness
     pub async fn set_luminance(&self, luminance: i32) -> Result<()> {
         let response = self.send_command(Command::SetLuminance(luminance)).await?;
         if response == "OK" {
@@ -258,7 +304,7 @@ impl IpcClient {
         }
     }
 
-    // Set dark screen time
+    // set dim-screen timeout
     pub async fn set_dark_screen_time(&self, seconds: i32) -> Result<()> {
         let response = self
             .send_command(Command::SetDarkScreenTime(seconds))
@@ -270,7 +316,7 @@ impl IpcClient {
         }
     }
 
-    // Set sleep time
+    // set sleep/screen-off timeout
     pub async fn set_sleep_time(&self, seconds: i32) -> Result<()> {
         let response = self.send_command(Command::SetSleepTime(seconds)).await?;
         if response == "OK" {

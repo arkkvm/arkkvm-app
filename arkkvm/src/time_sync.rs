@@ -6,7 +6,7 @@ use libc::{CLOCK_REALTIME, clock_settime, timespec};
 use reqwest::header;
 use tracing::{info, warn, error};
 
-use crate::config::ConfigManager;
+use crate::{config::ConfigManager, util};
 
 const DEFAULT_NTP_SERVERS: &[&str] = &[
     // Global
@@ -93,34 +93,75 @@ async fn sync_time_once() -> Result<()> {
         .user_agent("arkkvm/timesync")
         .build()?;
 
+    // Bootstrap with multiple HTTP Date sources and accept only consistent results.
+    // This avoids a single wrong/poisoned source shifting local time far away.
+    let mut samples: Vec<(DateTime<Utc>, &str)> = Vec::new();
+    const SLEEP_TIME: Duration = Duration::from_secs(1);
+    const SLEEP_TIME_FALLBACK: Duration = Duration::from_millis(500);
     for url in DEFAULT_HTTP_TIME_URLS.iter() {
         // Try HEAD first
         match http_date_with_rtt(url, &client, "HEAD").await {
             Ok(dt) => {
-                set_system_time(dt)?;
-                info!("Time synced via HTTP Date(+1/2RTT): {} (url: {})", dt, url);
-                return Ok(());
+                samples.push((dt, *url));
             }
             Err(e1) => {
+                if util::is_link_local_ip() {
+                    warn!("sync_time_once Time sync is disabled for link-local address");
+                    return Ok(());
+                }
+                tokio::time::sleep(SLEEP_TIME_FALLBACK).await;
                 // Fallback to GET
                 match http_date_with_rtt(url, &client, "GET").await {
                     Ok(dt) => {
-                        set_system_time(dt)?;
-                        info!("Time synced via HTTP Date(+1/2RTT): {} (url: {})", dt, url);
-                        return Ok(());
+                        samples.push((dt, *url));
                     }
                     Err(e2) => {
                         warn!("HTTP time source failed: {} (HEAD: {}; GET: {})", url, e1, e2);
+                        tokio::time::sleep(SLEEP_TIME).await;
                     }
                 }
             }
         }
+
+        // Enough samples for bootstrap consensus.
+        if samples.len() >= 3 {
+            break;
+        }
     }
 
-    Err(anyhow!("all HTTP time sources failed"))
+    if samples.is_empty() {
+        return Err(anyhow!("all HTTP time sources failed"));
+    }
+
+    samples.sort_by_key(|(dt, _)| dt.timestamp());
+    let min_ts = samples.first().map(|(dt, _)| dt.timestamp()).unwrap_or(0);
+    let max_ts = samples.last().map(|(dt, _)| dt.timestamp()).unwrap_or(0);
+
+    // If sources disagree too much, do not trust HTTP bootstrap.
+    const MAX_HTTP_SOURCE_SPREAD_SECS: i64 = 120;
+    if max_ts - min_ts > MAX_HTTP_SOURCE_SPREAD_SECS {
+        return Err(anyhow!(
+            "HTTP time sources disagree too much: spread={}s (min={}, max={})",
+            max_ts - min_ts,
+            min_ts,
+            max_ts
+        ));
+    }
+
+    let median_idx = samples.len() / 2;
+    let (dt, src) = samples[median_idx];
+    set_system_time(dt)?;
+    info!(
+        "Time synced via HTTP Date median(+1/2RTT): {} (selected={}, samples={})",
+        dt,
+        src,
+        samples.len()
+    );
+    Ok(())
 }
 
 async fn sync_time_by_ntp() -> Result<()> {
+    const SLEEP_TIME_NTP: Duration = Duration::from_secs(1);
     for server in DEFAULT_NTP_SERVERS.iter() {
         match ntp_request(server).await {
             Ok(dt) => {
@@ -130,6 +171,11 @@ async fn sync_time_by_ntp() -> Result<()> {
             }
             Err(e) => {
                 warn!("NTP server failed: {} (error: {})", server, e);
+                if util::is_link_local_ip() {
+                    warn!("sync_time_by_ntp Time sync is disabled for link-local address");
+                    return Ok(());
+                }
+                tokio::time::sleep(SLEEP_TIME_NTP).await;
             }
         }
     }

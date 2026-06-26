@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use base64::engine::general_purpose;
-use reqwest::Method;
+use reqwest::{Method, header::SERVER};
 use salvo::http::header::HeaderValue;
 use salvo::prelude::*;
 use serde_json::json;
@@ -53,7 +53,7 @@ pub async fn auth_middleware(
     }
 
     // Authentication failed
-    warn!("Authentication failed: invalid or missing auth token");
+    warn!("Authentication failed: invalid or missing auth token by url: {}", req.uri().path());
     res.status_code(StatusCode::UNAUTHORIZED);
     res.render(Json(json!({"error": "Unauthorized"})));
     ctrl.skip_rest();
@@ -121,7 +121,7 @@ pub async fn developer_auth_middleware(
 }
 
 /// CSRF token validation middleware for protected write operations.
-/// Must run after auth_middleware. Skips for noPassword mode and for GET/HEAD/OPTIONS.
+/// Must run after auth_middleware.
 #[handler]
 pub async fn csrf_middleware(
     req: &mut Request,
@@ -156,7 +156,8 @@ pub async fn csrf_middleware(
 
 fn is_websocket_request(req: &Request) -> bool {
     // HTTP/1.1: Upgrade: websocket
-    if req.headers()
+    if req
+        .headers()
         .get("Upgrade")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_lowercase() == "websocket")
@@ -187,4 +188,67 @@ pub async fn public_middleware(
 ) {
     debug!("Public route accessed: {}", req.uri().path());
     // No authentication required, just continue
+}
+
+/// LAN-friendly security headers (HTTP allowed; HSTS only on HTTPS).
+/// Applied after the handler so error responses include headers (nginx `add_header ... always`).
+#[handler]
+pub async fn security_middleware(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) {
+    ctrl.call_next(req, depot, res).await;
+    apply_security_headers(req, res);
+}
+
+pub fn request_is_https(req: &Request) -> bool {
+    req.uri().scheme_str() == Some("https")
+        || req
+            .headers()
+            .get("X-Forwarded-Proto")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| s.eq_ignore_ascii_case("https"))
+}
+
+fn apply_security_headers(req: &Request, res: &mut Response) {
+    let headers = res.headers_mut();
+
+    headers.insert("X-Frame-Options", HeaderValue::from_static("SAMEORIGIN"));
+    headers.insert("X-Content-Type-Options", HeaderValue::from_static("nosniff"));
+    headers.insert("X-XSS-Protection", HeaderValue::from_static("1; mode=block"));
+    headers.insert("Referrer-Policy", HeaderValue::from_static("strict-origin-when-cross-origin"));
+
+    // No upgrade-insecure-requests: device must keep plain HTTP on LAN.
+    const CSP: &str = "\
+        default-src 'self'; \
+        script-src 'self' 'wasm-unsafe-eval' https://cdn.jsdelivr.net https://unpkg.com; \
+        worker-src 'self' blob: data: https://cdn.jsdelivr.net https://unpkg.com; \
+        connect-src 'self' data: blob: ws: wss: https://api.arkkvm.com https://api-tst.arkkvm.com https://cdn.jsdelivr.net https://unpkg.com https://tessdata.projectnaptha.com; \
+        img-src 'self' data: blob:; \
+        media-src 'self' blob:; \
+        font-src 'self' data:; \
+        style-src 'self' 'unsafe-inline'; \
+        frame-src 'self'; \
+        frame-ancestors 'self'; \
+        object-src 'none'; \
+        base-uri 'self'; \
+        form-action 'self';";
+
+    match HeaderValue::from_str(CSP) {
+        Ok(value) => {
+            headers.insert("Content-Security-Policy", value);
+        }
+        Err(e) => warn!("Failed to set Content-Security-Policy: {}", e),
+    }
+
+    if request_is_https(req) {
+        headers.insert(
+            "Strict-Transport-Security",
+            HeaderValue::from_static("max-age=3600; includeSubDomains"),
+        );
+    }
+
+    headers.remove(SERVER);
 }

@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use tracing::error;
 
-use crate::{config::types::NetworkConfig, hardware::atx::ATXPowerAction};
+use crate::{
+    config::types::{NetworkConfig, VlanSettings},
+    hardware::atx::ATXPowerAction,
+};
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct SettingSwitchParams {
@@ -98,8 +101,31 @@ pub struct NetworkSettingsParams {
     pub settings: NetworkConfig,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VlanSettingsParams {
+    pub settings: VlanSettings,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RenewVlanDhcpLeaseParams {
+    pub role: String,
+}
+
 #[derive(Deserialize)]
 pub struct SshKeyParam {
     #[serde(rename = "sshKey")]
     pub ssh_key: String,
+}
+
+#[derive(Deserialize, Serialize, Debug, Default)]
+pub struct VersionParams {
+    #[serde(rename = "showUI")]
+    pub show_ui: bool,
+}
+
+#[derive(Deserialize, Serialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TailscaleParams {
+    pub enabled: bool,
+    pub login_server: Option<String>,
 }

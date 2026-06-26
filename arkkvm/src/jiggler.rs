@@ -147,7 +147,7 @@ impl Jiggler {
             running.store(true, Ordering::Relaxed);
 
             let mut jiggler_config = { config.read().await.clone() };
-            info!("Jiggler Startting with config: {:?}", &jiggler_config);
+            info!("Jiggler Starting with config: {:?}", &jiggler_config);
 
             let mut last_action_time = Instant::now();
 
@@ -165,49 +165,68 @@ impl Jiggler {
                     config_update.store(false, Ordering::Relaxed);
                 }
 
-                // Get last input time offset
-                let mut input_offset = u64::MAX;
-                let Some(hid) = usb::get_hid() else {
-                    warn!("HID not initialized");
-                    break;
+                // Only consider real user-input timing when a session is active;
+                // without a session there is no user, so treat it as fully idle.
+                let input_offset = if get_current_session().await.is_some() {
+                    usb::seconds_since_last_user_input()
+                } else {
+                    u64::MAX
                 };
-                
-                if get_current_session().await.is_some() {
-                    input_offset = hid.get_last_user_input_time_offset().await;
-                }
 
                 // Check inactivity
                 let limit_time =
-                    u64::min(jiggler_config.inactivity_limit_seconds, INACTIVITY_LIMIT_MIN);
+                    u64::max(jiggler_config.inactivity_limit_seconds, INACTIVITY_LIMIT_MIN);
 
                 // Check if input offset is greater than inactivity limit
                 if input_offset >= limit_time && last_action_time.elapsed().as_secs() >= limit_time
                 {
                     info!("Jiggler: input offset is greater than inactivity limit, sending mouse report");
 
-                    if let Err(e) = hid.abs_mouse_report(0, 0, 0u8, false).await {
-                        error!("Failed to send abs mouse report: {:?}", e);
-                        if let Err(e) = hid.rel_mouse_report(-1, -1, 0, false).await {
-                            error!("Failed to send rel mouse report: {:?}", e);
-                        }
-                    };
-
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-
-                    if let Err(e) = hid.abs_mouse_report(1, 1, 0u8, false).await {
-                        error!("Failed to send abs mouse report: {:?}", e);
-                        if let Err(e) = hid.rel_mouse_report(1, 1, 0, false).await {
-                            error!("Failed to send rel mouse report: {:?}", e);
-                        }
-                    };
+                    if let Some(usb_client) = crate::services::get_usb() {
+                        let _ = usb_client
+                            .key_put_absmouse(crate::proto::v1::AbsMouseReportParams {
+                                x: 0,
+                                y: 0,
+                                buttons: 0,
+                                by_user: false,
+                            })
+                            .await;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let _ = usb_client
+                            .key_put_relmouse(crate::proto::v1::RelMouseReportParams {
+                                dx: -1,
+                                dy: -1,
+                                buttons: 0,
+                                by_user: false,
+                            })
+                            .await;
+                        let _ = usb_client
+                            .key_put_absmouse(crate::proto::v1::AbsMouseReportParams {
+                                x: 1,
+                                y: 1,
+                                buttons: 0,
+                                by_user: false,
+                            })
+                            .await;
+                        let _ = usb_client
+                            .key_put_relmouse(crate::proto::v1::RelMouseReportParams {
+                                dx: 1,
+                                dy: 1,
+                                buttons: 0,
+                                by_user: false,
+                            })
+                            .await;
+                    }
                     last_action_time = Instant::now();
                 }
 
-                tokio::time::sleep(Duration::from_secs(limit_time / 2)).await
+                let progress = input_offset.min(limit_time).min(last_action_time.elapsed().as_secs());
+                let elapsed = limit_time.saturating_sub(progress);
+                tokio::time::sleep(Duration::from_secs(elapsed)).await
             }
 
             running.store(false, Ordering::Relaxed);
-            info!("Jiggler has stoped");
+            info!("Jiggler has stopped");
         });
     }
 }

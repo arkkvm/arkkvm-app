@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::anyhow;
 use bytes::Bytes;
 use parking_lot::RwLock;
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn, error};
 use webrtc::media::Sample;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
@@ -43,11 +43,11 @@ pub async fn shutdown_native_audio() {
     info!("Audio Engine shutdown complete");
 }
 
-// Bridge audio data from Zenoh to WebRTC
-// 1. The underlying hardware service automatically captures audio data and publishes it via Zenoh
+// Bridge zenoh audio to WebRTC
+// 1. Hardware service captures audio and publishes on zenoh
 //    RKMPI: "hdmirx/audio/pcm"
 //    OPUS "hdmirx/audio/opus"
-// 2. Subscribe to the Zenoh topic "hdmirx/audio/opus"
+// 2. Subscribe to zenoh topic "hdmirx/audio/opus"
 pub async fn start_native_audio() -> anyhow::Result<()> {
     let config = get_config_manager();
     if !config.get_emulation_audio_playback().await {
@@ -55,7 +55,10 @@ pub async fn start_native_audio() -> anyhow::Result<()> {
         return Err(anyhow!("Audio playback is disabled"));
     }
 
-    if AUDIO_RUNNING.load(Ordering::Acquire) {
+    if AUDIO_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         return Ok(());
     }
 
@@ -66,9 +69,7 @@ pub async fn start_native_audio() -> anyhow::Result<()> {
         .await
         .expect("Failed to declare subscriber");
 
-    AUDIO_RUNNING.store(true, Ordering::Release);
-
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         info!("Starting audio stream");
 
         loop {
@@ -85,14 +86,14 @@ pub async fn start_native_audio() -> anyhow::Result<()> {
                     continue;
                 },
             };
-
+            
             let Some(track) = AUDIO_SINK.read().await.clone() else {
                 continue;
             };
 
             let payload = reply.payload();
             let payload_bytes = payload.to_bytes();
-
+            
             // Parse packet: [8 bytes timestamp][audio data]
             // Support backward compatibility with old format (no timestamp)
             let (audio_data, capture_time) = if payload_bytes.len() >= 8 {
@@ -101,16 +102,16 @@ pub async fn start_native_audio() -> anyhow::Result<()> {
                     Ok(timestamp_bytes) => {
                         let timestamp_us = u64::from_le_bytes(timestamp_bytes);
                         let audio_data = &payload_bytes[8..];
-
+                        
                         if audio_data.is_empty() {
                             warn!("Received audio frame with timestamp but no audio data");
                             continue;
                         }
-
+                        
                         // Log timestamp for debugging (optional, can be removed in production)
                         let capture_time = UNIX_EPOCH + Duration::from_micros(timestamp_us);
                         debug!("Received audio frame with capture timestamp: {:?}", &capture_time);
-
+                        
                         (audio_data, capture_time)
                     }
                     Err(_) => {
@@ -123,10 +124,10 @@ pub async fn start_native_audio() -> anyhow::Result<()> {
                 debug!("Received audio frame in old format (no timestamp), len: {}", payload_bytes.len());
                 continue;
             };
-
+            
             // TODO: Use timestamp_us for WebRTC synchronization when webrtc-rs supports it
             // For now, we just pass the audio data to write_sample
-
+            
             let _ = track
                     .write_sample(&Sample {
                         data: Bytes::copy_from_slice(audio_data),
@@ -138,13 +139,21 @@ pub async fn start_native_audio() -> anyhow::Result<()> {
         }
         info!("Audio track piping finished");
     });
+    *AUDIO_HANDLE.write() = Some(handle);
 
     Ok(())
 }
 
 pub async fn stop_native_audio() {
     AUDIO_RUNNING.store(false, Ordering::Release);
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let handle = AUDIO_HANDLE.write().take();
+    if let Some(handle) = handle {
+        match tokio::time::timeout(Duration::from_secs(2), handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("Audio task join failed: {}", e),
+            Err(_) => warn!("Timed out waiting audio task to stop"),
+        }
+    }
     info!("Audio engine stopped")
 }
 
@@ -164,7 +173,7 @@ pub fn get_webrtc_clock_rate() -> u32 {
             48000
         }
     };
-    info!("get_webrtc_clock_rate Using audio sample rate: {} Hz (detected: {} Hz) for WebRTC track",
+    info!("get_webrtc_clock_rate Using audio sample rate: {} Hz (detected: {} Hz) for WebRTC track", 
           webrtc_clock_rate, detected_rate);
     webrtc_clock_rate
 }

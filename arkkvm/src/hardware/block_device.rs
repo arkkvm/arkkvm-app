@@ -7,8 +7,9 @@ use parking_lot::RwLock;
 /// Pluggable remote image reader.
 /// Implementations should be cheap to clone or wrapped in Arc.
 pub trait RemoteImageReader: Send + Sync + 'static {
-    /// Read `len` bytes starting at `off`.
-    fn read_at(&self, off: i64, len: i64) -> Result<Vec<u8>>;
+    /// Read up to `buf.len()` bytes from `off` into `buf`.
+    /// Returns how many bytes were written (≤ `buf.len()`). Short reads are allowed.
+    fn read_at(&self, off: i64, buf: &mut [u8]) -> Result<usize>;
     /// Total size in bytes.
     fn size(&self) -> Result<i64>;
 }
@@ -26,6 +27,15 @@ pub fn set_current_remote_image_reader(reader: Option<Arc<dyn RemoteImageReader>
 /// Get a cloned Arc to current reader if any.
 pub fn get_current_remote_image_reader() -> Option<Arc<dyn RemoteImageReader>> {
     CURRENT_READER.read().clone()
+}
+
+fn nbd_timeout_secs() -> u64 {
+    const DEFAULT_TIMEOUT_SECS: u64 = 45;
+    std::env::var("ARKKVM_NBD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|v| *v >= 5 && *v <= 600)
+        .unwrap_or(DEFAULT_TIMEOUT_SECS)
 }
 
 /// NBD device driver wrapper.
@@ -97,7 +107,6 @@ mod linux {
         pub fn close(&mut self) {
             // Try to disconnect client first
             if let Some(dev) = self.device.take() {
-                // Best-effort disconnect; ignore errors, avoid raw ioctl here
                 let fd = dev.as_fd();
                 let _ = ioctl_simple(fd, super::linux::NBD_DISCONNECT);
                 let _ = ioctl_simple(fd, super::linux::NBD_CLEAR_SOCK);
@@ -118,25 +127,21 @@ mod linux {
             if let Some(h) = self.client_thread.take() {
                 let _ = h.join();
             }
-            // Remove stale socket path
             let _ = rustix::fs::unlink(NBD_SOCKET_PATH);
         }
     }
 
     pub(super) fn start_linux_nbd() -> Result<LinuxNbdState> {
-        // Ensure device exists
         if !Path::new(NBD_DEVICE_PATH).exists() {
             return Err(anyhow!("NBD device does not exist: {}", NBD_DEVICE_PATH));
         }
 
-        // Open device read-write; ioctl may require write; kernel ignores writes in read-only mode
         let device = OpenOptions::new()
             .read(true)
-            .write(true) // ioctl may require write; kernel ignores writes for RO
+            .write(true)
             .open(NBD_DEVICE_PATH)
             .context("failed to open NBD device")?;
 
-        // Clean stale socket
         if Path::new(NBD_SOCKET_PATH).exists() {
             rustix::fs::unlink(NBD_SOCKET_PATH).with_context(|| {
                 format!("failed to remove existing socket: {}", NBD_SOCKET_PATH)
@@ -146,26 +151,30 @@ mod linux {
         let listener = UnixListener::bind(NBD_SOCKET_PATH)
             .with_context(|| format!("failed to bind unix socket: {}", NBD_SOCKET_PATH))?;
 
-        // Dial to self to create a pair
         let client_conn =
             UnixStream::connect(NBD_SOCKET_PATH).context("failed to connect unix socket")?;
 
-        // Accept the server side
         let (server_conn, _) = listener.accept().context("failed to accept unix socket")?;
 
-        // Spawn server loop: serve NBD protocol, export name arkkvm
         let server_thread = thread::spawn({
             let mut sc = server_conn.try_clone().expect("dup server conn");
             move || {
-                let _ = run_server(&mut sc);
+                if let Err(e) = run_server(&mut sc) {
+                    if is_expected_disconnect_error(&e) {
+                        tracing::warn!(error = %e, "nbd userspace server exited after disconnect");
+                    } else {
+                        tracing::error!(error = %e, "nbd userspace server exited with error");
+                    }
+                }
             }
         });
 
-        // Spawn client loop: connect device to the socket
         let device_clone = device.try_clone().context("dup device")?;
         let client_conn_clone = client_conn.try_clone().context("dup client conn")?;
         let client_thread = thread::spawn(move || {
-            let _ = run_client_connect(client_conn_clone, device_clone);
+            if let Err(e) = run_client_connect(client_conn_clone, device_clone) {
+                tracing::error!(error = %e, "nbd kernel client thread exited with error");
+            }
         });
 
         Ok(LinuxNbdState {
@@ -181,60 +190,107 @@ mod linux {
     fn run_server(conn: &mut UnixStream) -> Result<()> {
         use nbd::server;
 
-        // Prepare export via handshake
-        let device = server::handshake(&mut *conn, |export_name| {
-            // Single export named "arkkvm". Kernel oldstyle may send empty name; accept both.
-            if !(export_name.is_empty() || export_name == "arkkvm") {
-                return Err(std::io::Error::other("unknown export"));
-            }
-            let res: Result<nbd::Export<_>> = (|| -> Result<_> {
-                let reader = get_current_remote_image_reader()
-                    .ok_or_else(|| anyhow!("image not mounted"))?;
-                let size = reader.size()?;
-                Ok(nbd::Export {
-                    size: size as u64,
-                    readonly: true,
-                    resizeable: false,
-                    rotational: false,
-                    send_trim: false,
-                    send_flush: false,
-                    data: RemoteImageDevice::new(reader, size as u64),
-                })
-            })();
-            anyhow_to_io(res)
-        })?;
-
+        // Kernel ioctl NBD: socket must enter transmission directly (no userspace handshake).
+        let reader =
+            get_current_remote_image_reader().ok_or_else(|| anyhow!("nbd: image not mounted"))?;
+        let data_size = reader.size()? as u64;
+        let export_size = align_export_size(data_size);
+        let device = RemoteImageDevice::new(reader, data_size, export_size);
         server::transmission(&mut *conn, device)?;
         Ok(())
     }
 
+    fn is_expected_disconnect_error(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            if let Some(ioe) = cause.downcast_ref::<std::io::Error>() {
+                matches!(
+                    ioe.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::NotConnected
+                )
+            } else {
+                false
+            }
+        })
+    }
+
+    #[inline]
+    fn align_export_size(data_size: u64) -> u64 {
+        const BLK: u64 = 4096;
+        (data_size + BLK - 1) & !(BLK - 1)
+    }
+
     struct RemoteImageDevice {
         reader: Arc<dyn RemoteImageReader>,
-        size: u64,
+        data_size: u64,
+        export_size: u64,
         pos: u64,
     }
 
     impl RemoteImageDevice {
-        fn new(reader: Arc<dyn RemoteImageReader>, size: u64) -> Self {
-            Self { reader, size, pos: 0 }
+        fn new(reader: Arc<dyn RemoteImageReader>, data_size: u64, export_size: u64) -> Self {
+            Self {
+                reader,
+                data_size,
+                export_size,
+                pos: 0,
+            }
         }
     }
 
     impl Read for RemoteImageDevice {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if self.pos >= self.size {
+            if self.pos >= self.export_size {
                 return Ok(0);
             }
-            let max = (self.size - self.pos) as usize;
+            let max = (self.export_size - self.pos) as usize;
             let to_read = buf.len().min(max);
             if to_read == 0 {
                 return Ok(0);
             }
-            let data = self.reader.read_at(self.pos as i64, to_read as i64).map_err(to_io_other)?;
-            let n = data.len().min(to_read);
-            buf[..n].copy_from_slice(&data[..n]);
-            self.pos += n as u64;
-            Ok(n)
+            if self.pos >= self.data_size {
+                buf[..to_read].fill(0);
+                self.pos += to_read as u64;
+                return Ok(to_read);
+            }
+            let n_from_image = to_read.min((self.data_size - self.pos) as usize);
+            let mut filled = 0usize;
+            while filled < n_from_image {
+                let n = self
+                    .reader
+                    .read_at((self.pos + filled as u64) as i64, &mut buf[filled..n_from_image])
+                    .map_err(to_io_other)?;
+                if n > (n_from_image - filled) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "read_at wrote past buffer",
+                    ));
+                }
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+
+            if filled < n_from_image {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "remote image short read at off={} want={} got={}",
+                        self.pos, n_from_image, filled
+                    ),
+                ));
+            }
+
+            if n_from_image < to_read {
+                // Padding region beyond source image EOF should be deterministic zeros.
+                buf[n_from_image..to_read].fill(0);
+            }
+
+            self.pos += to_read as u64;
+            Ok(to_read)
         }
     }
 
@@ -252,7 +308,7 @@ mod linux {
             let new_pos: i128 = match pos {
                 SeekFrom::Start(x) => x as i128,
                 SeekFrom::Current(x) => self.pos as i128 + (x as i128),
-                SeekFrom::End(x) => self.size as i128 + (x as i128),
+                SeekFrom::End(x) => self.export_size as i128 + (x as i128),
             };
             if new_pos < 0 {
                 return Err(std::io::Error::new(
@@ -261,15 +317,22 @@ mod linux {
                 ));
             }
             let new_pos = new_pos as u64;
+            if new_pos > self.export_size {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "seek past end of export",
+                ));
+            }
             self.pos = new_pos;
             Ok(self.pos)
         }
     }
 
-    // Minimal ioctl bindings for NBD device
+    // linux/nbd.h NBD_* ioctls
     const NBD_SET_SOCK: libc::c_ulong = 0x0000ab00;
     const NBD_SET_BLKSIZE: libc::c_ulong = 0x0000ab01;
     const NBD_SET_SIZE: libc::c_ulong = 0x0000ab02;
+    const NBD_SET_SIZE_BLOCKS: libc::c_ulong = 0x0000ab07;
     const NBD_DO_IT: libc::c_ulong = 0x0000ab03;
     const NBD_CLEAR_SOCK: libc::c_ulong = 0x0000ab04;
     const NBD_DISCONNECT: libc::c_ulong = 0x0000ab08;
@@ -278,7 +341,6 @@ mod linux {
     const NBD_FLAG_READ_ONLY_IOCTL: u64 = 2; // read-only
 
     fn ioctl_set_u64(fd: BorrowedFd<'_>, req: libc::c_ulong, val: u64) -> Result<()> {
-        // On 64-bit, third arg is unsigned long; cast directly. On 32-bit, check overflow.
         #[cfg(target_pointer_width = "32")]
         let arg: libc::c_ulong = match <libc::c_ulong as TryFrom<u64>>::try_from(val) {
             Ok(v) => v,
@@ -308,33 +370,31 @@ mod linux {
         std::io::Error::other(e.to_string())
     }
 
-    #[inline]
-    fn anyhow_to_io<T>(res: Result<T>) -> std::io::Result<T> {
-        res.map_err(to_io_other)
-    }
-
     fn run_client_connect(conn: UnixStream, device: File) -> Result<()> {
         let sock_fd = conn.as_raw_fd();
         let dev_fd = device.as_fd();
 
-        // Configure device parameters before attaching socket
+        // Set BLKSIZE before SIZE on old kernels (Rockchip BSP) or size can truncate.
+        const NBD_BLKSIZE: u64 = 4096;
         if let Some(reader) = get_current_remote_image_reader() {
-            let size = reader.size().context("get image size")? as u64;
-            ioctl_set_u64(dev_fd, NBD_SET_SIZE, size).context("ioctl NBD_SET_SIZE")?;
+            let data_size = reader.size().context("get image size")? as u64;
+            let export_size = align_export_size(data_size);
+            let blocks = export_size / NBD_BLKSIZE;
+            ioctl_set_u64(dev_fd, NBD_SET_BLKSIZE, NBD_BLKSIZE).context("ioctl NBD_SET_BLKSIZE")?;
+            ioctl_set_u64(dev_fd, NBD_SET_SIZE_BLOCKS, blocks)
+                .context("ioctl NBD_SET_SIZE_BLOCKS")?;
+            // Omit NBD_SET_SIZE: ioctl(2) third arg is unsigned long; on 32-bit, byte sizes
+            // > 2^32-1 cannot be passed. SET_SIZE_BLOCKS already sets the same bytesize.
+            // ioctl_set_u64(dev_fd, NBD_SET_SIZE, export_size).context("ioctl NBD_SET_SIZE")?;
         }
-        // Read-only flag
         let _ = ioctl_set_u64(dev_fd, NBD_SET_FLAGS, NBD_FLAG_READ_ONLY_IOCTL);
-        // Timeout (seconds)
-        let _ = ioctl_set_u64(dev_fd, NBD_SET_TIMEOUT, 5);
-        // Set block size to 4KiB
-        ioctl_set_u64(dev_fd, NBD_SET_BLKSIZE, 4096).context("ioctl NBD_SET_BLKSIZE")?;
-        // Associate socket with kernel NBD
+        let timeout_secs = nbd_timeout_secs();
+        let _ = ioctl_set_u64(dev_fd, NBD_SET_TIMEOUT, timeout_secs);
+        tracing::info!(timeout_secs, "nbd kernel timeout configured");
         ioctl_set_u64(dev_fd, NBD_SET_SOCK, sock_fd as u64).context("ioctl NBD_SET_SOCK")?;
 
-        // Run. This blocks until disconnect
         let _ = ioctl_simple(dev_fd, NBD_DO_IT);
 
-        // Teardown
         let _ = ioctl_simple(dev_fd, NBD_CLEAR_SOCK);
         Ok(())
     }

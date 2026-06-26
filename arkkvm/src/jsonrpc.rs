@@ -24,7 +24,7 @@ use futures::future::BoxFuture;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{error, info, warn, trace};
+use tracing::{error, info, trace, warn};
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 
@@ -39,7 +39,8 @@ use crate::jiggler::JigglerConfig;
 use crate::jsonrpc::handlers::*;
 use crate::module::rtc_request_params::{
     ATXPowerParams, BacklightSettingsParams, DisplayRotationParams, FilePathParams,
-    FileUploadParams, NetworkSettingsParams, PathParams, SettingSwitchParams, SshKeyParam,
+    FileUploadParams, NetworkSettingsParams, PathParams, RenewVlanDhcpLeaseParams,
+    SettingSwitchParams, SshKeyParam, TailscaleParams, VersionParams, VlanSettingsParams,
 };
 use crate::module::rtc_response_params::OtaState;
 use crate::services::gui_pipeline;
@@ -119,14 +120,9 @@ impl JsonRpcError {
     }
 }
 
-/// Build an error response to reduce duplicated Response construction in handle_message
+/// Build an error response; reduces duplicate Response construction in handle_message
 fn error_response(error: JsonRpcError, id: Option<Value>) -> JsonRpcResponse {
-    JsonRpcResponse {
-        jsonrpc: JSONRPC_VERSION.to_string(),
-        result: None,
-        error: Some(error),
-        id,
-    }
+    JsonRpcResponse { jsonrpc: JSONRPC_VERSION.to_string(), result: None, error: Some(error), id }
 }
 
 /// RPC handler trait
@@ -552,20 +548,26 @@ impl JsonRpcProcessor {
             Ok(req) => req,
             Err(e) => {
                 warn!("Failed to parse JSON-RPC request: {}", e);
-                if let Err(e) = self.send_response(&error_response(JsonRpcError::parse_error(), None), &channel).await {
+                if let Err(e) = self
+                    .send_response(&error_response(JsonRpcError::parse_error(), None), &channel)
+                    .await
+                {
                     error!("Failed to send error response: {}", e);
                 }
                 return;
             }
         };
-
+        info!("RPC handle_message request: {:?}", request);
         let handler = match self.registry.get_handler(&request.method) {
             Some(h) => h,
             None => {
                 warn!("Method not found: {}", request.method);
-                if let Err(e) =
-                    self.send_response(&error_response(JsonRpcError::method_not_found(), request.id), &channel)
-                        .await
+                if let Err(e) = self
+                    .send_response(
+                        &error_response(JsonRpcError::method_not_found(), request.id),
+                        &channel,
+                    )
+                    .await
                 {
                     error!("Failed to send error response: {}", e);
                 }
@@ -593,7 +595,10 @@ impl JsonRpcProcessor {
                 if request.id.is_some() {
                     if let Err(e) = self
                         .send_response(
-                            &error_response(JsonRpcError::internal_error(Some(e.to_string())), request.id),
+                            &error_response(
+                                JsonRpcError::internal_error(Some(e.to_string())),
+                                request.id,
+                            ),
                             &channel,
                         )
                         .await
@@ -654,11 +659,18 @@ impl JsonRpcProcessor {
         params: Option<Value>,
         session: Arc<Session>,
     ) -> Result<()> {
-        let event = JsonRpcEvent { jsonrpc: JSONRPC_VERSION.to_string(), method: method.to_string(), params };
+        let event = JsonRpcEvent {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: method.to_string(),
+            params,
+        };
         let message_bytes = serde_json::to_vec(&event)?;
         trace!("Sending JSON-RPC event: method={}, {} bytes", method, message_bytes.len());
 
-        if let Some(rpc_channel) = session.rpc_channel.read().await.as_ref() {
+        // Clone channel handle first so the RwLock read guard is dropped
+        // before awaiting send(), avoiding lock-holding across await.
+        let rpc_channel = session.rpc_channel.read().await.clone();
+        if let Some(rpc_channel) = rpc_channel {
             if let Err(e) = rpc_channel.send(&message_bytes.into()).await {
                 return Err(anyhow!("Failed to send RPC event: {}", e));
             }
@@ -675,6 +687,7 @@ pub mod handlers {
     use std::sync::OnceLock;
 
     use parking_lot::{Mutex, RwLock};
+    use reqwest::Url;
     use serde_json::json;
     use tokio::time::Duration;
     use uuid::Uuid;
@@ -684,15 +697,15 @@ pub mod handlers {
     use crate::cloud::CloudManager;
     use crate::config::types::{NetworkConfig, UISwitch};
     use crate::hardware::usb as usb_mod;
-    use crate::hardware::usb::gadget::UsbDeviceType;
+    use crate::hardware::usb::UsbDeviceType;
     use crate::hardware::usb::storage::{
         self as storage_mod, FileTransferState, FileTransferTarget,
     };
-    use crate::module::rtc_request_params::SshKeyParam;
+    use crate::module::rtc_request_params::{SshKeyParam, TailscaleParams};
     use crate::module::rtc_response_params::{GuiSettingsResponse, StartDownloadResponse};
     use crate::network::{self, NetworkInterfaceState, RpcIPv6Address, RpcNetworkState};
     use crate::web::get_global_app_state;
-    use crate::{audio, jiggler, ota, zenoh_bus};
+    use crate::{audio, jiggler, ota, plugin, zenoh_bus};
 
     static USB_STATE: once_cell::sync::OnceCell<RwLock<String>> = once_cell::sync::OnceCell::new();
     static KEYBOARD_LED: once_cell::sync::OnceCell<RwLock<HidKeyboardState>> =
@@ -704,7 +717,7 @@ pub mod handlers {
     static DISPLAY_ROTATION: OnceLock<Mutex<String>> = OnceLock::new();
     static KEYBOARD_LAYOUT: OnceLock<Mutex<String>> = OnceLock::new();
 
-    /// Ping handler: return a static string to avoid per-request allocations
+    /// Ping handler: returns a static string to avoid per-request allocation
     pub fn ping() -> Result<&'static str> {
         Ok("pong")
     }
@@ -752,6 +765,22 @@ pub mod handlers {
     pub async fn reset_config() -> Result<Value> {
         let config_manager = get_config_manager();
         let default_config = crate::config::types::Config::default();
+
+        // disable microphone emulation
+        handlers::set_microphone_emulation(SettingSwitchParams { enabled: default_config.microphone_emulation.unwrap_or(false) }).await?;
+
+        // reset usb devices to default
+        handlers::set_usb_devices(SetUsbDevicesParams {
+            devices: UsbDevicesState {
+                absolute_mouse: default_config.usb_devices.absolute_mouse,
+                relative_mouse: default_config.usb_devices.relative_mouse,
+                keyboard: default_config.usb_devices.keyboard,
+                mass_storage: default_config.usb_devices.mass_storage_vm,
+                microphone: default_config.usb_devices.microphone,
+            },
+        })
+        .await?;
+
         config_manager
             .update(|cfg| {
                 cfg.auto_update_enabled = default_config.auto_update_enabled;
@@ -771,6 +800,7 @@ pub mod handlers {
                 cfg.local_auth_token = default_config.local_auth_token;
                 cfg.dev_channel_enabled = default_config.dev_channel_enabled;
                 cfg.local_loopback_only = default_config.local_loopback_only;
+                cfg.microphone_emulation = default_config.microphone_emulation;
                 // TODO: Video Quality, Audio Quality, Device Display, HTTPS mode, Troubleshooting mode;
             })
             .await?;
@@ -782,6 +812,7 @@ pub mod handlers {
         gui_pipeline::set_dark_screen_time(gui_config.dark_screen_time).await?;
         gui_pipeline::set_sleep_time(gui_config.sleep_time).await?;
 
+        plugin::reset_tailscale().await?;
         info!("Configuration reset to default and saved");
         Ok(Value::Null)
     }
@@ -811,9 +842,44 @@ pub mod handlers {
     }
 
     pub async fn set_cloud_url(params: CloudUrlParams) -> Result<Value> {
+        let api_url = params.api_url.trim();
+        let app_url = params.app_url.trim();
+
+        if api_url.is_empty() || app_url.is_empty() {
+            return Err(anyhow!("API URL and app URL cannot be empty"));
+        }
+
+        let api_url = Url::parse(api_url)?;
+        let app_url = Url::parse(app_url)?;
+
+        let api_url_scheme = api_url.scheme();
+        let app_url_scheme = app_url.scheme();
+
+        if (api_url_scheme != "https" && api_url_scheme != "http")
+            || (app_url_scheme != "http" && app_url_scheme != "https")
+        {
+            return Err(anyhow!("unsupported url scheme"));
+        }
+
+        let api_url_origin = api_url.origin().ascii_serialization();
+        let app_url_origin = app_url.origin().ascii_serialization();
+
+        if !check_url_valid(&api_url_origin, api_url.as_str())
+            || !check_url_valid(&app_url_origin, app_url.as_str())
+        {
+            warn!("the url is not valid: api_url_origin={}, api_url={}", api_url_origin, api_url);
+            warn!("app_url_origin={}, app_url={}", app_url_origin, app_url);
+            return Err(anyhow!("the url is not valid"));
+        }
+
         let cloud_manager = CloudManager::new();
-        cloud_manager.set_cloud_url(&params.api_url, &params.app_url).await?;
+        cloud_manager.set_cloud_url(&api_url_origin, &app_url_origin).await?;
         Ok(Value::Null)
+    }
+
+    fn check_url_valid(origin: &str, url: &str) -> bool {
+        let origin_url = format!("{}/", origin);
+        origin_url.as_str() == url || origin == url
     }
 
     // Network IPv4 address (skeleton)
@@ -829,11 +895,11 @@ pub mod handlers {
     // }
 
     pub async fn get_network_state() -> RpcNetworkState {
-        NetworkInterfaceState::default().rpc_get_network_state().await
+        NetworkInterfaceState::get_instance().rpc_get_network_state().await
     }
 
     pub async fn get_ipv6_addresses() -> Vec<RpcIPv6Address> {
-        NetworkInterfaceState::default().get_ipv6_addresses().await
+        NetworkInterfaceState::get_instance().get_ipv6_addresses().await
     }
 
     pub async fn get_network_settings() -> NetworkConfig {
@@ -846,7 +912,32 @@ pub mod handlers {
     }
 
     pub async fn renew_dhcp_lease() -> Result<Value> {
-        NetworkInterfaceState::default().renew_dhcp_lease().await?;
+        NetworkInterfaceState::get_instance().renew_dhcp_lease().await?;
+        Ok(Value::Null)
+    }
+
+    pub async fn get_vlan_settings() -> Result<Value> {
+        let response = network::vlan::get_vlan_settings_response().await?;
+        Ok(serde_json::to_value(response)?)
+    }
+
+    pub async fn set_vlan_settings(settings: crate::config::types::VlanSettings) -> Result<Value> {
+        let response = network::vlan::set_vlan_settings(settings).await?;
+        Ok(serde_json::to_value(response)?)
+    }
+
+    pub async fn confirm_vlan_settings() -> Result<Value> {
+        network::vlan::confirm_vlan_settings().await?;
+        Ok(Value::Null)
+    }
+
+    pub async fn revert_vlan_settings() -> Result<Value> {
+        network::vlan::revert_vlan_settings().await?;
+        Ok(Value::Null)
+    }
+
+    pub async fn renew_vlan_dhcp_lease(role: &str) -> Result<Value> {
+        network::vlan::renew_vlan_dhcp_lease(role).await?;
         Ok(Value::Null)
     }
 
@@ -910,14 +1001,14 @@ pub mod handlers {
     }
 
     pub async fn keyboard_report(params: KeyboardReportParams) -> Result<Value> {
-        if let Some(hid) = usb_mod::get_hid() {
-            hid.keyboard_report(params.modifier, &params.keys).await
-                .map_err(|e| anyhow!("keyboard report failed: {}", e))?;
-            Ok(Value::Null)
-        }
-        else {
-            Err(anyhow!("HID not initialized"))
-        }
+        let usb =
+            crate::services::get_usb().ok_or_else(|| anyhow!("USB service not initialized"))?;
+        usb.key_put_keyboard(crate::proto::v1::KeyboardReportParams {
+            modifier: params.modifier as u32,
+            keys: params.keys,
+        })
+        .await?;
+        Ok(Value::Null)
     }
 
     #[derive(Deserialize)]
@@ -928,14 +1019,16 @@ pub mod handlers {
     }
 
     pub async fn abs_mouse_report(params: AbsMouseReportParams) -> Result<Value> {
-        if let Some(hid) = usb_mod::get_hid() {
-            hid.abs_mouse_report(params.x, params.y, params.buttons, true).await
-                .map_err(|e| anyhow!("abs mouse report failed: {}", e))?;
-            Ok(Value::Null)
-        }
-        else {
-            Err(anyhow!("HID not initialized"))
-        }
+        let usb =
+            crate::services::get_usb().ok_or_else(|| anyhow!("USB service not initialized"))?;
+        usb.key_put_absmouse(crate::proto::v1::AbsMouseReportParams {
+            x: params.x,
+            y: params.y,
+            buttons: params.buttons as u32,
+            by_user: true,
+        })
+        .await?;
+        Ok(Value::Null)
     }
 
     #[derive(Deserialize)]
@@ -946,14 +1039,16 @@ pub mod handlers {
     }
 
     pub async fn rel_mouse_report(params: RelMouseReportParams) -> Result<Value> {
-        if let Some(hid) = usb_mod::get_hid() {
-            hid.rel_mouse_report(params.dx, params.dy, params.buttons, true).await
-                .map_err(|e| anyhow!("rel mouse report failed: {}", e))?;
-            Ok(Value::Null)
-        }
-        else {
-            Err(anyhow!("HID not initialized"))
-        }
+        let usb =
+            crate::services::get_usb().ok_or_else(|| anyhow!("USB service not initialized"))?;
+        usb.key_put_relmouse(crate::proto::v1::RelMouseReportParams {
+            dx: params.dx as i32,
+            dy: params.dy as i32,
+            buttons: params.buttons as u32,
+            by_user: true,
+        })
+        .await?;
+        Ok(Value::Null)
     }
 
     #[derive(Deserialize)]
@@ -963,14 +1058,11 @@ pub mod handlers {
     }
 
     pub async fn wheel_report(params: WheelReportParams) -> Result<Value> {
-        if let Some(hid) = usb_mod::get_hid() {
-            hid.abs_mouse_wheel_report(params.wheel_y).await
-                .map_err(|e| anyhow!("wheel report failed: {}", e))?;
-            Ok(Value::Null)
-        }
-        else {
-            Err(anyhow!("HID not initialized"))
-        }
+        let usb =
+            crate::services::get_usb().ok_or_else(|| anyhow!("USB service not initialized"))?;
+        usb.key_put_wheel(crate::proto::v1::WheelReportParams { wheel_y: params.wheel_y as u32 })
+            .await?;
+        Ok(Value::Null)
     }
 
     /// Get device ID
@@ -1152,11 +1244,9 @@ pub mod handlers {
         pub factor: f64,
     }
 
-
-
     pub fn get_audio_quality() -> Result<Value> {
         let quality_str = format!("{:.3}", crate::services::audio::get_audio_quality());
-            Ok(serde_json::from_str(quality_str.as_str())?)
+        Ok(serde_json::from_str(quality_str.as_str())?)
     }
 
     pub async fn set_audio_quality(params: StreamQualityParams) -> Result<Value> {
@@ -1331,6 +1421,13 @@ pub mod handlers {
         pub relative_mouse: bool,
         pub keyboard: bool,
         pub mass_storage: bool,
+        pub microphone: bool,
+    }
+
+    /// Frontend `setUsbDevices` payload: `{ "devices": { ... } }`
+    #[derive(Deserialize, Debug)]
+    pub struct SetUsbDevicesParams {
+        pub devices: UsbDevicesState,
     }
 
     #[derive(Deserialize)]
@@ -1339,28 +1436,11 @@ pub mod handlers {
         pub enabled: bool,
     }
 
-    pub fn set_usb_device_state(params: UsbDeviceStateParams) -> Result<Value> {
-        match params.device.as_str() {
-            "absoluteMouse" | "relativeMouse" | "keyboard" | "massStorage" => {
-                info!("USB device {} state set to: {}", params.device, params.enabled);
-                Ok(Value::Null)
-            }
-            _ => Err(anyhow!("Invalid USB device: {}", params.device)),
-        }
-    }
-
-    /// USB emulation (bound/configured). Uses UsbManager state if available.
+    /// USB emulation enabled (gadget bound to UDC in usb_devices sidecar).
     pub async fn get_usb_emulation_state() -> Result<bool> {
-        // Bound to UDC by checking dwc3 driver path with current UDC name
-        let manager = usb_mod::get_usb_manager();
-        let manager = manager.read().await;
-        let Some(mgr) = manager.as_ref() else {
-            return Err(anyhow!("USB manager not initialized"));
-        };
-
-        let udc = mgr.get_udc_name();
-        let path = format!("/sys/bus/platform/drivers/dwc3/{}", udc);
-        return Ok(std::path::Path::new(&path).exists());
+        let usb =
+            crate::services::get_usb().ok_or_else(|| anyhow!("USB service not initialized"))?;
+        usb.get_usb_emulation_state().await
     }
 
     #[derive(Deserialize)]
@@ -1369,21 +1449,10 @@ pub mod handlers {
     }
 
     pub async fn set_usb_emulation_state(params: UsbEmulationParams) -> Result<Value> {
-        let manager = usb_mod::get_usb_manager();
-        let manager = manager.read().await;
-        let Some(mgr) = manager.as_ref() else {
-            return Err(anyhow!("USB manager not initialized"));
-        };
-
-        let udc = mgr.get_udc_name().to_string();
-        let bind_path = "/sys/bus/platform/drivers/dwc3/bind";
-        let unbind_path = "/sys/bus/platform/drivers/dwc3/unbind";
-        if params.enabled {
-            std::fs::write(bind_path, &udc).map_err(|e| anyhow!("error binding UDC: {}", e))?;
-        } else {
-            std::fs::write(unbind_path, &udc).map_err(|e| anyhow!("error unbinding UDC: {}", e))?;
-        }
-        info!("USB emulation state set to: {}", params.enabled);
+        let usb =
+            crate::services::get_usb().ok_or_else(|| anyhow!("USB service not initialized"))?;
+        let enabled = usb.set_usb_emulation_state(params.enabled).await?;
+        info!("USB emulation state set to: {}", enabled);
         Ok(Value::Null)
     }
 
@@ -1419,13 +1488,53 @@ pub mod handlers {
     }
 
     pub async fn set_microphone_emulation(params: SettingSwitchParams) -> Result<Value> {
-        // let manager = usb_mod::get_usb_manager();
-        // let mut manager = manager.write().await;
-        // let Some(mgr) = manager.as_mut() else {
-        //     return Err(anyhow!("USB manager not initialized"));
-        // };
-        // mgr.set_usb_device_enable(UsbDeviceType::Microphone, params.enabled).await?;
-        usb_mod::reboot_usb_manager_by_device(UsbDeviceType::Microphone, params.enabled).await?;
+        info!(enabled = params.enabled, "jsonrpc set_microphone_emulation request");
+        if params.enabled {
+            let devices = get_config_manager().get_usb_devices().await;
+            if !devices.microphone {
+                return Err(anyhow!("microphone device is not enabled"));
+            }
+        }
+
+        let usb =
+            crate::services::get_usb().ok_or_else(|| anyhow!("USB service not initialized"))?;
+        if let Err(e) = usb.set_mic_process(params.enabled).await {
+            error!(
+                enabled = params.enabled,
+                error = %e,
+                "jsonrpc set_microphone_emulation set_mic_process failed"
+            );
+            return Err(e);
+        }
+
+        if params.enabled {
+            if let Err(e) = crate::services::init_virtual_mic_service().await {
+                error!(
+                    enabled = params.enabled,
+                    error = %e,
+                    "jsonrpc set_microphone_emulation init_virtual_mic failed"
+                );
+                return Err(e);
+            }
+        } else if let Err(e) = crate::services::uninit_virtual_mic_service().await {
+            error!(
+                enabled = params.enabled,
+                error = %e,
+                "jsonrpc set_microphone_emulation uninit_virtual_mic failed"
+            );
+            return Err(e);
+        }
+
+        if let Err(e) = get_config_manager().set_microphone_emulation(params.enabled).await {
+            error!(
+                enabled = params.enabled,
+                error = %e,
+                "jsonrpc set_microphone_emulation persist failed"
+            );
+            return Err(anyhow!("Failed to save microphone emulation: {:?}", e));
+        }
+
+        info!(enabled = params.enabled, "jsonrpc set_microphone_emulation success");
         Ok(Value::Null)
     }
 
@@ -1435,12 +1544,6 @@ pub mod handlers {
     }
 
     pub async fn set_camera_emulation(params: SettingSwitchParams) -> Result<Value> {
-        // let manager = usb_mod::get_usb_manager();
-        // let mut manager = manager.write().await;
-        // let Some(mgr) = manager.as_mut() else {
-        //     return Err(anyhow!("USB manager not initialized"));
-        // };
-        // mgr.set_usb_device_enable(UsbDeviceType::Camera, params.enabled).await?;
         usb_mod::reboot_usb_manager_by_device(UsbDeviceType::Camera, params.enabled).await?;
         Ok(Value::Null)
     }
@@ -1451,20 +1554,13 @@ pub mod handlers {
     }
 
     pub async fn set_file_transfer(params: SettingSwitchParams) -> Result<Value> {
-        // let manager = usb_mod::get_usb_manager();
-        // let mut manager = manager.write().await;
-        // let Some(mgr) = manager.as_mut() else {
-        //     return Err(anyhow!("USB manager not initialized"));
-        // };
-
-        if !params.enabled {
-            if storage_mod::get_file_transfer_state().await?.target == FileTransferTarget::RemoteUsb
-            {
-                return Err(anyhow!("Cannot disable file transfer while remote USB is enabled"));
-            }
+        if !params.enabled
+            && storage_mod::get_file_transfer_state().await?.target == FileTransferTarget::RemoteUsb
+        {
+            // If RemoteUsb FT is active, unmount first then disable switch.
+            storage_mod::unmount_file_img().await?;
         }
 
-        // mgr.set_usb_device_enable(UsbDeviceType::MassStorageFt, params.enabled).await?;
         usb_mod::reboot_usb_manager_by_device(UsbDeviceType::MassStorageFt, params.enabled).await?;
         Ok(Value::Null)
     }
@@ -1486,9 +1582,17 @@ pub mod handlers {
 
     pub async fn set_audio_playback(params: SettingSwitchParams) -> Result<Value> {
         let manager = crate::config::get_config_manager();
-        if let Err(e) = manager.set_emulation_audio_playback(params.enabled).await {
-            return Err(anyhow!("Failed to set audio playback: {:?}", e));
+        match manager.set_emulation_audio_playback(params.enabled).await {
+            Ok(has_changed) => {
+                if !has_changed {
+                    return Ok(Value::Null);
+                }
+            }
+            Err(e) => {
+                return Err(anyhow!("Failed to set audio playback: {:?}", e));
+            }
         }
+
         if params.enabled {
             tokio::time::sleep(Duration::from_millis(100)).await;
             audio::start_native_audio().await?;
@@ -1505,11 +1609,13 @@ pub mod handlers {
 
     pub async fn set_ui_switch(params: UISwitch) -> Result<Value> {
         let manager = crate::config::get_config_manager();
-        manager.update(|config| {
-            if config.ui_switch != params {
-                config.ui_switch = params;
-            }
-        }).await?;
+        manager
+            .update(|config| {
+                if config.ui_switch != params {
+                    config.ui_switch = params;
+                }
+            })
+            .await?;
         Ok(Value::Null)
     }
 
@@ -1549,35 +1655,45 @@ pub mod handlers {
         manager.get_usb_devices_state().await
     }
 
-    pub async fn set_usb_devices(params: UsbDevicesState) -> Result<Value> {
-        // let manager = usb_mod::get_usb_manager();
-        // let mut manager = manager.write().await;
-        // let Some(mgr) = manager.as_mut() else {
-        //     return Err(anyhow!("USB manager not initialized"));
-        // };
-        // mgr.set_usb_devices_enable_old(&params).await?;
-
+    pub async fn set_usb_devices(params: SetUsbDevicesParams) -> Result<Value> {
+        let state = params.devices;
+        info!(
+            absolute_mouse = state.absolute_mouse,
+            keyboard = state.keyboard,
+            mass_storage = state.mass_storage,
+            microphone = state.microphone,
+            "jsonrpc set_usb_devices request"
+        );
         let mut devices = get_config_manager().get_usb_devices().await;
-        devices.absolute_mouse = params.absolute_mouse;
-        devices.relative_mouse = params.relative_mouse;
-        devices.keyboard = params.keyboard;
-        devices.mass_storage_vm = params.mass_storage;
 
-        usb_mod::reboot_usb_manager(None, Some(devices)).await?;
+        devices.absolute_mouse = state.absolute_mouse;
+        devices.keyboard = state.keyboard;
+        // keyboard + relative mouse share one HID function in sidecar
+        devices.relative_mouse = state.keyboard;
+        devices.mass_storage_vm = state.mass_storage;
+        devices.mass_storage_ft = state.mass_storage;
+        devices.microphone = state.microphone;
+
+        // devices.camera = state.camera;
+        // Legacy API only exposes one mass-storage flag; do not mirror it onto FT.
+
+        info!("set_usb_devices -> apply sidecar: {:?}", devices);
+        if let Err(e) =
+            usb_mod::reboot_usb_manager_with_reason(None, Some(devices), "set_devices").await
+        {
+            error!(error = %e, "jsonrpc set_usb_devices failed");
+            return Err(e);
+        }
+        info!("jsonrpc set_usb_devices success");
         Ok(Value::Null)
     }
 
     pub async fn get_usb_config() -> Result<UsbConfig> {
-        let manager = usb_mod::get_usb_manager();
-        let manager = manager.read().await;
-        let Some(mgr) = manager.as_ref() else {
-            return Err(anyhow!("USB manager not initialized"));
-        };
-        mgr.get_usb_config().await
+        Ok(crate::config::get_config_manager().get_usb_config().await)
     }
 
     pub async fn set_usb_config(usb_config: UsbConfig) -> Result<Value> {
-        usb_mod::reboot_usb_manager(Some(usb_config), None).await?;
+        usb_mod::reboot_usb_manager_with_reason(Some(usb_config), None, "set_config").await?;
         Ok(Value::Null)
     }
 
@@ -1672,8 +1788,7 @@ pub mod handlers {
         // Try to start/stop SSH (best-effort)
         if params.enabled {
             network::ssh::start_sshd().await?;
-        }
-        else {
+        } else {
             network::ssh::stop_sshd().await?;
         }
         Ok(Value::Null)
@@ -1821,6 +1936,11 @@ pub mod handlers {
 
     pub async fn create_ft_dir(path: String) -> Result<Value> {
         storage_mod::fs_create_dir_with_file_img(path).await?;
+        Ok(Value::Null)
+    }
+
+    pub async fn create_ft_file(path: String) -> Result<Value> {
+        storage_mod::fs_create_empty_file_with_file_img(path).await?;
         Ok(Value::Null)
     }
 
@@ -2046,14 +2166,18 @@ pub mod handlers {
             "file" => false,
             _ => return Err(anyhow!("invalid mode: {}", params.mode)),
         };
-        storage_mod::set_mass_storage_mode(cdrom, storage_mod::UsbTarget::Usb0Lun0).await?;
+        // "file" (disk): writable; "cdrom": read-only
+        storage_mod::set_mass_storage_mode(cdrom, cdrom, storage_mod::UsbTarget::Usb0Lun0).await?;
         get_mass_storage_mode().await
     }
 
     pub async fn get_mass_storage_mode() -> Result<String> {
-        let cdrom =
-            storage_mod::get_mass_storage_cdrom_enabled(storage_mod::UsbTarget::Usb0Lun0).await?;
-        Ok(if cdrom { "cdrom".to_string() } else { "file".to_string() })
+        let mode = storage_mod::get_vm_mode_from_sidecar().await?;
+        Ok(if mode == storage_mod::VirtualMediaMode::CDROM {
+            "cdrom".to_string()
+        } else {
+            "file".to_string()
+        })
     }
 
     // ---- Check mount URL usability (HTTP) ----
@@ -2085,6 +2209,28 @@ pub mod handlers {
 
     pub async fn rpc_mount_built_in_image(params: RpcMountBuiltInImageParams) -> Result<Value> {
         mount_built_in_image(MountBuiltInImageParams { filename: params.filename }).await
+    }
+
+    pub async fn get_tailscale_state() -> Result<Value> {
+        match plugin::get_tailscale_state().await {
+            Ok(state) => Ok(serde_json::to_value(state)?),
+            Err(e) => Err(anyhow!("Failed to get tailscale state: {}", e)),
+        }
+    }
+
+    pub async fn switch_tailscale(params: TailscaleParams) -> Result<Value> {
+        plugin::switch_tailscale(params).await?;
+        Ok(Value::Null)
+    }
+
+    pub async fn register_tailscale() -> Result<Value> {
+        let result = plugin::register_tailscale().await?;
+        Ok(serde_json::to_value(result)?)
+    }
+
+    pub async fn register_tailscale_force() -> Result<Value> {
+        let result = plugin::register_tailscale_force().await?;
+        Ok(serde_json::to_value(result)?)
     }
 }
 
@@ -2212,7 +2358,6 @@ pub fn create_default_registry() -> RpcRegistry {
         })
     });
 
-
     // Auto update
     registry.register_async("getAutoUpdateState", |_params| {
         Box::pin(async move { Ok(serde_json::to_value(handlers::get_auto_update_state().await)?) })
@@ -2248,7 +2393,6 @@ pub fn create_default_registry() -> RpcRegistry {
 
     // USB device management
     // registry.register_no_params("getUsbDevices", handlers::get_usb_devices);
-    registry.register_typed("setUsbDeviceState", handlers::set_usb_device_state);
     registry.register_async("getUsbEmulationState", |_params| {
         Box::pin(
             async move { Ok(serde_json::to_value(handlers::get_usb_emulation_state().await?)?) },
@@ -2360,7 +2504,7 @@ pub fn create_default_registry() -> RpcRegistry {
         Box::pin(async move {
             let params: UISwitch =
                 serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
-                handlers::set_ui_switch(params).await
+            handlers::set_ui_switch(params).await
         })
     });
 
@@ -2400,8 +2544,9 @@ pub fn create_default_registry() -> RpcRegistry {
     });
     registry.register_async("setUsbDevices", |params| {
         Box::pin(async move {
-            let params: UsbDevicesState =
-                serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
+            let raw = params.ok_or(anyhow!("Missing required parameters"))?;
+            let inner = raw.get("params").cloned().unwrap_or(raw);
+            let params: handlers::SetUsbDevicesParams = serde_json::from_value(inner)?;
             handlers::set_usb_devices(params).await
         })
     });
@@ -2411,19 +2556,26 @@ pub fn create_default_registry() -> RpcRegistry {
     });
     registry.register_async("setUsbConfig", |params| {
         Box::pin(async move {
-            info!("Setting USB config: {:?}", &params);
-            let params: UsbConfig =
-                serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
-            handlers::set_usb_config(params).await
+            let raw = params.ok_or(anyhow!("Missing required parameters"))?;
+            let inner = raw.get("params").cloned().unwrap_or(raw);
+            info!("Setting USB config: {:?}", &inner);
+            let usb_config: UsbConfig = serde_json::from_value(inner)?;
+            handlers::set_usb_config(usb_config).await
         })
     });
 
     // USB state & keyboard LED
     registry.register_no_params("getUSBState", handlers::get_usb_state);
     registry.register_no_params("getKeyboardLedState", handlers::get_keyboard_led_state);
-    registry.register_async("getCurrentVersion", |_params| {
+    registry.register_async("getCurrentVersion", |params| {
         Box::pin(async move {
-            let result = crate::ota::get_current_version().await?;
+            let version_params: VersionParams = if let Some(value) = params {
+                serde_json::from_value(value)?
+            } else {
+                VersionParams::default()
+            };
+
+            let result = crate::ota::get_current_version(version_params.show_ui).await?;
             Ok(serde_json::to_value(result)?)
         })
     });
@@ -2501,13 +2653,41 @@ pub fn create_default_registry() -> RpcRegistry {
     });
     registry.register_async("setNetworkSettings", |params| {
         Box::pin(async move {
-            let params: NetworkSettingsParams =
-                serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
+            let params: NetworkSettingsParams = serde_json::from_value(
+                params.ok_or(anyhow!("Missing required parameters(NetworkSettingsParams)"))?,
+            )?;
             handlers::set_network_settings(params.settings).await
         })
     });
     registry.register_async("renewDHCPLease", |_params| {
         Box::pin(async move { handlers::renew_dhcp_lease().await })
+    });
+    registry.register_async("getVlanSettings", |_params| {
+        Box::pin(async move { handlers::get_vlan_settings().await })
+    });
+    registry.register_async("setVlanSettings", |params| {
+        info!("setVlanSettings: {:?}", params);
+
+        Box::pin(async move {
+            let params: VlanSettingsParams = serde_json::from_value(
+                params.ok_or(anyhow!("Missing required parameters(VlanSettingsParams)"))?,
+            )?;
+            handlers::set_vlan_settings(params.settings).await
+        })
+    });
+    registry.register_async("confirmVlanSettings", |_params| {
+        Box::pin(async move { handlers::confirm_vlan_settings().await })
+    });
+    registry.register_async("revertVlanSettings", |_params| {
+        Box::pin(async move { handlers::revert_vlan_settings().await })
+    });
+    registry.register_async("renewVlanDhcpLease", |params| {
+        Box::pin(async move {
+            let params: RenewVlanDhcpLeaseParams = serde_json::from_value(
+                params.ok_or(anyhow!("Missing required parameters(RenewVlanDhcpLeaseParams)"))?,
+            )?;
+            handlers::renew_vlan_dhcp_lease(&params.role).await
+        })
     });
     // registry.register_no_params("getNetworkIpAddress", handlers::get_network_ip_address);
     // registry.register_typed("setNetworkIpAddress", handlers::set_network_ip_address);
@@ -2632,6 +2812,14 @@ pub fn create_default_registry() -> RpcRegistry {
             let params: PathParams =
                 serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
             handlers::del_ft_file(params.path).await
+        })
+    });
+
+    registry.register_async("ftCreateFile", |params| {
+        Box::pin(async move {
+            let params: PathParams =
+                serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
+            handlers::create_ft_file(params.path).await
         })
     });
 
@@ -2800,6 +2988,26 @@ pub fn create_default_registry() -> RpcRegistry {
             handlers::set_gui_sleep_time(params.off_after).await?;
             Ok(Value::Null)
         })
+    });
+
+    registry.register_async("getTailscaleState", |_params| {
+        Box::pin(async move { Ok(handlers::get_tailscale_state().await?) })
+    });
+
+    registry.register_async("switchTailscale", |params| {
+        Box::pin(async move {
+            let params: TailscaleParams =
+                serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
+            Ok(handlers::switch_tailscale(params).await?)
+        })
+    });
+
+    registry.register_async("registerTailscale", |_params| {
+        Box::pin(async move { Ok(handlers::register_tailscale().await?) })
+    });
+
+    registry.register_async("registerTailscaleForce", |_params| {
+        Box::pin(async move { Ok(handlers::register_tailscale_force().await?) })
     });
 
     registry

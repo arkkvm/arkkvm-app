@@ -49,7 +49,7 @@
   }
 
   const socket = io("ws://localhost:8000/", {
-    transports: ["websocket"] // Force using the WebSocket protocol
+    transports: ["websocket"]   // force WebSocket transport
   });
 
   socket.on("connect", () => {
@@ -57,11 +57,11 @@
     window.connect();
   });
 
-  // Listen for ICE candidate events
+  // ICE candidate events
   pc.onicecandidate = event => {
     console.log("onicecandidate: ", event);
     if (event.candidate) {
-      // Send ICE candidates via Socket.io
+      // send ICE candidate via Socket.io
       socket.emit('ice-candidate', JSON.stringify(event.candidate));
     }
   };

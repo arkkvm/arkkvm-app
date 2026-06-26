@@ -90,7 +90,7 @@ pub async fn init() -> anyhow::Result<()> {
                     }
                 }
                 let _ = session_cloned.put("", "").await;
-
+                
             } else if msg.starts_with("NAME/") {
             }
         }
@@ -128,7 +128,7 @@ pub async fn init() -> anyhow::Result<()> {
         }
     });
 
-    // Get extended status every second
+    // poll extended status once per second
     let tx2 = tx.clone();
     tokio::spawn(async move {
         loop {

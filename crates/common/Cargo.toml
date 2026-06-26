@@ -1,0 +1,15 @@
+[package]
+name = "common"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tracing-appender = { workspace = true }
+anyhow = { workspace = true }
+
+rustix = { workspace = true }
+regex = { workspace = true }
+
+file-rotate = "0.8.0"

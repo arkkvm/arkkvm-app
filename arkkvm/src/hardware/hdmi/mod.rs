@@ -33,8 +33,7 @@ use rk628_hpd::{HdmiConnectionStatus, Rk628HpdDetector};
 const VIDEO_DEV: &str = "/dev/video0";
 const SUB_DEV: &str = "/dev/v4l-subdev2";
 const INPUT_BUFFER_COUNT: usize = 2;
-const BASE_BITRATE_HIGH: i32 = 2000; // 1500 kbps = 1.5 Mbps
-const BASE_BITRATE_LOW: i32 = 512;   // 600 kbps = 0.5 Mbps
+const BASE_BITRATE: i32 = 2000; // 1500 kbps = 1.5 Mbps
 const MIN_BITRATE: i32 = 200;        // 200 kbps = 0.2 Mbps
 const REF_WIDTH: u32 = 1920;
 const REF_HEIGHT: u32 = 1080;
@@ -61,6 +60,8 @@ pub struct HdmiCapture {
 }
 
 impl HdmiCapture {
+    const THREAD_STOP_TIMEOUT: Duration = Duration::from_secs(3);
+
     /// Create a new HDMI capture instance
     pub fn new() -> Self {
         Self {
@@ -84,7 +85,7 @@ impl HdmiCapture {
 
     /// Initialize the video system
     pub async fn init(&self) -> Result<()> {
-        // Initialize Rockchip MPP system (use the global manager to avoid multiple initializations)
+        // Initialize Rockchip MPP (global manager avoids duplicate init)
         mpi::init().context("Failed to initialize Rockchip MPP system")?;
 
         // Open sub-device for FPS detection
@@ -225,7 +226,7 @@ impl HdmiCapture {
                 }
             }
             info!("
-
+            
              task stopped");
         });
 
@@ -241,7 +242,7 @@ impl HdmiCapture {
         else {
             None
         };
-
+        
         if let Some(handle) = self.hpd_thread.write().await.take() {
             handle.abort();
             let _ = handle.await;
@@ -296,8 +297,16 @@ impl HdmiCapture {
     async fn wait_to_exit_hw_detection(&self) {
         if let Some(handle) = self.hw_detector_thread.write().await.take() {
             info!("Stopping HW detection thread");
-            let _ = handle.await;
-            info!("HW detection thread stopped");
+            match tokio::time::timeout(Self::THREAD_STOP_TIMEOUT, handle).await {
+                Ok(Ok(())) => info!("HW detection thread stopped"),
+                Ok(Err(e)) => error!("Failed to stop HW detection thread: {}", e),
+                Err(_) => {
+                    error!(
+                        "Timed out stopping HW detection thread after {:?}",
+                        Self::THREAD_STOP_TIMEOUT
+                    );
+                }
+            }
         }
     }
 
@@ -305,7 +314,7 @@ impl HdmiCapture {
         self.should_exit.store(true, Ordering::Release);
         self.wait_to_exit_hw_detection().await;
         self.stop_streaming().await;
-
+        
         tokio::time::sleep(Duration::from_millis(100)).await;
         self.start_hw_detection().await?;
         self.start_streaming().await?;
@@ -359,9 +368,22 @@ impl HdmiCapture {
 
         if let Some(handle) = self.streaming_thread.write().await.take() {
             info!("Stopping video streaming thread");
-            if let Err(e) = handle.await {
-                error!("Failed to stop video streaming thread: {}", e);
+            match tokio::time::timeout(Self::THREAD_STOP_TIMEOUT, handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => error!("Failed to stop video streaming thread: {}", e),
+                Err(_) => {
+                    error!(
+                        "Timed out stopping video streaming thread after {:?}",
+                        Self::THREAD_STOP_TIMEOUT
+                    );
+                }
             }
+        }
+
+        // Ensure encoder-side state won't remain stuck when stop path times out.
+        self.venc_running.store(false, Ordering::Release);
+        if let Some(join) = self.venc_read_thread.write().take() {
+            let _ = join.join();
         }
     }
 
@@ -555,6 +577,7 @@ fn run_video_stream(
                 drop(video_dev);
                 warn!("Failed to set video format ({}x{}), retrying", width, height);
                 retry = true;
+                std::thread::sleep(Duration::from_millis(500));
                 continue;
             }
         }
@@ -566,26 +589,26 @@ fn run_video_stream(
             Err(e) => {
                 error!("Failed to get CSI stream format: {}", e);
                 drop(video_dev);
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(500));
                 retry = true;
                 continue;
             }
         };
         info!("CSI stream resolution: {}x{}", width, height);
 
-        // Scale the input resolution proportionally to the target resolution and compute centered offsets
+        // scale HDMI IN to target resolution preserving aspect ratio; compute center offset
         let (offset_x, offset_y) = if (hw_w * hw_h) != (width * height) {
             let target_w = width as f64;
             let target_h = height as f64;
             let src_w = hw_w as f64;
             let src_h = hw_h as f64;
 
-            // Proportional scaling: pick the largest scale factor that does not exceed the target resolution
+            // scale down to fit within target resolution
             let scale = (target_w / src_w).min(target_h / src_h);
             let scaled_w = (src_w * scale).round() as u32;
             let scaled_h = (src_h * scale).round() as u32;
 
-            // Center offset (top-left coordinates)
+            // center offset (top-left)
             let offset_x = (width - scaled_w) as f32 / 2.0;
             let offset_y = (height - scaled_h) as f32 / 2.0;
 
@@ -598,6 +621,7 @@ fn run_video_stream(
             error!("Failed to create memory pool: {}", e);
             drop(video_dev);
             retry = true;
+            std::thread::sleep(Duration::from_millis(500));
             continue;
         }
 
@@ -614,6 +638,7 @@ fn run_video_stream(
                 HdmiCapture::destroy_memory_pool_blocking(&mem_pool);
                 drop(video_dev);
                 retry = true;
+                std::thread::sleep(Duration::from_millis(500));
                 continue;
             }
         };
@@ -630,15 +655,11 @@ fn run_video_stream(
             venc_read_thread.clone(),
         ) {
             error!("Failed to start video encoder: {}", e);
-            // Release buffers
-            for buffer in &buffers {
-                if let Some(mb_blk) = buffer.mb_blk {
-                    mpi::mb_release_mb(mb_blk);
-                }
-            }
+            release_capture_buffers(video_fd, &buffers);
             HdmiCapture::destroy_memory_pool_blocking(&mem_pool);
             drop(video_dev);
             retry = true;
+            std::thread::sleep(Duration::from_millis(500));
             continue;
         }
         info!("Video encoder started successfully");
@@ -647,15 +668,11 @@ fn run_video_stream(
         if let Err(e) = v4l2::stream_on(video_fd, v4l2::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE as u32) {
             error!("Failed to start streaming: {}", e);
             venc::stop_venc(venc_running.clone(), venc_read_thread.clone());
-            // Release buffers
-            for buffer in &buffers {
-                if let Some(mb_blk) = buffer.mb_blk {
-                    mpi::mb_release_mb(mb_blk);
-                }
-            }
+            release_capture_buffers(video_fd, &buffers);
             HdmiCapture::destroy_memory_pool_blocking(&mem_pool);
             drop(video_dev);
             retry = true;
+            std::thread::sleep(Duration::from_millis(500));
             continue;
         }
         info!("Video streaming started ({}x{})", width, height);
@@ -785,12 +802,7 @@ fn run_video_stream(
         }
         info!("Video stream stopped");
 
-        // Release buffers
-        for buffer in &buffers {
-            if let Some(mb_blk) = buffer.mb_blk {
-                mpi::mb_release_mb(mb_blk);
-            }
-        }
+        release_capture_buffers(video_fd, &buffers);
         info!("Buffers released");
 
         // Destroy memory pool
@@ -799,9 +811,22 @@ fn run_video_stream(
 
         // video_dev will be dropped here automatically, closing the file descriptor
         drop(video_dev);
+        std::thread::sleep(Duration::from_millis(500));
         info!("Video device closed");
     }
     info!("video stream thread finished");
+}
+
+/// Release DMA-BUF blocks and return V4L2 buffers to the driver (`REQBUFS(0)`).
+fn release_capture_buffers(video_fd: RawFd, buffers: &[v4l2::VideoBuffer]) {
+    for buffer in buffers {
+        if let Some(mb_blk) = buffer.mb_blk {
+            mpi::mb_release_mb(mb_blk);
+        }
+    }
+    if let Err(e) = v4l2::release_buffers(video_fd) {
+        warn!("Failed to release V4L2 capture buffers: {}", e);
+    }
 }
 
 fn try_video_format(video_fd: RawFd, width: u32, height: u32) -> bool {
@@ -826,8 +851,7 @@ fn try_video_format(video_fd: RawFd, width: u32, height: u32) -> bool {
 /// Calculate bitrate
 fn calculate_bitrate(quality_factor: f32, width: u32, height: u32) -> i32 {
     let scale_factor = (width * height) as f64 / (REF_WIDTH * REF_HEIGHT) as f64;
-    let base_bitrate = BASE_BITRATE_LOW as f64
-        + (BASE_BITRATE_HIGH - BASE_BITRATE_LOW) as f64 * quality_factor as f64;
+    let base_bitrate = BASE_BITRATE as f64 * quality_factor as f64;
     let bitrate = (base_bitrate * scale_factor) as i32;
     let bitrate = bitrate.max(MIN_BITRATE);
     info!(

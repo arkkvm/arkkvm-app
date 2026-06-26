@@ -101,7 +101,7 @@ fn capture_audio_task(
 ) -> anyhow::Result<()> {
     loop {
         if !AUDIO_RUNNING.load(Ordering::Acquire) {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::thread::sleep(std::time::Duration::from_secs(1));
             continue;
         }
         AudioMPI::init()?;
@@ -137,7 +137,7 @@ fn capture_audio_task(
         encode_handle.abort();
         std::thread::sleep(std::time::Duration::from_millis(100));
         AudioMPI::un_init()?;
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(2000));
     }
     info!("Audio capture task finished");
     Ok(())
@@ -367,10 +367,10 @@ impl AudioMPI {
         let dev_id = 0;
         let chn_id = 0;
 
-        // Disable the audio input channel
+        // disable audio input channel
         mpi::ai_disable_chn(dev_id, chn_id);
 
-        // Disable the audio input device
+        // disable audio input device
         mpi::ai_disable(dev_id);
 
         info!("AudioMPI uninitialized successfully");

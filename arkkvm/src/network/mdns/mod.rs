@@ -110,7 +110,7 @@ async fn format_homename_fqdn(hostname: &str, domain: &str) -> Result<(String, S
 
     let mut domain = domain.trim().to_owned();
     if domain.is_empty() {
-        if let Some(dhcp_lease) = network::NetworkInterfaceState::default().get_dhcp_lease().await {
+        if let Some(dhcp_lease) = network::NetworkInterfaceState::get_instance().get_dhcp_lease().await {
             domain = dhcp_lease.domain.unwrap_or_default();
         }
     }

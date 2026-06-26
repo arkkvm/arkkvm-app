@@ -39,8 +39,13 @@ impl ConfigManager {
 
     /// Load configuration from persistent storage
     pub async fn load(&self) -> Result<()> {
-        let loaded_config = self.persistence.load().await?;
+        let mut loaded_config = self.persistence.load().await?;
+        let migrated = loaded_config.migrate_microphone_emulation();
         *self.config.write().await = loaded_config;
+        if migrated {
+            self.save().await?;
+            info!("migrated microphone_emulation from usb_devices.microphone");
+        }
         info!("Configuration loaded successfully");
         Ok(())
     }
@@ -242,6 +247,7 @@ impl ConfigManager {
     ) -> Result<()> {
         self.update(|config| {
             config.usb_devices.microphone = microphone_emulation;
+            config.microphone_emulation = Some(microphone_emulation);
             config.usb_devices.camera = camera_emulation;
             config.usb_devices.mass_storage_ft = file_transfer;
             config.audio_playback = audio_playback;
@@ -270,11 +276,16 @@ impl ConfigManager {
     //     .await
     // }
 
-    pub async fn set_emulation_audio_playback(&self, enabled: bool) -> Result<()> {
+    pub async fn set_emulation_audio_playback(&self, enabled: bool) -> Result<bool> {
+        let mut has_changed = false;
         self.update(|config| {
-            config.audio_playback = enabled;
+            if config.audio_playback != enabled {
+                has_changed = true;
+                config.audio_playback = enabled;
+            }
         })
-        .await
+        .await?;
+        Ok(has_changed)
     }
 
     pub async fn set_dev_channel_state(&self, enabled: bool) -> Result<()> {
@@ -287,9 +298,21 @@ impl ConfigManager {
     pub async fn set_usb_devices_state(&self, state: &UsbDevicesState) -> Result<()> {
         self.update(|config| {
             config.usb_devices.keyboard = state.keyboard;
+            config.usb_devices.relative_mouse = state.keyboard;
             config.usb_devices.absolute_mouse = state.absolute_mouse;
-            config.usb_devices.relative_mouse = state.relative_mouse;
             config.usb_devices.mass_storage_vm = state.mass_storage;
+            config.usb_devices.microphone = state.microphone;
+        })
+        .await
+    }
+
+    pub async fn get_microphone_emulation(&self) -> bool {
+        self.get().await.effective_microphone_emulation()
+    }
+
+    pub async fn set_microphone_emulation(&self, enabled: bool) -> Result<()> {
+        self.update(|config| {
+            config.microphone_emulation = Some(enabled);
         })
         .await
     }
@@ -304,8 +327,8 @@ impl ConfigManager {
     pub async fn set_usb_devices(&self, devices: &UsbDevices) -> Result<()> {
         self.update(|config| {
             config.usb_devices.keyboard = devices.keyboard;
+            config.usb_devices.relative_mouse = devices.keyboard;
             config.usb_devices.absolute_mouse = devices.absolute_mouse;
-            config.usb_devices.relative_mouse = devices.relative_mouse;
             config.usb_devices.mass_storage_vm = devices.mass_storage_vm;
             config.usb_devices.mass_storage_ft = devices.mass_storage_ft;
             config.usb_devices.microphone = devices.microphone;
@@ -328,8 +351,9 @@ impl ConfigManager {
         UsbDevicesState {
             keyboard: config.usb_devices.keyboard,
             absolute_mouse: config.usb_devices.absolute_mouse,
-            relative_mouse: config.usb_devices.relative_mouse,
+            relative_mouse: config.usb_devices.keyboard,
             mass_storage: config.usb_devices.mass_storage_vm,
+            microphone: config.usb_devices.microphone,
         }
     }
 
@@ -338,7 +362,7 @@ impl ConfigManager {
     }
 
     pub async fn get_emulation_microphone(&self) -> bool {
-        self.get().await.usb_devices.microphone
+        self.get_microphone_emulation().await
     }
 
     pub async fn get_emulation_camera(&self) -> bool {

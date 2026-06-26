@@ -2,6 +2,8 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
+use once_cell::sync::Lazy;
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -28,6 +30,8 @@ use crate::jsonrpc::PROCESSOR;
 use crate::session::Session;
 use crate::web::get_global_app_state;
 use crate::{audio, video, zenoh_bus};
+
+static MEDIA_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 /// Session configuration for WebRTC connections
 #[derive(Debug, Clone)]
@@ -81,15 +85,15 @@ impl WebRTCApi {
                 info!("ICE servers not provided by cloud");
             }
 
-            if let Some(local_ip) = config.local_ip {
-                setting_engine.set_nat_1to1_ips(
-                    vec![local_ip.to_string()],
-                    webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType::Srflx,
-                );
-                info!("Setting NAT 1-to-1 IPs with local IP: {}", local_ip);
-            } else {
-                info!("Local IP address not provided, won't set NAT 1-to-1 IPs");
-            }
+            // if let Some(local_ip) = config.local_ip {
+            //     setting_engine.set_nat_1to1_ips(
+            //         vec![local_ip.to_string()],
+            //         webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType::Srflx,
+            //     );
+            //     info!("Setting NAT 1-to-1 IPs with local IP: {}", local_ip);
+            // } else {
+            //     info!("Local IP address not provided, won't set NAT 1-to-1 IPs");
+            // }
         }
 
         let audio_channels = 2u16; // Stereo
@@ -564,10 +568,15 @@ pub async fn trigger_video_state_update() {
 pub async fn trigger_usb_state_update() {
     info!("Triggering USB state update");
 
+    let usb_state = crate::services::usb::ensure_usb_state().await;
+    crate::jsonrpc::broadcast_usb_state(usb_state).await;
+
     if let Some(session) = get_global_app_state().get_current_session().await {
         let usb_devices = crate::jsonrpc::handlers::get_usb_devices().await;
-        let usb_emulation =
-            crate::jsonrpc::handlers::get_usb_emulation_state().await.unwrap_or(false);
+        let usb_emulation = match crate::services::get_usb() {
+            Some(usb) => usb.get_usb_emulation_state().await.unwrap_or(false),
+            None => false,
+        };
 
         let params = serde_json::json!({
             "devices": usb_devices,
@@ -580,24 +589,67 @@ pub async fn trigger_usb_state_update() {
     }
 }
 
+/// Trigger keyboard LED state update from cached sidecar state
+pub async fn trigger_keyboard_led_state_update() {
+    info!("Triggering keyboard LED state update");
+    let state = crate::jsonrpc::handlers::get_keyboard_led_state().unwrap_or_default();
+    crate::jsonrpc::broadcast_keyboard_led_state(state).await;
+}
+
 /// Handle first session connected
 pub async fn on_first_session_connected() {
+    const MEDIA_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+    let _guard = MEDIA_LIFECYCLE_LOCK.lock().await;
+
     info!("First WebRTC session connected - starting media");
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    if let Err(e) = video::start_native_video().await {
-        error!("Failed to start native video: {}", e);
+    if get_global_app_state().session_count().await == 0 {
+        debug!("Skip delayed media start: no active sessions");
+        return;
     }
 
-    if let Err(e) = audio::start_native_audio().await {
-        warn!("Failed to start native audio: {}", e);
+    match tokio::time::timeout(MEDIA_START_TIMEOUT, video::start_native_video()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => error!("Failed to start native video: {}", e),
+        Err(_) => error!(
+            "Timed out starting native video after {:?}",
+            MEDIA_START_TIMEOUT
+        ),
+    }
+
+    match tokio::time::timeout(MEDIA_START_TIMEOUT, audio::start_native_audio()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("Failed to start native audio: {}", e),
+        Err(_) => warn!(
+            "Timed out starting native audio after {:?}",
+            MEDIA_START_TIMEOUT
+        ),
     }
 }
 
 /// Handle last session disconnected
 pub async fn on_last_session_disconnected() {
+    const MEDIA_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+    let _guard = MEDIA_LIFECYCLE_LOCK.lock().await;
+
+    if get_global_app_state().session_count().await > 0 {
+        debug!("Skip media stop: active sessions still present");
+        return;
+    }
+
     info!("Last WebRTC session disconnected - stopping media");
-    video::stop_native_video().await;
-    audio::stop_native_audio().await;
+    if tokio::time::timeout(MEDIA_STOP_TIMEOUT, video::stop_native_video()).await.is_err() {
+        error!(
+            "Timed out stopping native video after {:?}",
+            MEDIA_STOP_TIMEOUT
+        );
+    }
+    if tokio::time::timeout(MEDIA_STOP_TIMEOUT, audio::stop_native_audio()).await.is_err() {
+        error!(
+            "Timed out stopping native audio after {:?}",
+            MEDIA_STOP_TIMEOUT
+        );
+    }
 }
 
 /// Handle session count change

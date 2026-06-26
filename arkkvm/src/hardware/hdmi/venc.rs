@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use anyhow::{Result, anyhow};
-use bytes::Bytes;
 use parking_lot::RwLock;
 use tracing::{error, info, warn};
 
@@ -88,8 +87,8 @@ fn populate_venc_attr(
     attr.stVencAttr.enMirror = MIRROR_NONE;
 }
 
-/// Dynamically update bitrate at runtime (Option A: GetChnAttr -> modify RC fields -> SetChnAttr)
-/// Note: This function only modifies RC-related fields to avoid affecting other encoding parameters.
+/// Update bitrate at runtime (GetChnAttr -> patch RC fields -> SetChnAttr).
+/// Only RC-related fields are modified to avoid clobbering other encoder settings.
 // pub fn update_venc_bitrate(bitrate: i32, max_bitrate: i32) -> Result<()> {
 //     if bitrate <= 0 || max_bitrate <= 0 {
 //         return Err(anyhow!("Invalid bitrate/max_bitrate: {}, {}", bitrate, max_bitrate));
@@ -98,7 +97,7 @@ fn populate_venc_attr(
 //     let mut attr = mpi::venc_get_chn_attr(VENC_CHANNEL)
 //         .map_err(|e| anyhow!("Failed to get encoder channel attr: {}", e))?;
 
-//     // Only update when the current RC mode is H264VBR to avoid writing the wrong union fields in other modes
+//     // only update when RC mode is H264VBR to avoid writing the wrong union field
 //     if attr.stRcAttr.enRcMode != VENC_RC_MODE_H264VBR {
 //         return Err(anyhow!(
 //             "Unsupported rc mode for dynamic bitrate update: {} (expected H264VBR={})",
@@ -234,7 +233,7 @@ fn venc_read_stream(venc_running: Arc<AtomicBool>, fps: f64) {
             // Note: data pointer is valid before ReleaseStream
             let slice = unsafe { std::slice::from_raw_parts(data, pack.u32Len as usize) };
             // Note: Must copy because C pointer memory will be released after venc_release_stream
-            crate::video::on_frame_received(Bytes::copy_from_slice(slice), pack.u64PTS, fps);
+            crate::video::on_frame_received(slice, pack.u64PTS, fps);
 
             let ret = mpi::venc_release_stream(VENC_CHANNEL, &mut frame);
             if ret != RK_SUCCESS {

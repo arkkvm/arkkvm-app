@@ -27,3 +27,5 @@ pub mod webrtc;
 pub mod wol;
 pub mod jiggler;
 pub mod zenoh_bus;
+pub mod plugin;
+pub mod proto;

@@ -1,6 +1,6 @@
-//! Rockchip MPP (Media Process Platform) Global Management Module
+//! Rockchip MPP (Media Process Platform) global manager
 //!
-//! This module provides global singleton management for the MPI system, ensuring MPI is initialized only once and avoiding issues caused by repeated initialization.
+//! Provides a process-wide MPI singleton so the system is initialized only once.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -9,7 +9,7 @@ use tracing::info;
 
 // Re-export types from rockchip_mpi_sys for convenience
 pub use rockchip_mpi_sys::{
-    MB_BLK, MB_POOL, MB_POOL_CONFIG_S, VENC_CHN_ATTR_S, VENC_PACK_S,
+    MB_BLK, MB_POOL, MB_POOL_CONFIG_S, VENC_CHN_ATTR_S, VENC_PACK_S, 
     VENC_RECV_PIC_PARAM_S, VENC_STREAM_S, VIDEO_FRAME_INFO_S,
     // Audio input types
     AIO_ATTR_S, AI_CHN_PARAM_S, AUDIO_FRAME_S,
@@ -42,15 +42,15 @@ pub const H264E_PROFILE_HIGH: u32 = 100;
 pub const MIRROR_NONE: u32 = 0;
 pub const COMPRESS_MODE_NONE: u32 = 0;
 
-/// MPI global manager
+/// Global MPI manager
 ///
-/// Use a singleton pattern to ensure the MPI system is initialized only once
+/// Singleton ensuring MPI is initialized only once
 pub struct MpiManager {
     initialized: AtomicBool,
 }
 
 impl MpiManager {
-    /// Get the global MPI manager instance
+    /// Return the global MPI manager instance
     pub fn instance() -> &'static MpiManager {
         static INSTANCE: OnceLock<MpiManager> = OnceLock::new();
         INSTANCE.get_or_init(|| MpiManager {
@@ -60,34 +60,34 @@ impl MpiManager {
 
     /// Initialize the MPI system
     ///
-    /// If already initialized, return success without initializing again
+    /// No-op if already initialized
     pub fn init(&self) -> Result<()> {
-        // Use compare_exchange to ensure thread safety
+        // compare_exchange for thread safety
         if self.initialized.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
             unsafe {
                 let ret = rockchip_mpi_sys::RK_MPI_SYS_Init();
                 if ret != 0 {
-                    // Initialization failed; reset the flag
+                    // init failed; reset flag
                     self.initialized.store(false, Ordering::Release);
                     anyhow::bail!("Failed to initialize Rockchip MPP system: {}", ret);
                 }
             }
             info!("Rockchip MPP system initialized");
         } else {
-            // Already initialized; return success
+            // already initialized
             info!("Rockchip MPP system already initialized, skipping");
         }
         Ok(())
     }
 
-    /// Check whether the MPI system is initialized
+    /// Whether MPI has been initialized
     pub fn is_initialized(&self) -> bool {
         self.initialized.load(Ordering::Acquire)
     }
 
-    /// Exit the MPI system
+    /// Shut down MPI
     ///
-    /// Note: Call this only after all modules using MPI have been cleaned up
+    /// Call only after all MPI users have been torn down
     pub fn exit(&self) {
         if self.initialized.compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire).is_ok() {
             unsafe {
@@ -98,26 +98,26 @@ impl MpiManager {
     }
 }
 
-/// Initialize the MPI system (convenience function)
+/// Initialize MPI (convenience wrapper)
 pub fn init() -> Result<()> {
     MpiManager::instance().init()
 }
 
-/// Exit the MPI system (convenience function)
+/// Exit MPI (convenience wrapper)
 pub fn exit() {
     MpiManager::instance().exit()
 }
 
-/// Check whether the MPI system is initialized (convenience function)
+/// Whether MPI is initialized (convenience wrapper)
 pub fn is_initialized() -> bool {
     MpiManager::instance().is_initialized()
 }
 
-// ========== Memory pool related function wrappers ==========
+// ========== Memory pool wrappers ==========
 
 /// Create a memory pool
 pub fn mb_create_pool(config: &mut MB_POOL_CONFIG_S) -> Result<MB_POOL> {
-    // Ensure MPI has been initialized
+    // ensure MPI is initialized
     MpiManager::instance().init()
         .context("MPI system must be initialized before creating memory pool")?;
 
@@ -130,14 +130,14 @@ pub fn mb_create_pool(config: &mut MB_POOL_CONFIG_S) -> Result<MB_POOL> {
     }
 }
 
-/// Destroy the memory pool
+/// Destroy a memory pool
 pub fn mb_destroy_pool(pool: MB_POOL) {
     unsafe {
         rockchip_mpi_sys::RK_MPI_MB_DestroyPool(pool);
     }
 }
 
-/// Get an MB block from the memory pool
+/// Get a memory block from a pool
 pub fn mb_get_mb(pool: MB_POOL, size: u64, blocking: u32) -> Result<MB_BLK> {
     unsafe {
         let mb_blk = rockchip_mpi_sys::RK_MPI_MB_GetMB(pool, size, blocking);
@@ -148,14 +148,14 @@ pub fn mb_get_mb(pool: MB_POOL, size: u64, blocking: u32) -> Result<MB_BLK> {
     }
 }
 
-/// Release an MB block
+/// Release a memory block
 pub fn mb_release_mb(mb_blk: MB_BLK) {
     unsafe {
         rockchip_mpi_sys::RK_MPI_MB_ReleaseMB(mb_blk);
     }
 }
 
-/// Convert an MB handle to a file descriptor
+/// Convert a memory block handle to a file descriptor
 pub fn mb_handle2fd(mb_blk: MB_BLK) -> Result<i32> {
     unsafe {
         let fd = rockchip_mpi_sys::RK_MPI_MB_Handle2Fd(mb_blk);
@@ -166,21 +166,21 @@ pub fn mb_handle2fd(mb_blk: MB_BLK) -> Result<i32> {
     }
 }
 
-/// Convert an MB handle to a virtual address
+/// Convert a memory block handle to a virtual address
 pub fn mb_handle2viraddr(mb_blk: MB_BLK) -> *mut std::ffi::c_void {
     unsafe {
         rockchip_mpi_sys::RK_MPI_MB_Handle2VirAddr(mb_blk)
     }
 }
 
-// ========== VENC encoder related function wrappers ==========
+// ========== VENC encoder wrappers ==========
 
-/// VENC channel constant
+/// VENC channel id
 pub const VENC_CHANNEL: i32 = 0;
 
 /// Create a VENC encoder channel
 pub fn venc_create_chn(channel: i32, attr: &VENC_CHN_ATTR_S) -> Result<()> {
-    // Ensure MPI has been initialized
+    // ensure MPI is initialized
     MpiManager::instance().init()
         .context("MPI system must be initialized before creating VENC channel")?;
 
@@ -218,28 +218,28 @@ pub fn venc_stop_recv_frame(channel: i32) {
     }
 }
 
-/// Get the encoded stream
+/// Get encoded stream
 pub fn venc_get_stream(channel: i32, stream: &mut VENC_STREAM_S, timeout_ms: i32) -> i32 {
     unsafe {
         rockchip_mpi_sys::RK_MPI_VENC_GetStream(channel, stream, timeout_ms)
     }
 }
 
-/// Release the encoded stream
+/// Release encoded stream
 pub fn venc_release_stream(channel: i32, stream: &mut VENC_STREAM_S) -> i32 {
     unsafe {
         rockchip_mpi_sys::RK_MPI_VENC_ReleaseStream(channel, stream)
     }
 }
 
-/// Send frames to the encoder
+/// Send a frame to the encoder
 pub fn venc_send_frame(channel: i32, frame: &VIDEO_FRAME_INFO_S, timeout_ms: i32) -> i32 {
     unsafe {
         rockchip_mpi_sys::RK_MPI_VENC_SendFrame(channel, frame, timeout_ms)
     }
 }
 
-/// Get VENC channel attributes (used for dynamic bitrate and other parameter updates at runtime)
+/// Get VENC channel attributes (e.g. runtime bitrate updates)
 pub fn venc_get_chn_attr(channel: i32) -> Result<VENC_CHN_ATTR_S> {
     unsafe {
         let mut attr: VENC_CHN_ATTR_S = std::mem::zeroed();
@@ -251,7 +251,7 @@ pub fn venc_get_chn_attr(channel: i32) -> Result<VENC_CHN_ATTR_S> {
     }
 }
 
-/// Set VENC channel attributes (used for dynamic bitrate and other parameter updates at runtime)
+/// Set VENC channel attributes (e.g. runtime bitrate updates)
 pub fn venc_set_chn_attr(channel: i32, attr: &VENC_CHN_ATTR_S) -> Result<()> {
     unsafe {
         let ret = rockchip_mpi_sys::RK_MPI_VENC_SetChnAttr(channel, attr);
@@ -262,11 +262,11 @@ pub fn venc_set_chn_attr(channel: i32, attr: &VENC_CHN_ATTR_S) -> Result<()> {
     }
 }
 
-// ========== Audio input (AI) related function wrappers ==========
+// ========== Audio input (AI) wrappers ==========
 
 /// Set audio input public attributes
 pub fn ai_set_pub_attr(dev_id: i32, attr: &AIO_ATTR_S) -> Result<()> {
-    // Ensure MPI has been initialized
+    // ensure MPI is initialized
     MpiManager::instance().init()
         .context("MPI system must be initialized before setting AI attributes")?;
 
@@ -279,7 +279,7 @@ pub fn ai_set_pub_attr(dev_id: i32, attr: &AIO_ATTR_S) -> Result<()> {
     }
 }
 
-/// Enable the audio input device
+/// Enable audio input device
 pub fn ai_enable(dev_id: i32) -> Result<()> {
     unsafe {
         let ret = rockchip_mpi_sys::RK_MPI_AI_Enable(dev_id);
@@ -290,7 +290,7 @@ pub fn ai_enable(dev_id: i32) -> Result<()> {
     }
 }
 
-/// Disable the audio input device
+/// Disable audio input device
 pub fn ai_disable(dev_id: i32) {
     unsafe {
         let _ = rockchip_mpi_sys::RK_MPI_AI_Disable(dev_id);
@@ -308,7 +308,7 @@ pub fn ai_set_chn_param(dev_id: i32, chn_id: i32, param: &AI_CHN_PARAM_S) -> Res
     }
 }
 
-/// Enable the audio input channel
+/// Enable audio input channel
 pub fn ai_enable_chn(dev_id: i32, chn_id: i32) -> Result<()> {
     unsafe {
         let ret = rockchip_mpi_sys::RK_MPI_AI_EnableChn(dev_id, chn_id);
@@ -319,14 +319,14 @@ pub fn ai_enable_chn(dev_id: i32, chn_id: i32) -> Result<()> {
     }
 }
 
-/// Disable the audio input channel
+/// Disable audio input channel
 pub fn ai_disable_chn(dev_id: i32, chn_id: i32) {
     unsafe {
         let _ = rockchip_mpi_sys::RK_MPI_AI_DisableChn(dev_id, chn_id);
     }
 }
 
-/// Set the audio input volume
+/// Set audio input volume
 pub fn ai_set_volume(dev_id: i32, volume: i32) -> Result<()> {
     unsafe {
         let ret = rockchip_mpi_sys::RK_MPI_AI_SetVolume(dev_id, volume);
@@ -338,15 +338,15 @@ pub fn ai_set_volume(dev_id: i32, volume: i32) -> Result<()> {
 }
 
 /// Get an audio frame
-///
+/// 
 /// # Arguments
-/// * `dev_id` - Audio input device ID
-/// * `chn_id` - Audio input channel ID
-/// * `frame` - Pointer to the audio frame struct
-/// * `timeout_ms` - Timeout in milliseconds; -1 indicates blocking mode
-///
+/// * `dev_id` - audio input device ID
+/// * `chn_id` - audio input channel ID
+/// * `frame` - audio frame struct
+/// * `timeout_ms` - timeout in ms; -1 blocks
+/// 
 /// # Returns
-/// Returns `RK_SUCCESS` on success; returns an error code on failure
+/// Returns `RK_SUCCESS` on success, error code otherwise
 pub fn ai_get_frame(dev_id: i32, chn_id: i32, frame: &mut AUDIO_FRAME_S, timeout_ms: i32) -> i32 {
     unsafe {
         rockchip_mpi_sys::RK_MPI_AI_GetFrame(dev_id, chn_id, frame, std::ptr::null_mut(), timeout_ms)
