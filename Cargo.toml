@@ -3,6 +3,11 @@ members = ["arkkvm", "crates/rockchip_mpi_sys", "crates/usb_devices", "crates/co
 exclude = ["rust"]
 resolver = "2"
 
+[workspace.package]
+edition = "2024"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/arkkvm/arkkvm-app"
+
 [profile.dev]
 opt-level = 0
 

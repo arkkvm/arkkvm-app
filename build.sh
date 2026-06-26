@@ -1,5 +1,9 @@
 #!/bin/bash
 # set -e
+#
+# External build inputs (not in this repository; see README.md):
+#   BUILDKIT_ROOT  - cross toolchain + Rockchip SDK sysroot (proprietary .so)
+#   OPUS_LIB_DIR   - prebuilt libopus (BSD-3-Clause)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_CARGO_TOML="$SCRIPT_DIR/arkkvm/Cargo.toml"

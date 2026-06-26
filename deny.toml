@@ -13,15 +13,22 @@ ignore = []
 
 [licenses]
 allow = [
+    "GPL-2.0-or-later",
+    "GPL-3.0-only",
+    "GPL-3.0-or-later",
     "MIT",
     "ISC",
     "OpenSSL",
     "BSL-1.0",
     "Apache-2.0",
+    "EPL-2.0",
+    "MPL-2.0",
     "Unicode-3.0",
+    "BSD-2-Clause",
     "BSD-3-Clause",
     "CDLA-Permissive-2.0",
     "Apache-2.0 WITH LLVM-exception",
+    "Zlib",
 ]
 confidence-threshold = 0.8
 exceptions = []
@@ -45,7 +52,7 @@ skip-tree = []
 unknown-registry = "warn"
 unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+allow-git = ["https://github.com/foxxcn/id_token_verifier.git"]
 
 [sources.allow-org]
 github = []

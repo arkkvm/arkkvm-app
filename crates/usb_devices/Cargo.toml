@@ -1,7 +1,9 @@
 [package]
 name = "arkkvm_usb"
 version = "0.2.26061893"
-edition = "2024"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 name = "arkkvm_usb"

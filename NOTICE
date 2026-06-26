@@ -1,0 +1,41 @@
+ArkKVM App
+Copyright (c) 2024-2026 Ark Intelligent
+
+This product includes software developed by the ArkKVM project
+(https://github.com/arkkvm).
+
+LICENSING
+
+ArkKVM software in this repository is licensed under the GNU General Public
+License version 2 or later (GPL-2.0-or-later). See the LICENSE file for the
+full text of GPL version 2.
+
+Several components linked into or distributed with ArkKVM releases are
+available under the Apache License 2.0 or the Eclipse Public License 2.0
+(for example zenoh, prometheus, and usb-gadget). Those licenses are not
+compatible with distributing a combined work only under GPL version 2.
+
+For official ArkKVM releases of this repository and the combined programs
+built from it, the copyright holder elects to distribute under the terms of
+GNU General Public License version 3 (exercising the "or later" option in
+GPL-2.0-or-later).
+
+GPL version 3 text: https://www.gnu.org/licenses/gpl-3.0.txt
+
+When you receive an official ArkKVM release, you may use, modify, and
+redistribute it under GPL version 3. You may also choose GPL version 2 or
+later for your own modifications to ArkKVM-authored code, subject to the
+compatibility constraints above when combining with Apache-2.0-licensed
+dependencies.
+
+SOURCE OFFER
+
+Source code corresponding to each official release tag of this repository is
+available at:
+
+  https://github.com/arkkvm/arkkvm-app/tree/<tag>
+
+OTHER NOTICES
+
+Third-party Rust dependencies: see THIRD_PARTY_NOTICES
+External build dependencies and embedded assets: see README.md
