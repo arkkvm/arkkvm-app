@@ -11,7 +11,7 @@ use crate::config;
 // =====================
 // SSH key management
 // =====================
-const SSH_KEY_DIR: &str = "/root/.ssh";
+pub const SSH_KEY_DIR: &str = "/root/.ssh";
 const USER_SSH_KEY_DIR: &str = "/userdata/arkkvm/ssh";
 const SSH_KEY_FILE: &str = "authorized_keys";
 const SSHD_PATH: &str = "/etc/init.d/S91sshd";

@@ -64,6 +64,10 @@ static VIDEO_DROP_COUNTER: Lazy<prometheus::IntCounter> = Lazy::new(|| {
     .expect("register arkkvm_video_frame_drops_total")
 });
 
+pub fn frame_drops_total() -> u64 {
+    VIDEO_DROP_COUNTER.get()
+}
+
 pub async fn init_video_state_updater() -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<VideoInputState>();
     VIDEO_STATE_TX.set(tx).map_err(|_| anyhow::anyhow!("video state tx already set"))?;
@@ -108,7 +112,7 @@ pub async fn detach_webrtc_sink() {
 
 pub async fn equal_webrtc_sink(track: Arc<TrackLocalStaticSample>) -> bool {
     if let Some(sink) = VIDEO_SINK.read().await.as_ref() {
-        sink.id() == track.id()
+        Arc::ptr_eq(sink, &track)
     }
     else {
         false

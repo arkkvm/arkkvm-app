@@ -23,6 +23,7 @@ pub struct Session {
     pub is_cloud: bool,
     channel_cache: Arc<RwLock<HashMap<String, Arc<RTCDataChannel>>>>,
     pub username_fragment: RwLock<Option<String>>, // Cache usernameFragment to avoid blocking in send_ice_candidate
+    pub created_at: std::time::Instant,
 }
 
 impl fmt::Debug for Session {
@@ -87,6 +88,7 @@ impl Session {
             is_cloud: false,
             channel_cache: Arc::new(RwLock::new(HashMap::new())),
             username_fragment: RwLock::new(None),
+            created_at: std::time::Instant::now(),
         }
     }
     
@@ -104,6 +106,7 @@ impl Session {
             is_cloud,
             channel_cache: Arc::new(RwLock::new(HashMap::new())),
             username_fragment: RwLock::new(None),
+            created_at: std::time::Instant::now(),
         }
     }
 

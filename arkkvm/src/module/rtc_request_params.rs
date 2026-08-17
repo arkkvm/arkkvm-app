@@ -2,8 +2,7 @@ use serde::{Deserialize, Serialize};
 use tracing::error;
 
 use crate::{
-    config::types::{NetworkConfig, VlanSettings},
-    hardware::atx::ATXPowerAction,
+    config::types::{NetworkConfig, VirtualMediaItem, VlanSettings}, hardware::atx::ATXPowerAction,
 };
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -22,11 +21,26 @@ pub struct FilePathParams {
     pub name: String,
 }
 
+#[derive(Deserialize)]
+pub struct FtFileDownloadParams {
+    pub path: String,
+    pub name: String,
+    #[serde(default)]
+    pub offset: u64,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct FileUploadParams {
     pub path: String,
     pub name: String,
     pub size: i64,
+}
+
+#[derive(Deserialize)]
+pub struct LocalFileDownloadParams {
+    pub path: String,
+    #[serde(default)]
+    pub offset: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,4 +142,14 @@ pub struct VersionParams {
 pub struct TailscaleParams {
     pub enabled: bool,
     pub login_server: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct VirtualMediaListParams {
+    pub list: Vec<VirtualMediaItem>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct RemoveVirtualMediaItemParams {
+    pub name: String,
 }

@@ -1,6 +1,7 @@
 pub mod hid_abs;
 mod hid_io;
 pub mod hid_kb;
+pub mod hid_rel;
 pub mod uac;
 pub mod ums;
 pub mod ums1;
@@ -49,12 +50,12 @@ pub fn build_gadget(
     config.max_power = GADGET_MAX_POWER_MA;
 
     // 3. Add functions dynamically
-    if switches.hid_kb_rel_enabled {
+    if switches.hid_kb_enabled {
         let mut builder = LibHid::builder();
-        builder.sub_class = HID_KB_REL_SUBCLASS;
-        builder.protocol = HID_KB_REL_PROTOCOL;
-        builder.report_len = HID_KB_REL_REPORT_LENGTH as u8;
-        builder.report_desc = HID_KB_REL_REPORT_DESC.to_vec();
+        builder.sub_class = HID_KB_SUBCLASS;
+        builder.protocol = HID_KB_PROTOCOL;
+        builder.report_len = HID_KB_REPORT_LENGTH as u8;
+        builder.report_desc = HID_KB_REPORT_DESC.to_vec();
         let (_hid, handle) = builder.build();
         config.functions.push(handle);
     }
@@ -66,6 +67,17 @@ pub fn build_gadget(
         builder.report_len = HID_ABS_REPORT_LENGTH as u8;
         builder.no_out_endpoint = HID_ABS_NO_OUT_ENDPOINT;
         builder.report_desc = HID_ABS_REPORT_DESC.to_vec();
+        let (_hid, handle) = builder.build();
+        config.functions.push(handle);
+    }
+
+    if switches.hid_rel_enabled {
+        let mut builder = LibHid::builder();
+        builder.sub_class = HID_REL_SUBCLASS;
+        builder.protocol = HID_REL_PROTOCOL;
+        builder.report_len = HID_REL_REPORT_LENGTH as u8;
+        builder.no_out_endpoint = HID_REL_NO_OUT_ENDPOINT;
+        builder.report_desc = HID_REL_REPORT_DESC.to_vec();
         let (_hid, handle) = builder.build();
         config.functions.push(handle);
     }
@@ -107,30 +119,23 @@ pub fn build_gadget(
     }
 
     if switches.uac1_enabled {
-        // Possible driver quirk: playback p_chmask=3 c_chmask=0 is inverted, which disables speaker and keeps mic only
+        // f_uac1: p_chmask → ISO IN (mic); c_chmask=0 → no speaker.
+        // Kernel defaults enable FU (mute/volume); write false to avoid AC interrupt EP.
+        let mut uac1_capture = Uac1Config::default();
+        uac1_capture.channel = Channel::new(UAC1_C_CHMASK, UAC1_SAMPLE_RATE, UAC1_SAMPLE_SIZE);
+        uac1_capture.mute_present = Some(false);
+        uac1_capture.volume_present = Some(false);
 
-        // Enable capture
-        let mut uac1_capture_config = Uac1Config::default();
-        uac1_capture_config.channel = Channel::new(0, 48000, 2);
-        uac1_capture_config.mute_present = Some(true);
-        uac1_capture_config.volume_present = Some(true);
-        uac1_capture_config.volume_min = Some(-25600);
-        uac1_capture_config.volume_max = Some(0);
-        uac1_capture_config.volume_resolution = Some(1);
-        uac1_capture_config.volume_name = None;
-        uac1_capture_config.input_terminal_name = None;
-        uac1_capture_config.input_terminal_channel_name = None;
-        uac1_capture_config.output_terminal_name = None;
+        let mut uac1_playback = Uac1Config::default();
+        uac1_playback.channel = Channel::new(UAC1_P_CHMASK, UAC1_SAMPLE_RATE, UAC1_SAMPLE_SIZE);
+        uac1_playback.mute_present = Some(false);
+        uac1_playback.volume_present = Some(false);
 
-        // Disable playback
-        let mut uac1_playback_config = Uac1Config::default();
-
-        uac1_playback_config.channel = Channel::new(3, 48000, 2);
         let mut builder = Uac1::builder();
         builder.function_name = Some(UAC1_INSTANCE.to_string());
         let (_uac1, handle) = builder
-            .with_capture_config(uac1_capture_config)
-            .with_playback_config(uac1_playback_config)
+            .with_capture_config(uac1_capture)
+            .with_playback_config(uac1_playback)
             .build();
         config.functions.push(handle);
     }

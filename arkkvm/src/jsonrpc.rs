@@ -16,7 +16,7 @@
 //! - Type-safe parameter serialization/deserialization
 
 use std::collections::HashMap;
-use std::panic;
+use std::{format, panic};
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
@@ -30,7 +30,7 @@ use webrtc::data_channel::data_channel_message::DataChannelMessage;
 
 use crate::cloud::types::{CloudConnectionState, CloudState};
 use crate::config::get_config_manager;
-use crate::config::types::{UISwitch, UsbConfig};
+use crate::config::types::{UISwitch, UsbConfig, VirtualMediaItem};
 use crate::hardware::atx::{ATXLedState, ATXPowerAction};
 use crate::hardware::hdmi::edid;
 use crate::hardware::usb::KeyboardState as HidKeyboardState;
@@ -38,9 +38,7 @@ use crate::hardware::usb::storage::FileTransferTarget;
 use crate::jiggler::JigglerConfig;
 use crate::jsonrpc::handlers::*;
 use crate::module::rtc_request_params::{
-    ATXPowerParams, BacklightSettingsParams, DisplayRotationParams, FilePathParams,
-    FileUploadParams, NetworkSettingsParams, PathParams, RenewVlanDhcpLeaseParams,
-    SettingSwitchParams, SshKeyParam, TailscaleParams, VersionParams, VlanSettingsParams,
+    ATXPowerParams, BacklightSettingsParams, DisplayRotationParams, FilePathParams, FileUploadParams, FtFileDownloadParams, LocalFileDownloadParams, NetworkSettingsParams, PathParams, RemoveVirtualMediaItemParams, RenewVlanDhcpLeaseParams, SettingSwitchParams, SshKeyParam, TailscaleParams, VersionParams, VirtualMediaListParams, VlanSettingsParams,
 };
 use crate::module::rtc_response_params::OtaState;
 use crate::services::gui_pipeline;
@@ -695,17 +693,20 @@ pub mod handlers {
 
     use super::*;
     use crate::cloud::CloudManager;
-    use crate::config::types::{NetworkConfig, UISwitch};
+    use crate::config::types::{NetworkConfig, UISwitch, VirtualMediaItem};
     use crate::hardware::usb as usb_mod;
     use crate::hardware::usb::UsbDeviceType;
     use crate::hardware::usb::storage::{
         self as storage_mod, FileTransferState, FileTransferTarget,
     };
-    use crate::module::rtc_request_params::{SshKeyParam, TailscaleParams};
+    use crate::module::rtc_request_params::{LocalFileDownloadParams, SshKeyParam, TailscaleParams};
     use crate::module::rtc_response_params::{GuiSettingsResponse, StartDownloadResponse};
     use crate::network::{self, NetworkInterfaceState, RpcIPv6Address, RpcNetworkState};
+    use crate::services::local_file::{
+        self, ByteRange, DataChannelBackpressure,
+    };
     use crate::web::get_global_app_state;
-    use crate::{audio, jiggler, ota, plugin, zenoh_bus};
+    use crate::{audio, config, jiggler, ota, plugin, zenoh_bus};
 
     static USB_STATE: once_cell::sync::OnceCell<RwLock<String>> = once_cell::sync::OnceCell::new();
     static KEYBOARD_LED: once_cell::sync::OnceCell<RwLock<HidKeyboardState>> =
@@ -801,6 +802,8 @@ pub mod handlers {
                 cfg.dev_channel_enabled = default_config.dev_channel_enabled;
                 cfg.local_loopback_only = default_config.local_loopback_only;
                 cfg.microphone_emulation = default_config.microphone_emulation;
+                cfg.virtual_media_list = default_config.virtual_media_list;
+                cfg.file_transfer_target = default_config.file_transfer_target;
                 // TODO: Video Quality, Audio Quality, Device Display, HTTPS mode, Troubleshooting mode;
             })
             .await?;
@@ -815,6 +818,22 @@ pub mod handlers {
         plugin::reset_tailscale().await?;
         info!("Configuration reset to default and saved");
         Ok(Value::Null)
+    }
+
+    pub async fn factory_reset() -> Result<Value> {
+        for path in [
+            config::CONFIG_DIR,
+            network::ssh::SSH_KEY_DIR,
+            ota::OTA_PACKAGE_ROOT_PATH,
+        ] {
+            match tokio::fs::remove_dir_all(path).await {
+                Ok(()) => info!("factory_reset: removed {path}"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!("factory_reset: failed to remove {path}: {e}"),
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        reboot(RebootParams { force: false })
     }
 
     #[derive(Deserialize)]
@@ -926,18 +945,13 @@ pub mod handlers {
         Ok(serde_json::to_value(response)?)
     }
 
-    pub async fn confirm_vlan_settings() -> Result<Value> {
-        network::vlan::confirm_vlan_settings().await?;
-        Ok(Value::Null)
-    }
-
-    pub async fn revert_vlan_settings() -> Result<Value> {
-        network::vlan::revert_vlan_settings().await?;
-        Ok(Value::Null)
-    }
-
     pub async fn renew_vlan_dhcp_lease(role: &str) -> Result<Value> {
         network::vlan::renew_vlan_dhcp_lease(role).await?;
+        Ok(Value::Null)
+    }
+
+    pub async fn reset_network_factory() -> Result<Value> {
+        network::settings::reset_network_to_factory().await?;
         Ok(Value::Null)
     }
 
@@ -1055,13 +1069,18 @@ pub mod handlers {
     pub struct WheelReportParams {
         #[serde(rename = "wheelY")]
         pub wheel_y: i8,
+        #[serde(rename = "wheelX", default)]
+        pub wheel_x: i8,
     }
 
     pub async fn wheel_report(params: WheelReportParams) -> Result<Value> {
         let usb =
             crate::services::get_usb().ok_or_else(|| anyhow!("USB service not initialized"))?;
-        usb.key_put_wheel(crate::proto::v1::WheelReportParams { wheel_y: params.wheel_y as u32 })
-            .await?;
+        usb.key_put_wheel(crate::proto::v1::WheelReportParams {
+            wheel_y: params.wheel_y as u32,
+            wheel_x: params.wheel_x as u32,
+        })
+        .await?;
         Ok(Value::Null)
     }
 
@@ -1668,8 +1687,7 @@ pub mod handlers {
 
         devices.absolute_mouse = state.absolute_mouse;
         devices.keyboard = state.keyboard;
-        // keyboard + relative mouse share one HID function in sidecar
-        devices.relative_mouse = state.keyboard;
+        devices.relative_mouse = state.relative_mouse;
         devices.mass_storage_vm = state.mass_storage;
         devices.mass_storage_ft = state.mass_storage;
         devices.microphone = state.microphone;
@@ -1840,6 +1858,26 @@ pub mod handlers {
         Ok(mapped)
     }
 
+    pub async fn get_virtual_media_list() -> Result<Option<Vec<VirtualMediaItem>>> {
+        let config_manager = crate::config::get_config_manager();
+        Ok(config_manager.get_virtual_media_list().await)
+    }
+
+    pub async fn add_virtual_media_item(params: VirtualMediaItem) -> Result<()> {
+        let config_manager = crate::config::get_config_manager();
+        config_manager.add_virtual_media_item(params).await
+    }
+
+    pub async fn remove_virtual_media_item(name: String) -> Result<()> {
+        let config_manager = crate::config::get_config_manager();
+        config_manager.remove_virtual_media_item(name.as_str()).await
+    }
+
+    pub async fn update_virtual_media_list(params: VirtualMediaListParams) -> Result<()> {
+        let config_manager = crate::config::get_config_manager();
+        config_manager.update_virtual_media_list(Some(params.list)).await
+    }
+
     pub async fn get_file_transfer_state() -> Result<FileTransferState> {
         storage_mod::get_file_transfer_state().await
     }
@@ -1944,39 +1982,47 @@ pub mod handlers {
         Ok(Value::Null)
     }
 
-    pub async fn download_ft_file(path: String, name: String) -> Result<Value> {
+    pub async fn download_ft_file(path: String, name: String, offset: u64) -> Result<Value> {
         let Some(session) = get_global_app_state().get_current_session().await else {
             return Err(anyhow!("Can not found current session"));
         };
 
         let file_path = format!("{}/{}", &path, &name).replace("//", "/");
 
-        storage_mod::fs_file_exists(file_path.as_str()).await?;
+        if !storage_mod::fs_file_exists(file_path.as_str()).await? {
+            return Err(anyhow!("file not found"));
+        }
+
+        let file_info = storage_mod::fs_get_file_info(file_path.as_str()).await?;
+        let file_size = file_info.size;
+        if offset > file_size {
+            return Err(anyhow!("offset beyond file size"));
+        }
 
         let channel_label = format!("tf_download_{}", Uuid::new_v4().to_string());
         let channel = session
             .create_data_channel(channel_label.as_str(), Some(RTCDataChannelInit::default()))
             .await?;
 
+        let backpressure = DataChannelBackpressure::attach(&channel).await;
         let file_path_clone = file_path.clone();
+        let path_clone = path.clone();
+        let name_clone = name.clone();
+        let file_size_clone = file_size;
+        let offset_clone = offset;
         let channel_clone = channel.clone();
+        let bp_clone = backpressure.clone();
         info!("add open Listener on download task channel: {}", &channel_label);
         channel.on_open(Box::new(move || {
-            info!("FT Download Data channel opened");
+            let file_path = file_path_clone.clone();
+            let path = path_clone.clone();
+            let name = name_clone.clone();
+            let channel = channel_clone.clone();
+            let bp = bp_clone.clone();
             Box::pin(async move {
                 info!("FT Download task loop started");
 
-                let file_info = match storage_mod::fs_get_file_info(file_path_clone.as_str()).await
-                {
-                    Ok(file_info) => file_info,
-                    Err(e) => {
-                        error!("FT Download get file info error: {:?}", e);
-                        return;
-                    }
-                };
-
-                let mut reader = match storage_mod::fs_download_file(file_path_clone.as_str()).await
-                {
+                let mut reader = match storage_mod::fs_download_file(file_path.as_str()).await {
                     Ok(reader) => reader,
                     Err(e) => {
                         error!("FT Download create reader error: {:?}", e);
@@ -1984,50 +2030,91 @@ pub mod handlers {
                     }
                 };
 
-                let package_count =
-                    (reader.file_size() as f64 / reader.chunk_size() as f64).ceil() as u64;
+                if offset_clone > 0 {
+                    if let Err(e) = reader.skip_bytes(offset_clone).await {
+                        error!("FT Download seek offset error: {:?}", e);
+                        return;
+                    }
+                }
+
+                let length = file_size_clone.saturating_sub(offset_clone);
+                let package_count = if length == 0 {
+                    0
+                } else {
+                    (length as f64 / reader.chunk_size() as f64).ceil() as u64
+                };
 
                 let info = json!({
                     "path": &path,
-                    "name": file_info.name,
-                    "size": reader.file_size(),
-                    "packageCount": package_count
+                    "name": &name,
+                    "size": file_size_clone,
+                    "offset": offset_clone,
+                    "length": length,
+                    "packageCount": package_count,
+                    "chunkSize": reader.chunk_size(),
                 })
                 .to_string();
 
-                channel_clone.send_text(info).await.expect("failed to send head message");
-                let mut index = 0;
+                if channel.send_text(info).await.is_err() {
+                    error!("FT Download failed to send header");
+                    return;
+                }
+
+                if length == 0 {
+                    let _ = channel
+                        .send_text(
+                            json!({
+                                "type": "file_finished",
+                                "path": &path,
+                                "name": &name,
+                                "offset": offset_clone,
+                                "bytesSent": 0
+                            })
+                            .to_string(),
+                        )
+                        .await;
+                    return;
+                }
+
+                let mut bytes_sent = 0u64;
                 loop {
-                    let _data = match reader.read_next_chunk().await {
-                        Ok(data) => match data {
-                            Some(data) => {
-                                channel_clone.send(&data.into()).await.expect(
-                                    format!("failed to send file data index: {}", index).as_str(),
-                                );
-                            }
-                            None => {
-                                info!("FT Download read next chunk finished");
-                                break;
-                            }
-                        },
+                    bp.wait_writable(&channel).await;
+                    let data = match reader.read_next_chunk().await {
+                        Ok(Some(data)) => data,
+                        Ok(None) => {
+                            info!("FT Download read next chunk finished");
+                            break;
+                        }
                         Err(e) => {
                             error!("FT Download read next chunk error: {:?}", e);
                             break;
                         }
                     };
-                    index += 1;
+                    let chunk_len = data.len() as u64;
+                    if channel.send(&data.into()).await.is_err() {
+                        error!("FT Download send chunk error");
+                        break;
+                    }
+                    bytes_sent += chunk_len;
                 }
 
-                channel_clone
+                channel
                     .send_text(
-                        json!({"type": "file_finished", "path": &path, "name": &name}).to_string(),
+                        json!({
+                            "type": "file_finished",
+                            "path": &path,
+                            "name": &name,
+                            "offset": offset_clone,
+                            "bytesSent": bytes_sent
+                        })
+                        .to_string(),
                     )
                     .await
-                    .expect("failed to send end message");
+                    .ok();
                 if let Err(e) = reader.shutdown().await {
                     warn!("Failed to shutdown reader: {:?}", e);
                 }
-                info!("Download task finished channel: {}", &channel_clone.label());
+                info!("Download task finished channel: {}", &channel.label());
             })
         }));
 
@@ -2047,6 +2134,156 @@ pub mod handlers {
         info!("Cache download task channel: {}", &channel_label);
         session.cache_channel(channel.clone()).await;
         info!("Starting download task channel: {}", &channel_label);
+        Ok(serde_json::to_value(StartDownloadResponse { data_channel: channel_label })?)
+    }
+
+    pub async fn get_local_file_info(path: String) -> Result<Value> {
+        let info = local_file::get_local_file_info(&path).await?;
+        Ok(serde_json::to_value(info)?)
+    }
+
+    pub async fn delete_collected_evidence(path: String) -> Result<Value> {
+        local_file::delete_collected_evidence_file(&path).await?;
+        Ok(Value::Null)
+    }
+
+    pub async fn download_local_file(path: String, offset: u64) -> Result<Value> {
+        let Some(session) = get_global_app_state().get_current_session().await else {
+            return Err(anyhow!("Can not found current session"));
+        };
+
+        let info = local_file::get_local_file_info(&path).await?;
+        if offset > info.size {
+            return Err(anyhow!("offset beyond file size"));
+        }
+
+        let channel_label = format!("local_download_{}", Uuid::new_v4());
+        let channel = session
+            .create_data_channel(channel_label.as_str(), Some(RTCDataChannelInit::default()))
+            .await?;
+
+        let backpressure = DataChannelBackpressure::attach(&channel).await;
+
+        let path_clone = path.clone();
+        let name = info.name.clone();
+        let file_size = info.size;
+        let channel_clone = channel.clone();
+        let bp_clone = backpressure.clone();
+
+        channel.on_open(Box::new(move || {
+            let path = path_clone.clone();
+            let name = name.clone();
+            let channel = channel_clone.clone();
+            let bp = bp_clone.clone();
+            Box::pin(async move {
+                let length = file_size.saturating_sub(offset);
+                let byte_range = if file_size == 0 {
+                    ByteRange { start: 0, end: 0 }
+                } else {
+                    ByteRange { start: offset, end: file_size - 1 }
+                };
+
+                let package_count = if length == 0 {
+                    0
+                } else {
+                    (length as f64 / local_file::LOCAL_FILE_CHUNK_SIZE as f64).ceil() as u64
+                };
+
+                let header = json!({
+                    "path": path,
+                    "name": name,
+                    "size": file_size,
+                    "offset": offset,
+                    "length": length,
+                    "packageCount": package_count,
+                    "chunkSize": local_file::LOCAL_FILE_CHUNK_SIZE,
+                })
+                .to_string();
+
+                if channel.send_text(header).await.is_err() {
+                    error!("Local file download failed to send header");
+                    return;
+                }
+
+                if length == 0 {
+                    let _ = channel
+                        .send_text(
+                            json!({
+                                "type": "file_finished",
+                                "path": path,
+                                "name": name,
+                                "offset": offset,
+                                "bytesSent": 0,
+                            })
+                            .to_string(),
+                        )
+                        .await;
+                    return;
+                }
+
+                let mut reader = match local_file::open_local_file_reader(&path, Some(byte_range)).await
+                {
+                    Ok(reader) => reader,
+                    Err(e) => {
+                        error!("Local file download open reader error: {:?}", e);
+                        return;
+                    }
+                };
+
+                let mut bytes_sent = 0u64;
+                loop {
+                    bp.wait_writable(&channel).await;
+
+                    let chunk = match reader.read_next_chunk().await {
+                        Ok(Some(chunk)) => chunk,
+                        Ok(None) => break,
+                        Err(e) => {
+                            error!("Local file download read error: {:?}", e);
+                            break;
+                        }
+                    };
+
+                    let chunk_len = chunk.len() as u64;
+                    if channel.send(&chunk.into()).await.is_err() {
+                        error!("Local file download send error");
+                        break;
+                    }
+                    bytes_sent += chunk_len;
+                }
+
+                if let Err(e) = reader.shutdown().await {
+                    warn!("Local file download shutdown reader: {:?}", e);
+                }
+
+                let _ = channel
+                    .send_text(
+                        json!({
+                            "type": "file_finished",
+                            "path": path,
+                            "name": name,
+                            "offset": offset,
+                            "bytesSent": bytes_sent,
+                        })
+                        .to_string(),
+                    )
+                    .await;
+            })
+        }));
+
+        let channel_label_clone = channel.label().to_string();
+        channel.on_close(Box::new(move || {
+            let channel_label = channel_label_clone.clone();
+            Box::pin(async move {
+                let Some(session) = get_global_app_state().get_current_session().await else {
+                    warn!("Current Session not found");
+                    return;
+                };
+                session.remove_channel(&channel_label).await;
+                info!("Local file download channel closed: {}", channel_label);
+            })
+        }));
+
+        session.cache_channel(channel.clone()).await;
         Ok(serde_json::to_value(StartDownloadResponse { data_channel: channel_label })?)
     }
 
@@ -2636,6 +2873,9 @@ pub fn create_default_registry() -> RpcRegistry {
     registry.register_async("resetConfig", |_params| {
         Box::pin(async move { handlers::reset_config().await })
     });
+    registry.register_async("facrotyReset", |_params| {
+        Box::pin(async move { handlers::factory_reset().await })
+    });
 
     registry.register_async("setCloudUrl", |params| {
         Box::pin(async move {
@@ -2675,12 +2915,6 @@ pub fn create_default_registry() -> RpcRegistry {
             handlers::set_vlan_settings(params.settings).await
         })
     });
-    registry.register_async("confirmVlanSettings", |_params| {
-        Box::pin(async move { handlers::confirm_vlan_settings().await })
-    });
-    registry.register_async("revertVlanSettings", |_params| {
-        Box::pin(async move { handlers::revert_vlan_settings().await })
-    });
     registry.register_async("renewVlanDhcpLease", |params| {
         Box::pin(async move {
             let params: RenewVlanDhcpLeaseParams = serde_json::from_value(
@@ -2688,6 +2922,9 @@ pub fn create_default_registry() -> RpcRegistry {
             )?;
             handlers::renew_vlan_dhcp_lease(&params.role).await
         })
+    });
+    registry.register_async("resetNetworkFactory", |_params| {
+        Box::pin(async move { handlers::reset_network_factory().await })
     });
     // registry.register_no_params("getNetworkIpAddress", handlers::get_network_ip_address);
     // registry.register_typed("setNetworkIpAddress", handlers::set_network_ip_address);
@@ -2733,6 +2970,36 @@ pub fn create_default_registry() -> RpcRegistry {
 
     // Virtual media (storage) RPCs
     registry.register_no_params("getVirtualMediaState", handlers::get_virtual_media_state);
+
+    registry.register_async("getVirtualMediaList", |_params| {
+        Box::pin(async move {
+            Ok(serde_json::to_value(handlers::get_virtual_media_list().await?)?)
+        })
+    });
+    registry.register_async("addVirtualMediaItem", |params| {
+        Box::pin(async move {
+            let params: VirtualMediaItem =
+                serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
+            handlers::add_virtual_media_item(params).await?;
+            Ok(Value::Null)
+        })
+    });
+    registry.register_async("removeVirtualMediaItem", |params| {
+        Box::pin(async move {
+            let params: RemoveVirtualMediaItemParams =
+                serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
+            handlers::remove_virtual_media_item(params.name).await?;
+            Ok(Value::Null)
+        })
+    });
+    registry.register_async("updateVirtualMediaList", |params| {
+        Box::pin(async move {
+            let params: VirtualMediaListParams =
+                serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
+                handlers::update_virtual_media_list(params).await?;
+            Ok(Value::Null)
+        })
+    });
 
     // File transfer State
     registry.register_async("getFileTransferState", |_params| {
@@ -2841,9 +3108,9 @@ pub fn create_default_registry() -> RpcRegistry {
 
     registry.register_async("startFtFsDownload", |params| {
         Box::pin(async move {
-            let params: FilePathParams =
+            let params: FtFileDownloadParams =
                 serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
-            handlers::download_ft_file(params.path, params.name).await
+            handlers::download_ft_file(params.path, params.name, params.offset).await
         })
     });
 
@@ -3008,6 +3275,36 @@ pub fn create_default_registry() -> RpcRegistry {
 
     registry.register_async("registerTailscaleForce", |_params| {
         Box::pin(async move { Ok(handlers::register_tailscale_force().await?) })
+    });
+
+    registry.register_async("collectEvidence", |_params| {
+        Box::pin(async move {
+            Ok(serde_json::to_value(crate::common::log::collect_evidence().await?)?)
+         })
+    });
+
+    registry.register_async("getLocalFileInfo", |params| {
+        Box::pin(async move {
+            let params: PathParams =
+                serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
+            handlers::get_local_file_info(params.path).await
+        })
+    });
+
+    registry.register_async("startLocalFileDownload", |params| {
+        Box::pin(async move {
+            let params: LocalFileDownloadParams =
+                serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
+            handlers::download_local_file(params.path, params.offset).await
+        })
+    });
+
+    registry.register_async("deleteCollectedEvidence", |params| {
+        Box::pin(async move {
+            let params: PathParams =
+                serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
+            handlers::delete_collected_evidence(params.path).await
+        })
     });
 
     registry

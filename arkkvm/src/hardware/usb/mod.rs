@@ -89,10 +89,8 @@ pub async fn reboot_usb_manager_by_device(
 
     match device_type {
         UsbDeviceType::AbsoluteMouse => deivces.absolute_mouse = enable,
-        UsbDeviceType::RelativeMouse | UsbDeviceType::Keyboard => {
-            deivces.keyboard = enable;
-            deivces.relative_mouse = enable;
-        }
+        UsbDeviceType::RelativeMouse => deivces.relative_mouse = enable,
+        UsbDeviceType::Keyboard => deivces.keyboard = enable,
         UsbDeviceType::MassStorageVm => deivces.mass_storage_vm = enable,
         UsbDeviceType::MassStorageFt => deivces.mass_storage_ft = enable,
         UsbDeviceType::Microphone => deivces.microphone = enable,
@@ -130,7 +128,7 @@ pub async fn reboot_usb_manager_with_reason(
         config.get_usb_config().await
     };
 
-    let mut devices =
+    let devices =
         if let Some(devices) = devices.take() { devices } else { config.get_usb_devices().await };
 
     info!(
@@ -138,7 +136,6 @@ pub async fn reboot_usb_manager_with_reason(
         requested_devices = ?devices,
         "reboot_usb_manager apply target devices (config saved only on success)"
     );
-    devices.relative_mouse = devices.keyboard;
 
     if services::get_usb().is_none() {
         warn!("UsbClient not initialized; skipped sidecar apply");

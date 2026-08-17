@@ -1,9 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex as StdMutex};
-use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
@@ -93,7 +93,8 @@ pub async fn get_vm_mode_from_sidecar() -> Result<VirtualMediaMode> {
 }
 
 /// Resolve VM/FT backing paths and VM LUN mode for usb_devices apply.
-pub async fn resolve_ums_paths_for_apply() -> Result<(String, String, crate::proto::v1::UmsVmType)> {
+pub async fn resolve_ums_paths_for_apply() -> Result<(String, String, crate::proto::v1::UmsVmType)>
+{
     use crate::proto::v1::{UmsControlResponse, UmsTarget, UmsVmType};
 
     let usb = require_usb()?;
@@ -119,16 +120,8 @@ pub async fn resolve_ums_paths_for_apply() -> Result<(String, String, crate::pro
     });
     let ums_vm_type = UmsVmType::try_from(vm.vm_type).unwrap_or(UmsVmType::VmCdRom);
     Ok((
-        if vm.mounted {
-            vm.mounted_path
-        } else {
-            String::new()
-        },
-        if ft.mounted {
-            ft.mounted_path
-        } else {
-            String::new()
-        },
+        if vm.mounted { vm.mounted_path } else { String::new() },
+        if ft.mounted { ft.mounted_path } else { String::new() },
         ums_vm_type,
     ))
 }
@@ -170,8 +163,7 @@ pub async fn get_file_transfer_state() -> Result<FileTransferState> {
 /// Mount remote HTTP image via NBD and point mass storage to /dev/nbd0.
 pub async fn mount_with_http(url: &str, mode: VirtualMediaMode) -> Result<()> {
     ensure_images_folder().await?;
-    set_mass_storage_mode(mode == VirtualMediaMode::CDROM, true, UsbTarget::Usb0Lun0)
-        .await?;
+    set_mass_storage_mode(mode == VirtualMediaMode::CDROM, true, UsbTarget::Usb0Lun0).await?;
 
     // Create HTTP/HTTPS reader and determine size
     let reader = HttpRangeReader::new(url)?;
@@ -382,10 +374,7 @@ pub async fn set_mass_storage_image(image_path: &str, usb_target: UsbTarget) -> 
             if is_ums_unmount_path(image_path) {
                 usb.ums_unmount_vm().await
             } else {
-                let mode = CURRENT_VIRTUAL_MEDIA_STATE
-                    .read()
-                    .as_ref()
-                    .map(|s| s.mode);
+                let mode = CURRENT_VIRTUAL_MEDIA_STATE.read().as_ref().map(|s| s.mode);
                 let mode = match mode {
                     Some(m) => m,
                     None => get_vm_mode_from_sidecar().await?,
@@ -404,15 +393,15 @@ pub async fn set_mass_storage_image(image_path: &str, usb_target: UsbTarget) -> 
 }
 
 /// Set mass storage VM mode (CD-ROM vs disk) via sidecar.
-pub async fn set_mass_storage_mode(cdrom: bool, _read_only: bool, usb_target: UsbTarget) -> Result<()> {
+pub async fn set_mass_storage_mode(
+    cdrom: bool,
+    _read_only: bool,
+    usb_target: UsbTarget,
+) -> Result<()> {
     match usb_target {
         UsbTarget::Usb0Lun0 => {
             let usb = require_usb()?;
-            let mode = if cdrom {
-                VirtualMediaMode::CDROM
-            } else {
-                VirtualMediaMode::Disk
-            };
+            let mode = if cdrom { VirtualMediaMode::CDROM } else { VirtualMediaMode::Disk };
             usb.ums_switch_vm_mode(mode).await
         }
         UsbTarget::Usb1Lun0 => Ok(()),
@@ -480,11 +469,7 @@ async fn wait_nbd_ready() -> Result<()> {
         }
 
         if Instant::now() >= deadline {
-            return Err(anyhow!(
-                "nbd ready timeout: pid_ok={}, size_ok={}",
-                pid_ok,
-                size_ok
-            ));
+            return Err(anyhow!("nbd ready timeout: pid_ok={}, size_ok={}", pid_ok, size_ok));
         }
         sleep(NBD_READY_POLL_INTERVAL).await;
     }
@@ -525,11 +510,7 @@ struct InflightGate {
 
 impl InflightGate {
     fn new(max: usize) -> Self {
-        Self {
-            inner: StdMutex::new(0),
-            cv: Condvar::new(),
-            max,
-        }
+        Self { inner: StdMutex::new(0), cv: Condvar::new(), max }
     }
 
     fn acquire(&self) {
@@ -574,11 +555,7 @@ struct BlockCache {
 
 impl BlockCache {
     fn new(cap: usize) -> Self {
-        Self {
-            map: HashMap::new(),
-            lru: VecDeque::new(),
-            cap,
-        }
+        Self { map: HashMap::new(), lru: VecDeque::new(), cap }
     }
 
     fn touch(&mut self, key: i64) {
@@ -691,9 +668,7 @@ impl HttpRangeReader {
                 }
             }
         }
-        Err(last_err
-            .map(|e| anyhow::Error::from(e))
-            .unwrap_or_else(|| anyhow!("http send failed")))
+        Err(last_err.map(|e| anyhow::Error::from(e)).unwrap_or_else(|| anyhow!("http send failed")))
     }
 
     fn fetch_range_once(&self, req_off: i64, req_end: i64, out: &mut [u8]) -> Result<usize> {
@@ -859,11 +834,8 @@ impl HttpRangeReader {
             let block_id = global_off.div_euclid(block_size);
             let offset_in_block = (global_off - block_id * block_size) as usize;
             let writable = (HTTP_BLOCK_SIZE - offset_in_block).min(data.len() - cursor);
-            let mut block_data = prefetch
-                .cache
-                .map
-                .remove(&block_id)
-                .unwrap_or_else(|| vec![0u8; HTTP_BLOCK_SIZE]);
+            let mut block_data =
+                prefetch.cache.map.remove(&block_id).unwrap_or_else(|| vec![0u8; HTTP_BLOCK_SIZE]);
             block_data[offset_in_block..offset_in_block + writable]
                 .copy_from_slice(&data[cursor..cursor + writable]);
             prefetch.cache.put(block_id, block_data);
@@ -913,7 +885,12 @@ impl HttpRangeReader {
         prefetch.enabled
     }
 
-    fn read_at_with_prefetch(&self, off: i64, want: usize, buf: &mut [u8]) -> Result<Option<usize>> {
+    fn read_at_with_prefetch(
+        &self,
+        off: i64,
+        want: usize,
+        buf: &mut [u8],
+    ) -> Result<Option<usize>> {
         if want > HTTP_PREFETCH_CHUNK_SIZE {
             return Ok(None);
         }
@@ -1070,10 +1047,7 @@ impl HttpRangeReader {
 
         let mut effective_url = url.to_string();
         if let Ok(resp) = reader.send_with_retry(|| {
-            reader
-                .client
-                .head(url)
-                .header(reqwest::header::USER_AGENT, HTTP_RANGE_USER_AGENT)
+            reader.client.head(url).header(reqwest::header::USER_AGENT, HTTP_RANGE_USER_AGENT)
         }) {
             effective_url = resp.url().as_str().to_owned();
         }
@@ -1082,18 +1056,18 @@ impl HttpRangeReader {
             .send_with_retry(|| {
                 reader
                     .client
-                .get(effective_url.as_str())
-                .header(reqwest::header::USER_AGENT, HTTP_RANGE_USER_AGENT)
-                .header(reqwest::header::ACCEPT_ENCODING, "identity")
-                .header(reqwest::header::RANGE, "bytes=0-0")
+                    .get(effective_url.as_str())
+                    .header(reqwest::header::USER_AGENT, HTTP_RANGE_USER_AGENT)
+                    .header(reqwest::header::ACCEPT_ENCODING, "identity")
+                    .header(reqwest::header::RANGE, "bytes=0-0")
             })
             .context("range probe GET failed")?;
         effective_url = resp.url().as_str().to_owned();
 
         let status = resp.status();
         let has_cr = resp.headers().get(reqwest::header::CONTENT_RANGE).is_some();
-        let acceptable = status == reqwest::StatusCode::PARTIAL_CONTENT
-            || (status.is_success() && has_cr);
+        let acceptable =
+            status == reqwest::StatusCode::PARTIAL_CONTENT || (status.is_success() && has_cr);
         if !acceptable {
             return Err(anyhow!(
                 "range probe: HTTP {} (need 206 or 2xx with Content-Range); byte ranges required for NBD",
@@ -1193,17 +1167,9 @@ pub fn check_mount_url(url: &str) -> Result<UrlCheckResult> {
     match HttpRangeReader::new(url) {
         Ok(r) => {
             let size = r.size().unwrap_or(0);
-            Ok(UrlCheckResult {
-                usable: true,
-                reason: None,
-                size,
-            })
+            Ok(UrlCheckResult { usable: true, reason: None, size })
         }
-        Err(e) => Ok(UrlCheckResult {
-            usable: false,
-            reason: Some(e.to_string()),
-            size: 0,
-        }),
+        Err(e) => Ok(UrlCheckResult { usable: false, reason: Some(e.to_string()), size: 0 }),
     }
 }
 
@@ -1305,7 +1271,7 @@ pub struct StorageFileUpload {
 }
 
 struct PendingUpload {
-    file: File,
+    file: Option<File>,
     size: i64,
     already_uploaded_bytes: i64,
     upload_path: PathBuf,
@@ -1321,6 +1287,8 @@ struct FtPendingUpload {
 }
 
 static PENDING_UPLOADS: Lazy<AsyncMutex<HashMap<String, PendingUpload>>> =
+    Lazy::new(|| AsyncMutex::new(HashMap::new()));
+static PENDING_UPLOADS_CLOSED: Lazy<AsyncMutex<HashMap<String, PendingUpload>>> =
     Lazy::new(|| AsyncMutex::new(HashMap::new()));
 
 static FT_PENDING_UPLOADS: Lazy<AsyncMutex<HashMap<String, FtPendingUpload>>> =
@@ -1343,9 +1311,72 @@ pub async fn start_storage_file_upload(filename: &str, size: i64) -> Result<Stor
         return Err(anyhow!("file already exists: {}", filename));
     }
 
-    let mut already_uploaded_bytes: i64 = 0;
-    if let Ok(meta) = fs::metadata(&upload_path).await {
-        already_uploaded_bytes = meta.len() as i64;
+    {
+        let map = PENDING_UPLOADS.lock().await;
+        if let Some((upload_id, entry)) =
+            map.iter().find(|(_, entry)| entry.upload_path == upload_path && entry.size == size)
+        {
+            info!(
+                "Reusing active VM upload session {} for {} ({}/{})",
+                upload_id,
+                upload_path.display(),
+                entry.already_uploaded_bytes,
+                size
+            );
+            return Ok(StorageFileUpload {
+                already_uploaded_bytes: entry.already_uploaded_bytes,
+                data_channel: upload_id.clone(),
+            });
+        }
+    }
+
+    let disk_size = if upload_path.exists() {
+        fs::metadata(&upload_path).await?.len() as i64
+    } else {
+        0
+    };
+
+    if upload_path.exists() {
+        let mut closed = PENDING_UPLOADS_CLOSED.lock().await;
+        let matched_id = closed.iter().find_map(|(upload_id, item)| {
+            if item.final_path == final_path
+                && item.upload_path == upload_path
+                && item.already_uploaded_bytes == disk_size
+            {
+                Some(upload_id.clone())
+            } else {
+                None
+            }
+        });
+
+        if let Some(upload_id) = matched_id {
+            let mut entry = closed.remove(&upload_id).expect("checked above");
+            if entry.already_uploaded_bytes != disk_size {
+                entry.already_uploaded_bytes = disk_size;
+            }
+            let file = OpenOptions::new().append(true).open(&upload_path).await.with_context(
+                || format!("failed to reopen partial upload: {}", upload_path.display()),
+            )?;
+            entry.file = Some(file);
+            let resumed_bytes = entry.already_uploaded_bytes;
+            PENDING_UPLOADS.lock().await.insert(upload_id.clone(), entry);
+            info!(
+                "Resumed VM upload session {} for {} ({}/{})",
+                upload_id,
+                upload_path.display(),
+                resumed_bytes,
+                size
+            );
+            return Ok(StorageFileUpload {
+                already_uploaded_bytes: resumed_bytes,
+                data_channel: upload_id,
+            });
+        }
+        drop(closed);
+
+        fs::remove_file(&upload_path)
+            .await
+            .with_context(|| format!("failed to remove orphan upload: {}", upload_path.display()))?;
     }
 
     let file =
@@ -1358,11 +1389,17 @@ pub async fn start_storage_file_upload(filename: &str, size: i64) -> Result<Stor
         let mut map = PENDING_UPLOADS.lock().await;
         map.insert(
             upload_id.clone(),
-            PendingUpload { file, size, already_uploaded_bytes, upload_path, final_path },
+            PendingUpload {
+                file: Some(file),
+                size,
+                already_uploaded_bytes: 0,
+                upload_path,
+                final_path,
+            },
         );
     }
 
-    Ok(StorageFileUpload { already_uploaded_bytes, data_channel: upload_id })
+    Ok(StorageFileUpload { already_uploaded_bytes: 0, data_channel: upload_id })
 }
 
 pub async fn append_upload_data(upload_id: &str, data: &[u8]) -> Result<i64> {
@@ -1373,8 +1410,12 @@ pub async fn append_upload_data(upload_id: &str, data: &[u8]) -> Result<i64> {
     let Some(mut entry) = entry.take() else {
         return Err(anyhow!("upload not found"));
     };
-    let write_res = entry
-        .file
+    let Some(file) = entry.file.as_mut() else {
+        let mut map = PENDING_UPLOADS.lock().await;
+        map.insert(upload_id.to_owned(), entry);
+        return Err(anyhow!("upload file handle not open"));
+    };
+    let write_res = file
         .write_all(data)
         .await
         .with_context(|| format!("failed to write upload: {}", upload_id));
@@ -1398,10 +1439,14 @@ pub async fn complete_upload(upload_id: &str) -> Result<()> {
     let Some(mut entry) = entry else {
         return Err(anyhow!("upload not found"));
     };
-    entry.file.flush().await.ok();
-    entry.file.sync_data().await.ok();
-    drop(entry.file);
-    if entry.already_uploaded_bytes == entry.size {
+    if let Some(mut file) = entry.file.take() {
+        file.flush().await.ok();
+        file.sync_data().await.ok();
+        drop(file);
+    }
+
+    let finish = entry.already_uploaded_bytes == entry.size;
+    if finish {
         fs::rename(&entry.upload_path, &entry.final_path).await.with_context(|| {
             format!(
                 "failed to rename uploaded file: {} -> {}",
@@ -1409,6 +1454,9 @@ pub async fn complete_upload(upload_id: &str) -> Result<()> {
                 entry.final_path.display()
             )
         })?;
+    } else {
+        let mut closed = PENDING_UPLOADS_CLOSED.lock().await;
+        closed.insert(upload_id.to_owned(), entry);
     }
     Ok(())
 }
@@ -1433,15 +1481,33 @@ pub async fn start_ft_file_upload(
         return Err(anyhow!("File already exists"));
     }
 
+    {
+        let map = FT_PENDING_UPLOADS.lock().await;
+        if let Some((upload_id, entry)) =
+            map.iter().find(|(_, entry)| entry.final_path == file_path && entry.size == size)
+        {
+            info!(
+                "Reusing active FT upload session {} for {} ({}/{})",
+                upload_id, &file_path, entry.already_uploaded_bytes, size
+            );
+            return Ok(StorageFileUpload {
+                already_uploaded_bytes: entry.already_uploaded_bytes,
+                data_channel: upload_id.clone(),
+            });
+        }
+    }
+
     let task = if remote_fs.exists(file_cache_path.as_str()).await? {
         let cache_size = remote_fs.file_size(file_cache_path.as_str()).await?;
         let mut should_delete_cache = false;
         let mut map = FT_PENDING_UPLOADS_CLOSED.lock().await;
         let mut old_upload_id = map.iter().find_map(|(upload_id, item)| {
-            if item.final_path == file_path && item.upload_path == file_cache_path && item.already_uploaded_bytes == cache_size as i64 {
+            if item.final_path == file_path
+                && item.upload_path == file_cache_path
+                && item.already_uploaded_bytes == cache_size as i64
+            {
                 Some(upload_id.clone())
-            }
-            else {
+            } else {
                 None
             }
         });
@@ -1449,8 +1515,7 @@ pub async fn start_ft_file_upload(
         let task = if let Some(upload_id) = old_upload_id.take() {
             let entry = map.remove(&upload_id);
             (Some(upload_id.clone()), entry)
-        }
-        else {
+        } else {
             should_delete_cache = true;
             (None, None)
         };
@@ -1459,48 +1524,44 @@ pub async fn start_ft_file_upload(
             remote_fs.delete_file(file_cache_path.as_str()).await?;
         }
         task
-    }
-    else {
+    } else {
         (None, None)
     };
 
     let (upload_id, entry) = if task.0.is_some() && task.1.is_some() {
         let mut pending_upload = task.1.unwrap();
-        pending_upload.writer = Some(remote_fs
-            .create_async_writer(
-                pending_upload.upload_path.as_str(),
-                1024 * 4,
-                pending_upload.already_uploaded_bytes as u64,
-            )
-            .await?);
-        
-        (task.0.unwrap(), pending_upload)
-    }
-    else {
-        remote_fs.create_empty_file(file_cache_path.as_str()).await?;
-        (format!("ft_upload_{}", Uuid::new_v4()), FtPendingUpload {
-            writer: Some(remote_fs
+        pending_upload.writer = Some(
+            remote_fs
                 .create_async_writer(
-                    file_cache_path.as_str(),
+                    pending_upload.upload_path.as_str(),
                     1024 * 4,
-                    0,
+                    pending_upload.already_uploaded_bytes as u64,
                 )
-                .await?),
-            size,
-            already_uploaded_bytes: 0,
-            upload_path: file_cache_path.clone(),
-            final_path: file_path.clone(),
-        })
+                .await?,
+        );
+
+        (task.0.unwrap(), pending_upload)
+    } else {
+        remote_fs.create_empty_file(file_cache_path.as_str()).await?;
+        (
+            format!("ft_upload_{}", Uuid::new_v4()),
+            FtPendingUpload {
+                writer: Some(
+                    remote_fs.create_async_writer(file_cache_path.as_str(), 1024 * 4, 0).await?,
+                ),
+                size,
+                already_uploaded_bytes: 0,
+                upload_path: file_cache_path.clone(),
+                final_path: file_path.clone(),
+            },
+        )
     };
 
     let already_uploaded_bytes = entry.already_uploaded_bytes;
-    
+
     {
         let mut map = FT_PENDING_UPLOADS.lock().await;
-        map.insert(
-            upload_id.clone(),
-            entry,
-        );
+        map.insert(upload_id.clone(), entry);
     }
 
     info!(
@@ -1573,8 +1634,7 @@ pub async fn complete_ft_upload(upload_id: &str) -> Result<()> {
     if finish {
         let remote_fs = REMOTE_FS.read().await;
         remote_fs.rename(upload_path.as_str(), final_path.as_str()).await?;
-    }
-    else {
+    } else {
         let mut map = FT_PENDING_UPLOADS_CLOSED.lock().await;
         map.insert(upload_id.to_owned(), entry);
     }
@@ -1612,6 +1672,14 @@ pub async fn list_storage_files() -> Result<StorageFilesList> {
     let mut pending_totals: HashMap<String, i64> = HashMap::new();
     {
         let map = PENDING_UPLOADS.lock().await;
+        for (_id, pu) in map.iter() {
+            if let Some(name) = pu.upload_path.file_name().and_then(|s| s.to_str()) {
+                pending_totals.insert(name.to_string(), pu.size);
+            }
+        }
+    }
+    {
+        let map = PENDING_UPLOADS_CLOSED.lock().await;
         for (_id, pu) in map.iter() {
             if let Some(name) = pu.upload_path.file_name().and_then(|s| s.to_str()) {
                 pending_totals.insert(name.to_string(), pu.size);
@@ -1670,25 +1738,70 @@ pub async fn get_storage_space() -> Result<StorageSpace> {
         let adjusted_total = (total as i64).saturating_sub(img_file_size as i64).max(0);
         let adjusted_used = (used as i64).saturating_sub(img_file_used as i64).max(0);
         let adjusted_free = adjusted_total.saturating_sub(adjusted_used);
-        
-        Ok(StorageSpace { 
-            bytes_used: adjusted_used, 
-            bytes_free: adjusted_free,
-        })
+
+        Ok(StorageSpace { bytes_used: adjusted_used, bytes_free: adjusted_free })
     })
     .await
     .context("spawn_blocking failed")?
 }
 
-pub async fn delete_storage_file(filename: &str) -> Result<()> {
-    let filename = sanitize_filename(filename)?;
+pub async fn delete_storage_file(file_name: &str) -> Result<()> {
+    let filename = sanitize_filename(file_name)?;
     let full_path = Path::new(IMAGES_FOLDER).join(&filename);
-    if !full_path.exists() {
-        return Err(anyhow!("file does not exist: {}", filename));
+
+    cancel_vm_upload(file_name).await?;
+
+    if full_path.exists() {
+        fs::remove_file(&full_path)
+            .await
+            .with_context(|| format!("failed to delete file: {}", filename))?;
     }
-    fs::remove_file(&full_path)
-        .await
-        .with_context(|| format!("failed to delete file: {}", filename))?;
+    Ok(())
+}
+
+pub async fn cancel_vm_upload(file_name: &str) -> Result<()> {
+    let filename = sanitize_filename(file_name)?;
+    let final_path = Path::new(IMAGES_FOLDER).join(&filename);
+    let mut upload_path = final_path.clone();
+    let base = final_path.file_name().ok_or_else(|| anyhow!("invalid filename"))?;
+    let mut appended = std::ffi::OsString::from(base);
+    appended.push(".incomplete");
+    upload_path.set_file_name(appended);
+
+    let mut stale_ids = Vec::new();
+    {
+        let pending_uploads = PENDING_UPLOADS.lock().await;
+        for (id, pu) in pending_uploads.iter() {
+            if pu.upload_path == upload_path {
+                stale_ids.push(id.clone());
+            }
+        }
+    }
+    {
+        let closed = PENDING_UPLOADS_CLOSED.lock().await;
+        for (id, pu) in closed.iter() {
+            if pu.upload_path == upload_path {
+                stale_ids.push(id.clone());
+            }
+        }
+    }
+
+    for upload_id in stale_ids {
+        if let Some(mut pd) = PENDING_UPLOADS.lock().await.remove(&upload_id) {
+            if let Some(mut file) = pd.file.take() {
+                if let Err(e) = file.shutdown().await {
+                    warn!("cancel_vm_upload: error shutting down file: {:?}", e);
+                }
+            }
+        } else {
+            let _ = PENDING_UPLOADS_CLOSED.lock().await.remove(&upload_id);
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    if upload_path.exists() {
+        fs::remove_file(&upload_path).await?;
+    }
     Ok(())
 }
 
@@ -1786,8 +1899,72 @@ pub async fn fs_info_with_file_img() -> Result<FileSystemInfo> {
 }
 
 pub async fn fs_del_file_with_file_img(path: String) -> Result<()> {
+    info!("fs_del_file_with_file_img Deleting file: {}", path);
+    cancel_ft_upload(&path).await?;
+    remove_ft_closed_upload(&path).await?;
+
     let remote_fs = REMOTE_FS.read().await;
     remote_fs.delete_file(path.as_str()).await
+}
+
+pub async fn cancel_ft_upload(path: &str) -> Result<()> {
+    let mut ft_pending_uploads = FT_PENDING_UPLOADS.lock().await;
+    let mut upload_id: Option<String> = None;
+    for (id, pu) in ft_pending_uploads.iter() {
+        if pu.final_path == path {
+            upload_id = Some(id.clone());
+            break;
+        }
+    }
+
+    if let Some(upload_id) = upload_id {
+        let pd = ft_pending_uploads.remove(&upload_id);
+        if let Some(mut pd) = pd {
+            if let Some(mut writer) = pd.writer {
+                if let Err(e) = writer.shutdown().await {
+                    warn!("cancel_ft_upload: error shutting down writer: {:?}", e);
+                }
+                pd.writer = None;
+                drop(writer);
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if Path::new(&pd.upload_path).exists() {
+                fs::remove_file(&pd.upload_path).await?;
+            }
+        }
+    }
+    drop(ft_pending_uploads);
+    Ok(())
+}
+
+pub async fn remove_ft_closed_upload(path: &str) -> Result<()> {
+    let mut ft_pending_uploads_closed = FT_PENDING_UPLOADS_CLOSED.lock().await;
+    let mut upload_id: Option<String> = None;
+    for (id, pu) in ft_pending_uploads_closed.iter() {
+        if pu.final_path == path {
+            upload_id = Some(id.clone());
+            break;
+        }
+    }
+
+    if let Some(upload_id) = upload_id {
+        let pd = ft_pending_uploads_closed.remove(&upload_id);
+        if let Some(mut pd) = pd {
+            if let Some(mut writer) = pd.writer {
+                if let Err(e) = writer.shutdown().await {
+                    warn!("remove_ft_closed_upload: error shutting down writer: {:?}", e);
+                }
+                pd.writer = None;
+                drop(writer);
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if Path::new(&pd.upload_path).exists() {
+                fs::remove_file(&pd.upload_path).await?;
+            }
+        }
+    }
+    drop(ft_pending_uploads_closed);
+    Ok(())
 }
 
 pub async fn fs_del_dir_with_file_img(path: String) -> Result<()> {

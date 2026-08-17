@@ -17,12 +17,13 @@ impl Default for MdnsListenOptions {
 #[derive(Debug, Clone, Default)]
 pub struct MdnsOptions {
     pub local_names: Vec<String>,
+    pub domain: String,
     pub listen_options: MdnsListenOptions,
 }
 
 impl MdnsOptions {
     pub fn new(local_names: Vec<String>, listen_options: MdnsListenOptions) -> Self {
-        Self { local_names, listen_options }
+        Self { local_names, domain: String::new(), listen_options }
     }
 }
 

@@ -24,6 +24,8 @@ pub use types::{Config, KeyboardMacro, KeyboardMacroStep, WakeOnLanDevice};
 /// Global configuration manager instance
 static CONFIG_MANAGER: OnceCell<ConfigManager> = OnceCell::const_new();
 
+pub const CONFIG_DIR: &str = "/userdata/arkkvm";
+
 /// Initialize the global configuration manager
 pub async fn init_config() -> Result<()> {
     let manager = ConfigManager::new();

@@ -1,6 +1,7 @@
 use crate::config::UsbBaseInfo;
 use crate::devices::hid_abs::{HidAbsController, HidAbsHandle};
-use crate::devices::hid_kb::{HidKbRelController, HidKbRelHandle};
+use crate::devices::hid_kb::{HidKbController, HidKbHandle};
+use crate::devices::hid_rel::{HidRelController, HidRelHandle};
 use crate::devices::ums1::{Ums1Controller, Ums1Handle, UmsFtEvent, UmsFtResponse};
 use crate::proto::v1::DeviceSwitches;
 // use crate::config::{DeviceSwitches, UsbBaseInfo};
@@ -27,7 +28,8 @@ const UDC_POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub const VIRTUAL_MEDIA_SERVICE: &str = "UMS_HANDLE";
 pub const FILE_TRANSFER_SERVICE: &str = "UMS1_HANDLE";
 pub const UAC_SERVICE: &str = "UAC_HANDLE";
-pub const HID_KB_REL_SERVICE: &str = "HID_KB_REL_HANDLE";
+pub const HID_KB_SERVICE: &str = "HID_KB_HANDLE";
+pub const HID_REL_SERVICE: &str = "HID_REL_HANDLE";
 pub const HID_ABS_SERVICE: &str = "HID_ABS_HANDLE";
 
 const DEFAULT_UMS_MODE: UmsMode = UmsMode::CdRom;
@@ -36,7 +38,8 @@ pub enum DeviceService {
     Ums(Arc<UmsController>, Arc<UmsHandle>),
     Ums1(Arc<Ums1Controller>, Arc<Ums1Handle>),
     Uac(Arc<UacController>, Arc<UacHandle>),
-    HidKbRel(Arc<HidKbRelController>, Arc<HidKbRelHandle>),
+    HidKb(Arc<HidKbController>, Arc<HidKbHandle>),
+    HidRel(Arc<HidRelController>, Arc<HidRelHandle>),
     HidAbs(Arc<HidAbsController>, Arc<HidAbsHandle>),
 }
 
@@ -410,9 +413,18 @@ impl UsbDeviceManager {
         }
     }
 
-    pub async fn get_hid_kb_rel(&self) -> Option<Arc<HidKbRelController>> {
+    pub async fn get_hid_kb(&self) -> Option<Arc<HidKbController>> {
         let services = self.device_services.read().await;
-        if let Some(DeviceService::HidKbRel(controller, _)) = services.get(HID_KB_REL_SERVICE) {
+        if let Some(DeviceService::HidKb(controller, _)) = services.get(HID_KB_SERVICE) {
+            Some(controller.clone())
+        } else {
+            None
+        }
+    }
+
+    pub async fn get_hid_rel(&self) -> Option<Arc<HidRelController>> {
+        let services = self.device_services.read().await;
+        if let Some(DeviceService::HidRel(controller, _)) = services.get(HID_REL_SERVICE) {
             Some(controller.clone())
         } else {
             None
@@ -657,17 +669,30 @@ impl UsbDeviceManager {
             );
         }
 
-        if let Some(DeviceService::HidKbRel(_, kb_handle)) = device_services.get(HID_KB_REL_SERVICE)
-        {
-            kb_handle.set_enabled(self.switches.hid_kb_rel_enabled);
+        if let Some(DeviceService::HidKb(_, kb_handle)) = device_services.get(HID_KB_SERVICE) {
+            kb_handle.set_enabled(self.switches.hid_kb_enabled);
         } else {
-            let kb_handle = HidKbRelHandle::new(self.switches.hid_kb_rel_enabled);
+            let kb_handle = HidKbHandle::new(self.switches.hid_kb_enabled);
             let _ = self.add_change_handler(kb_handle.clone()).await;
             device_services.insert(
-                HID_KB_REL_SERVICE,
-                DeviceService::HidKbRel(
-                    Arc::new(HidKbRelController::new(kb_handle.clone())),
+                HID_KB_SERVICE,
+                DeviceService::HidKb(
+                    Arc::new(HidKbController::new(kb_handle.clone())),
                     kb_handle,
+                ),
+            );
+        }
+
+        if let Some(DeviceService::HidRel(_, rel_handle)) = device_services.get(HID_REL_SERVICE) {
+            rel_handle.set_enabled(self.switches.hid_rel_enabled);
+        } else {
+            let rel_handle = HidRelHandle::new(self.switches.hid_rel_enabled);
+            let _ = self.add_change_handler(rel_handle.clone()).await;
+            device_services.insert(
+                HID_REL_SERVICE,
+                DeviceService::HidRel(
+                    Arc::new(HidRelController::new(rel_handle.clone())),
+                    rel_handle,
                 ),
             );
         }

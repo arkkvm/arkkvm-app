@@ -123,7 +123,7 @@ checksum = "69f7f8c3906b62b754cd5326047894316021dcfe5a194c8ea52bdd94934a3457"
 
 [[package]]
 name = "arkkvm"
-version = "0.2.26061893"
+version = "0.4.260814169"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "arkkvm_usb"
-version = "0.2.26061893"
+version = "0.4.260814169"
 dependencies = [
  "anyhow",
  "async-channel",

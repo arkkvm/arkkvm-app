@@ -22,7 +22,8 @@ pub fn extract_serial_number() -> Result<String> {
 
     let content = String::from_utf8(content).context(format!("Failed to parse {} as UTF-8", CPUINFO_FILE))?;
 
-    let r = Regex::new(r"Serial\s*:\s*(\S+)").context("Failed to compile regex")?;
+    let r = Regex::new(r"Serial\s*:\s*(\S+)")
+        .map_err(|e| anyhow::anyhow!("Failed to compile serial-number regex: {e}"))?;
 
     if let Some(matches) = r.captures(&content)
         && matches.len() >= 2

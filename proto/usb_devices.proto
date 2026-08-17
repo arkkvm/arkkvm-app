@@ -4,10 +4,9 @@ package arkkvm.usb_devices.v1;
 
 // Device function switches (mirrors config::DeviceSwitches).
 message DeviceSwitches {
-  bool hid_kb_rel_enabled = 1; // keyboard + relative mouse (single HID function)
-  bool hid_abs_enabled = 2;
-  reserved 3;
-  reserved "hid_rel_enabled";
+  bool hid_kb_enabled = 1;  // boot keyboard (hid.usb0)
+  bool hid_abs_enabled = 2; // absolute mouse (hid.usb1)
+  bool hid_rel_enabled = 3; // relative mouse (hid.usb2)
   bool ums_vm_enabled = 4;
   bool ums_ft_enabled = 5;
   bool uac1_enabled = 6;
@@ -147,6 +146,7 @@ message KeyboardState {
 
 message WheelReportParams{
   uint32 wheel_y =1;
+  uint32 wheel_x =2;
 }
 
 // UMS 虚拟存储独立控制（挂载/卸载/查询），不触发 gadget 重建。

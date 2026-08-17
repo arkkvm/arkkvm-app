@@ -50,10 +50,10 @@ export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_UCLIBCEABIHF_LINKER="$BUILDKIT_ROOT/bin/
 
 if [[ "$DEV_CHANNEL" == "1" ]]; then
     echo "[ArkKVM App] Building for development channel"
-    cargo build -Z build-std --features env_dev --release --target armv7-unknown-linux-uclibceabihf
+    cargo build -Z build-std --bin arkkvm_app --bin arkkvm_usb --features env_dev --release --target armv7-unknown-linux-uclibceabihf
 else
     echo "[ArkKVM App] Building for production channel"
-    cargo build -Z build-std --release --target armv7-unknown-linux-uclibceabihf
+    cargo build -Z build-std --bin arkkvm_app --bin arkkvm_usb --release --target armv7-unknown-linux-uclibceabihf
 fi
 
 echo "[ArkKVM App] Build Completed"

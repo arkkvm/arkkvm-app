@@ -143,14 +143,15 @@ fn build_usb_info_from_args(args: &[String]) -> UsbDeviceInfo {
     let mut info = UsbDeviceInfo::default();
     let mut switchs = info.switches.unwrap_or_default();
     // take at most the first 5 arguments
-    for (i, v) in args.iter().enumerate().take(5) {
+    for (i, v) in args.iter().enumerate().take(6) {
         let enable = v == "1";
         match i {
-            0 => switchs.hid_kb_rel_enabled = enable,
+            0 => switchs.hid_kb_enabled = enable,
             1 => switchs.hid_abs_enabled = enable,
-            2 => switchs.ums_vm_enabled = enable,
-            3 => switchs.ums_ft_enabled = enable,
-            4 => switchs.uac1_enabled = enable,
+            2 => switchs.hid_rel_enabled = enable,
+            3 => switchs.ums_vm_enabled = enable,
+            4 => switchs.ums_ft_enabled = enable,
+            5 => switchs.uac1_enabled = enable,
             _ => {}
         }
     }
@@ -165,10 +166,11 @@ fn build_usb_info_from_args(args: &[String]) -> UsbDeviceInfo {
 // print current parameter help
 fn print_param_hint() {
     println!("Parameters (0=off, 1=on):");
-    println!("  [0] hid_kb_rel_enabled : keyboard + relative mouse");
-    println!("  [1] hid_abs_enabled    : absolute mouse");
-    println!("  [2] ums_vm_enabled     : virtual media");
-    println!("  [3] ums_ft_enabled     : file transfer");
-    println!("  [4] uac1_enabled       : virtual microphone");
-    println!("Example: 1 0 1 0 1");
+    println!("  [0] hid_kb_enabled  : boot keyboard");
+    println!("  [1] hid_abs_enabled : absolute mouse");
+    println!("  [2] hid_rel_enabled : relative mouse");
+    println!("  [3] ums_vm_enabled  : virtual media");
+    println!("  [4] ums_ft_enabled  : file transfer");
+    println!("  [5] uac1_enabled    : virtual microphone");
+    println!("Example: 1 1 1 0 1 0");
 }

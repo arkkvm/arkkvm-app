@@ -1,6 +1,6 @@
 [package]
 name = "arkkvm_usb"
-version = "0.2.26061893"
+version = "0.4.260814169"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

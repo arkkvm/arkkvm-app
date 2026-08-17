@@ -298,22 +298,30 @@ impl CloudWebSocketClient {
                 anyhow::anyhow!("Failed to create WebRTC session: {}", e)
             })?;
 
-        // Exchange SDP offer/answer
-        let answer = session.exchange_offer(&request.sd).await.map_err(|e| {
-            error!("Failed to exchange SDP offer: {}", e);
-            anyhow::anyhow!("Failed to exchange SDP offer: {}", e)
-        })?;
-
         let session_id = session.id.clone();
-        crate::webrtc::handle_session_takeover(app_state.clone(), &session_id).await;
+
+        // Exchange SDP offer/answer. new_session registers the session, so every
+        // subsequent setup error must remove it and close its peer connection.
+        let answer = match session.exchange_offer(&request.sd).await {
+            Ok(answer) => answer,
+            Err(e) => {
+                error!("Failed to exchange SDP offer: {}", e);
+                crate::webrtc::remove_and_close_session(&app_state, &session_id).await;
+                return Err(anyhow::anyhow!("Failed to exchange SDP offer: {}", e));
+            }
+        };
 
         // Send response back to cloud
-        self.send_session_response(&answer, &session_id).await?;
+        if let Err(e) = self.send_session_response(&answer, &session_id).await {
+            crate::webrtc::remove_and_close_session(&app_state, &session_id).await;
+            return Err(e);
+        }
 
-        // Add session to app state
+        crate::webrtc::handle_session_takeover(app_state.clone(), session.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to promote cloud WebRTC session: {}", e))?;
+
         info!("Cloud WebRTC session created successfully with id: {}", &session_id);
-        // app_state.add_session(session).await;
-        app_state.set_current_session_id(Some(session_id)).await;
         Ok(())
     }
 
@@ -363,9 +371,10 @@ impl CloudWebSocketClient {
         {
             info!("Closing session: {}", session_id);
 
-            // Get global app state and remove session
+            // Removing first transfers cleanup ownership and prevents the ICE
+            // Closed callback from starting a second concurrent close.
             let app_state = get_global_app_state();
-            if let Some(_session) = app_state.remove_session(session_id).await {
+            if crate::webrtc::remove_and_close_session(&app_state, session_id).await {
                 info!("Session {} closed successfully", session_id);
                 // Send confirmation back to cloud
                 self.send_session_close_confirmation(session_id).await?;

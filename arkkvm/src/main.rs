@@ -47,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
     hardware::init().await?;
     services::init_usb_service().await?;
     services::init_gui_pipeline()?;
+    services::init_cmd_socket();
 
     let usb_config = config.get_usb_config().await;
     let devices = config.get_usb_devices().await;
@@ -138,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
     audio::shutdown_native_audio().await;
     let _ = zenoh_bus::uninit().await;
     let _ = services::uninit_gui_pipeline();
+    services::uninit_cmd_socket();
     info!("Shutdown complete");
     drop(guard);
     Ok(())

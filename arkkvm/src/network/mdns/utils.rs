@@ -8,6 +8,7 @@ pub async fn create_mdns_service(
 ) -> anyhow::Result<Mdns> {
     let mdns = Mdns::new(MdnsOptions {
         local_names: vec![hostname, fqdn],
+        domain: String::new(),
         listen_options: MdnsListenOptions { ipv4, ipv6 },
     })?;
 

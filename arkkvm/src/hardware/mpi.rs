@@ -5,7 +5,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{info, warn};
 
 // Re-export types from rockchip_mpi_sys for convenience
 pub use rockchip_mpi_sys::{
@@ -196,7 +196,10 @@ pub fn venc_create_chn(channel: i32, attr: &VENC_CHN_ATTR_S) -> Result<()> {
 /// Destroy a VENC encoder channel
 pub fn venc_destroy_chn(channel: i32) {
     unsafe {
-        let _ = rockchip_mpi_sys::RK_MPI_VENC_DestroyChn(channel);
+        let ret = rockchip_mpi_sys::RK_MPI_VENC_DestroyChn(channel);
+        if ret < 0 {
+            warn!("Failed to destroy encoder channel: {}", ret);
+        }
     }
 }
 
@@ -214,7 +217,10 @@ pub fn venc_start_recv_frame(channel: i32, param: &VENC_RECV_PIC_PARAM_S) -> Res
 /// Stop receiving frames
 pub fn venc_stop_recv_frame(channel: i32) {
     unsafe {
-        rockchip_mpi_sys::RK_MPI_VENC_StopRecvFrame(channel);
+        let ret = rockchip_mpi_sys::RK_MPI_VENC_StopRecvFrame(channel);
+        if ret < 0 {
+            warn!("Failed to stop receiving frames: {}", ret);
+        }
     }
 }
 

@@ -1860,10 +1860,10 @@ GNU General Public License v2.0 or later (GPL-2.0-or-later)
 ================================================================================
 
 Used by:
-  - arkkvm 0.2.26062201-dev
+  - arkkvm 0.4.260814169
   - common 0.1.0
   - rockchip_mpi_sys 0.1.0
-  - arkkvm_usb 0.2.26062201-dev
+  - arkkvm_usb 0.4.260814169
 
 GNU GENERAL PUBLIC LICENSE
 Version 2, June 1991

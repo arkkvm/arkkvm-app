@@ -517,7 +517,7 @@ impl CloudManager {
         Ok(token_resp)
     }
 
-    /// Disconnect cloud WebSocket before network restart so the connection loop can reconnect.
+    /// Disconnect cloud WebSocket before/after network restart so the connection loop can reconnect.
     pub async fn reconnect_after_network_change(&self) {
         let state = self.get_state();
         if matches!(state, CloudConnectionState::Connected | CloudConnectionState::Connecting) {
@@ -525,6 +525,17 @@ impl CloudManager {
             self.disconnect_from_cloud().await;
             self.set_state(CloudConnectionState::Disconnected);
         }
+    }
+
+    /// Always tear down WS (if any) and mark Disconnected so the connection loop retries.
+    /// Used after VLAN apply when WAN may only become ready later (no reboot required).
+    pub async fn force_reconnect(&self) {
+        if matches!(self.get_state(), CloudConnectionState::NotConfigured) {
+            return;
+        }
+        info!("Forcing cloud reconnect (was {:?})", self.get_state());
+        self.disconnect_from_cloud().await;
+        self.set_state(CloudConnectionState::Disconnected);
     }
 
     /// Connect to cloud WebSocket

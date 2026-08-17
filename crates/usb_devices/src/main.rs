@@ -29,6 +29,16 @@ async fn main() {
         }
     }
 
+    let session = match open_client().await {
+        Ok(session) => session,
+        Err(e) => {
+            error!("Failed to open zenoh session {:?}", e);
+            return;
+        }
+    };
+
+    // The manager starts the UDC watcher immediately. Initialize Zenoh first so
+    // its initial-state report cannot race the global session initialization.
     let manager = match UsbDeviceManager::new(None) {
         Ok(manager) => manager,
         Err(e) => {
@@ -38,14 +48,6 @@ async fn main() {
     };
 
     let (control, _control_task) = arkkvm_usb::control::spawn_control_service(manager);
-
-    let session = match open_client().await {
-        Ok(session) => session,
-        Err(e) => {
-            error!("Failed to open zenoh session  {:?}", e);
-            return;
-        }
-    };
 
     let zenoh_task = {
         let control = control.clone();

@@ -202,7 +202,10 @@ pub fn spawn_control_service(
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 ControlCmd::Apply { usb_info, reply } => {
-                    let res = apply_usb_info(&mut manager, &mut last_usb_info, usb_info, None).await;
+                    let base_info = manager.get_base_info();
+                    let res =
+                        apply_full_config(&mut manager, &mut last_usb_info, usb_info, base_info)
+                            .await;
                     let _ = reply.send(res);
                 }
                 ControlCmd::ApplyRuntime { req, reply } => {
@@ -237,7 +240,7 @@ pub fn spawn_control_service(
                     let _ = reply.send(resp);
                 }
                 ControlCmd::Putkeyboard { event } => {
-                    if let Some(hid) = manager.get_hid_kb_rel().await {
+                    if let Some(hid) = manager.get_hid_kb().await {
                         hid.keyboard_report(event.modifier as u8, &event.keys).await;
                     }
                 }
@@ -248,14 +251,15 @@ pub fn spawn_control_service(
                     }
                 }
                 ControlCmd::Putrelmouse { event } => {
-                    if let Some(hid) = manager.get_hid_kb_rel().await {
+                    if let Some(hid) = manager.get_hid_rel().await {
                         hid.rel_mouse_report(event.dx as i8, event.dy as i8, event.buttons as u8)
                             .await;
                     }
                 }
                 ControlCmd::Putwheel { event } => {
                     if let Some(hid) = manager.get_hid_abs().await {
-                        hid.abs_mouse_wheel(event.wheel_y as i8).await;
+                        hid.abs_mouse_wheel(event.wheel_y as i8, event.wheel_x as i8)
+                            .await;
                     }
                 }
             }
@@ -277,46 +281,16 @@ async fn apply_runtime_usb_info(
     let usb_info = req.usb_info.ok_or_else(|| {
         UsbError::InvalidArgument("missing usb_info in ApplyRuntimeConfigRequest".into())
     })?;
-    let requested_switches = usb_info.switches.clone().ok_or_else(|| {
-        UsbError::InvalidArgument("missing switches in usb_info".into())
-    })?;
-    let current_switches = manager.get_switches();
-    let switches_changed = is_switches_change(&current_switches, &requested_switches);
-    // None means first apply in this sidecar process — not a path change.
-    let paths_changed = last_usb_info
-        .as_ref()
-        .map(|prev| is_paths_change(prev, &usb_info))
-        .unwrap_or(false);
+    let base_info =
+        runtime_usb_config_to_base_info(&manager.get_base_info(), &runtime_usb_config)?;
 
-    let next_base_info = runtime_usb_config_to_base_info(
-        &manager.get_base_info(),
-        &runtime_usb_config,
-    )?;
-    let base_changed = manager.get_base_info() != next_base_info;
+    info!(
+        reason = %req.reason,
+        request_id = %req.request_id,
+        "apply_runtime_config"
+    );
 
-    // Descriptor-only updates must call update_base_info; set_base_info alone does not touch sysfs.
-    if base_changed && !switches_changed {
-        info!(
-            reason = %req.reason,
-            request_id = %req.request_id,
-            paths_changed = paths_changed,
-            "apply_runtime: usb_config update via update_base_info"
-        );
-        apply_base_info(manager, next_base_info).await?;
-        if paths_changed {
-            if let Err(e) =
-                preflight_ums_path_changes(manager, &usb_info, last_usb_info.as_ref()).await
-            {
-                return Err(e);
-            }
-            apply_ums_mounts(manager, &usb_info).await?;
-        }
-        *last_usb_info = Some(usb_info.clone());
-        return Ok(runtime_apply_ok(manager, usb_info));
-    }
-
-    let base_info_for_apply = base_changed.then_some(next_base_info);
-    apply_usb_info(manager, last_usb_info, usb_info.clone(), base_info_for_apply).await?;
+    apply_full_config(manager, last_usb_info, usb_info.clone(), base_info).await?;
     Ok(runtime_apply_ok(manager, usb_info))
 }
 
@@ -361,71 +335,39 @@ fn runtime_usb_config_to_base_info(
     })
 }
 
-/// Apply flow:
-/// 1. Return immediately if nothing changed
-/// 2. Switch change: preflight gadget (UMS mount busy, etc.) -> rebuild gadget (HID via ChangeHandler lifecycle)
-/// 3. Path-only change: preflight whether UMS paths may change while mounted
-/// 4. Apply UMS mounts
-async fn apply_usb_info(
+/// Every apply command runs the full gadget lifecycle and UMS mount sync.
+/// State diffs are logged only; they do not skip execution.
+async fn apply_full_config(
     manager: &mut UsbDeviceManager,
     last_usb_info: &mut Option<UsbDeviceInfo>,
     usb_info: UsbDeviceInfo,
-    base_info: Option<UsbBaseInfo>,
+    base_info: UsbBaseInfo,
 ) -> Result<DeviceSwitches, UsbError> {
     let switches = usb_info.switches.clone().ok_or_else(|| {
         UsbError::InvalidArgument("missing switches in usb_info".into())
     })?;
 
     let current = manager.get_switches();
-    let switches_changed = is_switches_change(&current, &switches);
     let paths_changed = last_usb_info
         .as_ref()
         .map(|prev| is_paths_change(prev, &usb_info))
         .unwrap_or(false);
-    let needs_initial_bind = manager.needs_initial_bind();
     info!(
         current = ?current,
         requested = ?switches,
-        switches_changed = switches_changed,
+        switches_changed = is_switches_change(&current, &switches),
         paths_changed = paths_changed,
-        needs_initial_bind = needs_initial_bind,
-        "control apply_usb_info request"
+        base_changed = manager.get_base_info() != base_info,
+        "apply_full_config"
     );
 
-    if !switches_changed && !paths_changed && !needs_initial_bind {
-        info!("USB apply: no switch or path changes");
-        return Ok(current);
-    }
+    apply_switches(manager, Some(base_info), &switches).await?;
+    apply_ums_mounts(manager, &usb_info, last_usb_info.as_ref()).await?;
 
-    if switches_changed || needs_initial_bind {
-        if let Err(e) = manager.preflight_gadget_change().await {
-            warn!(error = ?e, "control apply preflight_gadget_change rejected");
-            return Err(e);
-        }
-        apply_switches(manager, base_info, &switches).await?;
-    } else if paths_changed {
-        if let Err(e) = preflight_ums_path_changes(manager, &usb_info, last_usb_info.as_ref()).await
-        {
-            warn!(error = ?e, "control apply preflight_ums_path_changes rejected");
-            return Err(e);
-        }
-    }
-
-    apply_ums_mounts(manager, &usb_info).await?;
     *last_usb_info = Some(usb_info);
-
     Ok(manager.get_switches())
 }
 
-/// Rebuild gadget when only USB descriptors (VID/PID/strings) change.
-async fn apply_base_info(
-    manager: &mut UsbDeviceManager,
-    base_info: UsbBaseInfo,
-) -> Result<(), UsbError> {
-    manager.update_base_info(base_info).await
-}
-
-/// Rebuild gadget after gadget preflight passes.
 async fn apply_switches(
     manager: &mut UsbDeviceManager,
     base_info: Option<UsbBaseInfo>,
@@ -473,7 +415,10 @@ async fn preflight_ums_path_changes(
 async fn apply_ums_mounts(
     manager: &mut UsbDeviceManager,
     usb_info: &UsbDeviceInfo,
+    last_usb_info: Option<&UsbDeviceInfo>,
 ) -> Result<(), UsbError> {
+    preflight_ums_path_changes(manager, usb_info, last_usb_info).await?;
+
     let switches = usb_info.switches.as_ref();
 
     if let Some(s) = switches {
@@ -526,8 +471,9 @@ fn proto_vm_type_to_mode(vm_type: i32) -> UmsMode {
 }
 
 pub fn is_switches_change(a: &DeviceSwitches, b: &DeviceSwitches) -> bool {
-    a.hid_kb_rel_enabled != b.hid_kb_rel_enabled
+    a.hid_kb_enabled != b.hid_kb_enabled
         || a.hid_abs_enabled != b.hid_abs_enabled
+        || a.hid_rel_enabled != b.hid_rel_enabled
         || a.ums_vm_enabled != b.ums_vm_enabled
         || a.ums_ft_enabled != b.ums_ft_enabled
         || a.uac1_enabled != b.uac1_enabled
@@ -538,4 +484,50 @@ fn is_paths_change(a: &UsbDeviceInfo, b: &UsbDeviceInfo) -> bool {
     a.ums_vm_path != b.ums_vm_path
         || a.ums_ft_path != b.ums_ft_path
         || a.ums_vm_type != b.ums_vm_type
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_switches(ums_ft: bool) -> DeviceSwitches {
+        DeviceSwitches {
+            hid_kb_enabled: true,
+            hid_abs_enabled: true,
+            hid_rel_enabled: true,
+            ums_vm_enabled: true,
+            ums_ft_enabled: ums_ft,
+            uac1_enabled: false,
+            uvc_enabled: false,
+        }
+    }
+
+    #[test]
+    fn is_switches_change_reports_identical_switches() {
+        let a = sample_switches(true);
+        let b = sample_switches(true);
+        assert!(!is_switches_change(&a, &b));
+    }
+
+    #[test]
+    fn is_switches_change_reports_ft_toggle() {
+        let a = sample_switches(true);
+        let b = sample_switches(false);
+        assert!(is_switches_change(&a, &b));
+    }
+
+    #[test]
+    fn is_paths_change_reports_ft_path_diff() {
+        let a = UsbDeviceInfo {
+            switches: Some(sample_switches(true)),
+            ums_vm_path: String::new(),
+            ums_ft_path: "/a.img".into(),
+            ums_vm_type: UmsVmType::VmCdRom as i32,
+        };
+        let b = UsbDeviceInfo {
+            ums_ft_path: "/b.img".into(),
+            ..a.clone()
+        };
+        assert!(is_paths_change(&a, &b));
+    }
 }

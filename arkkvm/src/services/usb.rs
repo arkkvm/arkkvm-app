@@ -124,8 +124,9 @@ pub fn usb_info_from_devices_with_paths(
 ) -> UsbDeviceInfo {
     UsbDeviceInfo {
         switches: Some(DeviceSwitches {
-            hid_kb_rel_enabled: devices.keyboard,
+            hid_kb_enabled: devices.keyboard,
             hid_abs_enabled: devices.absolute_mouse,
+            hid_rel_enabled: devices.relative_mouse,
             ums_vm_enabled: devices.mass_storage_vm,
             ums_ft_enabled: devices.mass_storage_ft,
             uac1_enabled: devices.microphone,

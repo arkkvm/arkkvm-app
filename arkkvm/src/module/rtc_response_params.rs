@@ -131,18 +131,9 @@ pub struct VlanSettingsResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct PendingVlanSettings {
-    #[serde(flatten)]
-    pub settings: VlanSettingsResponse,
-    pub confirm_seconds_remaining: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct GetVlanSettingsResponse {
     pub settings: VlanSettingsResponse,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pending_settings: Option<PendingVlanSettings>,
-    /// Present while pending: VLAN IPs the UI should use for confirmation.
+    /// Optional redirect hints (primary/secondary IPv4) after apply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redirect: Option<VlanRedirectInfo>,
 }
@@ -165,6 +156,5 @@ pub struct VlanRedirectInfo {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SetVlanSettingsResponse {
-    pub confirm_within_seconds: u64,
     pub redirect: VlanRedirectInfo,
 }

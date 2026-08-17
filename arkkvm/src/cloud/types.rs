@@ -104,6 +104,7 @@ pub struct OtaInfo {
     pub app_url: Option<String>,
     pub app_hash: Option<String>,
     pub system_version: Option<String>,
+    pub system_summary: Option<String>,
     pub system_url: Option<String>,
     pub system_hash_signature: Option<String>,
 }

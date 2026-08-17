@@ -603,11 +603,14 @@ impl RemoteFs {
         let full_path = self.resolve_path(file_path)?;
         debug!("Deleting file: {:?}", full_path);
 
-        fs::remove_file(&full_path)
-            .await
-            .with_context(|| format!("Failed to delete file: {:?}", full_path))?;
-
-        debug!("Successfully deleted file: {:?}", full_path);
+        if full_path.exists() {
+            fs::remove_file(&full_path)
+                .await
+                .with_context(|| format!("Failed to delete file: {:?}", full_path))?;
+            debug!("Successfully deleted file: {:?}", full_path);
+        } else {
+            debug!("File does not exist: {:?}", full_path);
+        }
         Ok(())
     }
 

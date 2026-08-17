@@ -24,13 +24,14 @@ use libc::{
     AF_INET6,
 };
 
+pub mod fqdn;
 pub mod settings;
 pub mod ssh;
 pub mod mdns;
-pub mod static_ip_config;
+pub mod legacy_migrate;
+pub mod network_conf;
+pub mod nwu_bridge;
 pub mod vlan;
-
-const DHCP_RENEW_PATH: &str = "/etc/init.d/S15dhcpcd";
 
 static LINE_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$").expect("invalid udhcpc info regex")
@@ -590,33 +591,43 @@ impl NetworkInterfaceState {
     }
 
     pub async fn get_dhcp_lease(&self) -> Option<DhcpLease> {
-        let content = read_udhcpc_info_file(&self.interface_name).await?;
-        parse_dhcp_lease_from_info(&content).await
+        let from_file = match read_udhcpc_info_file(&self.interface_name).await {
+            Some(content) => parse_dhcp_lease_from_info(&content).await,
+            None => None,
+        };
+        let from_runtime = build_dhcp_lease_from_runtime(&self.interface_name).await;
+        merge_dhcp_leases(from_file, from_runtime)
     }
 
-    /// VLAN-only: build DHCP info from runtime network state, not udhcpc .info files.
+    /// Build DHCP lease for API responses (lease file + runtime enrichment).
+    pub async fn get_enriched_dhcp_lease(&self) -> Option<DhcpLease> {
+        self.get_dhcp_lease().await
+    }
+
+    /// @deprecated Use get_enriched_dhcp_lease — kept for internal callers.
     pub async fn get_dhcp_lease_from_interface(&self) -> Option<DhcpLease> {
-        build_dhcp_lease_from_runtime(&self.interface_name).await
+        self.get_dhcp_lease().await
     }
 
     pub async fn renew_dhcp_lease(&self) -> Result<()> {
-        info!("DHCP lease renewal requested");
-        
-        let output = Command::new(DHCP_RENEW_PATH)
-            .arg("restart")
-            .output()
-            .await
-            .context("Failed to execute DHCP RENEW command")?;
-        
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let err_msg = format!("DHCP renew failed: {}", stderr);
-            error!("{}", &err_msg);
-            return Err(anyhow::anyhow!(err_msg));
+        let report = vlan::get_effective_vlan_config_report().await;
+        let iface = if report.vlan_enabled {
+            report
+                .primary_vlan_id
+                .map(vlan::vlan_iface_name)
+                .unwrap_or_else(|| self.interface_name.clone())
+        } else {
+            self.interface_name.clone()
+        };
+        if iface != self.interface_name {
+            info!(
+                "VLAN mode: renewing DHCP on primary interface {iface} (not {})",
+                self.interface_name
+            );
+        } else {
+            info!("DHCP lease renewal requested for {iface}");
         }
-        
-        info!("DHCP renew command completed successfully");
-        Ok(())
+        nwu_bridge::dhcp_renew(Some(&iface)).await
     }
 
     /// Get global IPv6 address
@@ -754,6 +765,8 @@ async fn parse_dhcp_lease_from_info(content: &str) -> Option<DhcpLease> {
         }
     }
 
+    sanitize_dhcp_lease_ipv4_fields(&mut lease);
+
     let has_any = lease.ip.is_some()
         || lease.netmask.is_some()
         || lease.broadcast.is_some()
@@ -817,6 +830,7 @@ async fn build_dhcp_lease_from_runtime(interface_name: &str) -> Option<DhcpLease
     let gateway = get_gateway_for_interface(interface_name, &primary.ip).await;
     let dns_servers = read_ipv4_dns_servers_from_resolv_conf().await;
     let hostname = read_system_hostname().await;
+    let domain = read_domain_from_resolv_conf().await;
     let ipv4_addresses: Vec<String> = entries.iter().map(|entry| entry.ip.clone()).collect();
 
     let mut lease = DhcpLease {
@@ -826,7 +840,7 @@ async fn build_dhcp_lease_from_runtime(interface_name: &str) -> Option<DhcpLease
         ttl: None,
         mtu: None,
         hostname,
-        domain: None,
+        domain,
         bootp_next_server: gateway.clone(),
         bootp_server_name: None,
         bootp_file: None,
@@ -856,6 +870,106 @@ async fn build_dhcp_lease_from_runtime(interface_name: &str) -> Option<DhcpLease
     };
     lease.is_empty = Some(build_is_empty_map(&lease));
     Some(lease)
+}
+
+fn merge_dhcp_leases(primary: Option<DhcpLease>, fallback: Option<DhcpLease>) -> Option<DhcpLease> {
+    match (primary, fallback) {
+        (None, None) => None,
+        (None, Some(mut f)) => {
+            fill_dhcp_lease_gateway_fallbacks(&mut f);
+            f.is_empty = Some(build_is_empty_map(&f));
+            Some(f)
+        }
+        (Some(mut p), None) => {
+            fill_dhcp_lease_gateway_fallbacks(&mut p);
+            p.is_empty = Some(build_is_empty_map(&p));
+            Some(p)
+        }
+        (Some(mut p), Some(f)) => {
+            let fallback_server_id = f.server_id.clone();
+            let fallback_bootp = f.bootp_next_server.clone();
+            merge_option(&mut p.ip, f.ip);
+            merge_option(&mut p.netmask, f.netmask);
+            merge_option(&mut p.broadcast, f.broadcast);
+            merge_option(&mut p.ttl, f.ttl);
+            merge_option(&mut p.mtu, f.mtu);
+            merge_option(&mut p.hostname, f.hostname);
+            merge_option(&mut p.domain, f.domain);
+            merge_option(&mut p.bootp_next_server, f.bootp_next_server);
+            merge_option(&mut p.bootp_server_name, f.bootp_server_name);
+            merge_option(&mut p.bootp_file, f.bootp_file);
+            merge_option(&mut p.timezone, f.timezone);
+            merge_option_vec(&mut p.routers, f.routers);
+            merge_option_vec(&mut p.dns_servers, f.dns_servers);
+            merge_option_vec(&mut p.ntp_servers, f.ntp_servers);
+            merge_option_vec(&mut p.lpr_servers, f.lpr_servers);
+            merge_option_vec(&mut p._time_servers, f._time_servers);
+            merge_option_vec(&mut p._name_servers, f._name_servers);
+            merge_option_vec(&mut p._log_servers, f._log_servers);
+            merge_option_vec(&mut p._cookie_servers, f._cookie_servers);
+            merge_option_vec(&mut p._wins_servers, f._wins_servers);
+            merge_option(&mut p._swap_server, f._swap_server);
+            merge_option(&mut p.bootsize, f.bootsize);
+            merge_option(&mut p.root_path, f.root_path);
+            merge_option(&mut p.lease, f.lease);
+            merge_option(&mut p.dhcp_type, f.dhcp_type);
+            merge_option(&mut p.server_id, f.server_id);
+            merge_option(&mut p.reason, f.reason);
+            merge_option(&mut p.tftp, f.tftp);
+            merge_option(&mut p.bootfile, f.bootfile);
+            merge_option(&mut p.uptime, f.uptime);
+            merge_option(&mut p.lease_expiry, f.lease_expiry);
+            merge_option_vec(&mut p.ipv4_addresses, f.ipv4_addresses);
+            // DHCP server / bootp: legacy UI expects these when gateway is known
+            if p.server_id.is_none() {
+                p.server_id = p
+                    .routers
+                    .as_ref()
+                    .and_then(|r| r.first())
+                    .cloned()
+                    .or(fallback_server_id);
+            }
+            if p.bootp_next_server.is_none() {
+                p.bootp_next_server = p.server_id.clone().or(fallback_bootp);
+            }
+            fill_dhcp_lease_gateway_fallbacks(&mut p);
+            p.is_empty = Some(build_is_empty_map(&p));
+            Some(p)
+        }
+    }
+}
+
+fn merge_option<T>(dst: &mut Option<T>, src: Option<T>) {
+    if dst.is_none() {
+        *dst = src;
+    }
+}
+
+fn merge_option_vec(dst: &mut Option<Vec<String>>, src: Option<Vec<String>>) {
+    let empty = dst.as_ref().map(|v| v.is_empty()).unwrap_or(true);
+    if empty {
+        *dst = src;
+    }
+}
+
+async fn read_domain_from_resolv_conf() -> Option<String> {
+    let content = fs::read_to_string("/etc/resolv.conf").await.ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("search ") {
+            let first = rest.split_whitespace().next()?;
+            if !first.is_empty() {
+                return Some(first.to_string());
+            }
+        }
+        if let Some(rest) = line.strip_prefix("domain ") {
+            let domain = rest.split_whitespace().next()?;
+            if !domain.is_empty() {
+                return Some(domain.to_string());
+            }
+        }
+    }
+    None
 }
 
 async fn get_ipv4_addresses_via_ip(interface_name: &str) -> Vec<String> {
@@ -949,10 +1063,49 @@ fn parse_via_gateway(line: &str) -> Option<String> {
     let parts: Vec<_> = line.split_whitespace().collect();
     for (idx, part) in parts.iter().enumerate() {
         if *part == "via" {
-            return parts.get(idx + 1).map(|value| value.to_string());
+            let gw = parts.get(idx + 1)?.to_string();
+            if check_valid_ipv4(&gw) {
+                return Some(gw);
+            }
+            return None;
         }
     }
     None
+}
+
+/// Drop iface-name placeholders (e.g. eth0.6) that bad lease sync used to store.
+fn sanitize_dhcp_lease_ipv4_fields(lease: &mut DhcpLease) {
+    if let Some(routers) = lease.routers.as_mut() {
+        routers.retain(|r| check_valid_ipv4(r));
+        if routers.is_empty() {
+            lease.routers = None;
+        }
+    }
+    if lease
+        .server_id
+        .as_ref()
+        .is_some_and(|v| !check_valid_ipv4(v))
+    {
+        lease.server_id = None;
+    }
+    if lease
+        .bootp_next_server
+        .as_ref()
+        .is_some_and(|v| !check_valid_ipv4(v))
+    {
+        lease.bootp_next_server = None;
+    }
+}
+
+fn fill_dhcp_lease_gateway_fallbacks(lease: &mut DhcpLease) {
+    sanitize_dhcp_lease_ipv4_fields(lease);
+    // Do not invent gateway/server from DNS — only sanitize invalid iface-name values.
+    if lease.server_id.is_none() {
+        lease.server_id = lease.routers.as_ref().and_then(|r| r.first()).cloned();
+    }
+    if lease.bootp_next_server.is_none() {
+        lease.bootp_next_server = lease.server_id.clone();
+    }
 }
 
 async fn read_ipv4_dns_servers_from_resolv_conf() -> Option<Vec<String>> {

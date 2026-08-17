@@ -19,7 +19,7 @@ enum HidAbsCmd {
     Stop,
     Open(PathBuf),
     AbsMouseReport([u8; 6]),
-    MouseWheelReport([u8; 2]),
+    MouseWheelReport([u8; 3]),
 }
 
 pub struct HidAbsController {
@@ -42,11 +42,12 @@ impl HidAbsController {
         self.handle.submit(HidAbsCmd::AbsMouseReport(d));
     }
 
-    pub async fn abs_mouse_wheel(&self, y: i8) {
-        if y == 0 {
+    pub async fn abs_mouse_wheel(&self, y: i8, x: i8) {
+        if y == 0 && x == 0 {
             return;
         }
-        self.handle.submit(HidAbsCmd::MouseWheelReport([2, y as u8]));
+        self.handle
+            .submit(HidAbsCmd::MouseWheelReport([2, y as u8, x as u8]));
     }
 }
 

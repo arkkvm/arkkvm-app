@@ -13,9 +13,7 @@ use tracing::{info, warn};
 
 use super::hid_io::{prepare_hid_write_file, set_std_file_non_blocking, write_all_with_timeout, HID_WRITE_TIMEOUT};
 
-use crate::config::{
-    HID_KB_REL_INSTANCE, HID_KB_REL_PROTOCOL, HID_KB_REL_REPORT_LENGTH, HID_KB_REL_SUBCLASS,
-};
+use crate::config::{HID_KB_INSTANCE, HID_KB_PROTOCOL, HID_KB_REPORT_LENGTH, HID_KB_SUBCLASS};
 use crate::events::{ChangeRequest, ChangeResponse, UsbChangeHandler};
 use crate::proto::v1::KeyboardState;
 
@@ -26,8 +24,7 @@ const LED_CMD_POLL: Duration = Duration::from_millis(100);
 enum HidKbWriteCmd {
     Stop,
     Open(PathBuf),
-    KeyboardReport([u8; 9]),
-    RelMouseReport([u8; 5]),
+    KeyboardReport([u8; 8]),
 }
 
 #[derive(Debug)]
@@ -36,31 +33,24 @@ enum HidKbLedCmd {
     Open(PathBuf),
 }
 
-pub struct HidKbRelController {
-    handle: Arc<HidKbRelHandle>,
+pub struct HidKbController {
+    handle: Arc<HidKbHandle>,
 }
 
-impl HidKbRelController {
-    pub fn new(handle: Arc<HidKbRelHandle>) -> Self {
+impl HidKbController {
+    pub fn new(handle: Arc<HidKbHandle>) -> Self {
         Self { handle }
     }
 
     pub async fn keyboard_report(&self, mods: u8, keys: &[u8]) {
-        let mut d = [0u8; 9];
-        d[0] = 1;
-        d[1] = mods;
-        d[3..3 + keys.len().min(6)].copy_from_slice(keys);
+        let mut d = [0u8; 8];
+        d[0] = mods;
+        d[2..2 + keys.len().min(6)].copy_from_slice(keys);
         self.handle.submit_write(HidKbWriteCmd::KeyboardReport(d));
-    }
-
-    pub async fn rel_mouse_report(&self, dx: i8, dy: i8, btns: u8) {
-        self.handle.submit_write(HidKbWriteCmd::RelMouseReport([
-            2, btns, dx as u8, dy as u8, 0,
-        ]));
     }
 }
 
-pub struct HidKbRelHandle {
+pub struct HidKbHandle {
     name: String,
     enabled: AtomicBool,
     udc_updating: AtomicBool,
@@ -74,7 +64,7 @@ pub struct HidKbRelHandle {
     _led_publisher: TokioJoinHandle<()>,
 }
 
-impl HidKbRelHandle {
+impl HidKbHandle {
     pub fn new(enabled: bool) -> Arc<Self> {
         let (write_tx, write_rx) = std_mpsc::sync_channel(IO_CHANNEL_CAP);
         let (led_tx, led_rx) = std_mpsc::sync_channel(IO_CHANNEL_CAP);
@@ -82,16 +72,15 @@ impl HidKbRelHandle {
         let led_publisher = tokio::spawn(async move {
             while let Some(state) = led_event_rx.recv().await {
                 if let Err(e) = crate::control::zenoh::send_keyboard_led_event(state).await {
-                    warn!("HidKbRel: failed to publish keyboard LED event: {}", e);
+                    warn!("HidKb: failed to publish keyboard LED event: {}", e);
                 }
             }
         });
         let led_event_tx_for_thread = led_event_tx;
         let write_handle = thread::spawn(move || hid_kb_write_loop(write_rx));
-        let led_handle =
-            thread::spawn(move || hid_kb_led_loop(led_rx, led_event_tx_for_thread));
+        let led_handle = thread::spawn(move || hid_kb_led_loop(led_rx, led_event_tx_for_thread));
         Arc::new(Self {
-            name: HID_KB_REL_INSTANCE.to_owned(),
+            name: HID_KB_INSTANCE.to_owned(),
             enabled: AtomicBool::new(enabled),
             udc_updating: AtomicBool::new(false),
             warned_disabled: AtomicBool::new(false),
@@ -117,13 +106,13 @@ impl HidKbRelHandle {
     fn submit_write(&self, cmd: HidKbWriteCmd) {
         if !self.enabled.load(Ordering::Acquire) {
             if !self.warned_disabled.swap(true, Ordering::AcqRel) {
-                warn!(device = %self.name, "HidKbRel: device disabled, dropping reports");
+                warn!(device = %self.name, "HidKb: device disabled, dropping reports");
             }
             return;
         }
         if self.udc_updating.load(Ordering::Acquire) {
             if !self.warned_updating.swap(true, Ordering::AcqRel) {
-                warn!(device = %self.name, "HidKbRel: gadget updating, dropping reports");
+                warn!(device = %self.name, "HidKb: gadget updating, dropping reports");
             }
             return;
         }
@@ -136,16 +125,12 @@ impl HidKbRelHandle {
             *cache = None;
             return;
         }
-        match super::resolve_hid_device_path(
-            HID_KB_REL_PROTOCOL,
-            HID_KB_REL_SUBCLASS,
-            HID_KB_REL_REPORT_LENGTH,
-        )
-        .await
+        match super::resolve_hid_device_path(HID_KB_PROTOCOL, HID_KB_SUBCLASS, HID_KB_REPORT_LENGTH)
+            .await
         {
             Ok(path) => *cache = Some(path),
             Err(e) => {
-                warn!(device = %self.name, error = ?e, "HidKbRel: failed to resolve device path");
+                warn!(device = %self.name, error = ?e, "HidKb: failed to resolve device path");
                 *cache = None;
             }
         }
@@ -187,7 +172,7 @@ fn hid_kb_write_loop(cmd_rx: std_mpsc::Receiver<HidKbWriteCmd>) {
     let mut warned_open = false;
     let mut warned_write = false;
 
-    info!("HidKbRel write thread started");
+    info!("HidKb write thread started");
 
     loop {
         let cmd = if file.is_some() {
@@ -221,12 +206,12 @@ fn hid_kb_write_loop(cmd_rx: std_mpsc::Receiver<HidKbWriteCmd>) {
                     Ok(f) => {
                         prepare_hid_write_file(&f);
                         file = Some(f);
-                        info!(path = %path.display(), "HidKbRel: write device opened");
+                        info!(path = %path.display(), "HidKb: write device opened");
                     }
                     Err(e) => {
                         if !warned_open {
                             warned_open = true;
-                            warn!(path = %path.display(), error = %e, "HidKbRel: failed to open write device");
+                            warn!(path = %path.display(), error = %e, "HidKb: failed to open write device");
                         }
                     }
                 }
@@ -237,32 +222,13 @@ fn hid_kb_write_loop(cmd_rx: std_mpsc::Receiver<HidKbWriteCmd>) {
                         if !warned_write {
                             warned_write = true;
                             if e.kind() == std::io::ErrorKind::TimedOut {
-                                warn!(len = d.len(), "HidKbRel: keyboard report write timed out");
+                                warn!(len = d.len(), "HidKb: keyboard report write timed out");
                             } else {
                                 warn!(
                                     len = d.len(),
                                     error = %e,
                                     kind = ?e.kind(),
-                                    "HidKbRel: keyboard report write failed"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            HidKbWriteCmd::RelMouseReport(d) => {
-                if let Some(f) = file.as_mut() {
-                    if let Err(e) = write_all_with_timeout(f, &d, HID_WRITE_TIMEOUT) {
-                        if !warned_write {
-                            warned_write = true;
-                            if e.kind() == std::io::ErrorKind::TimedOut {
-                                warn!(len = d.len(), "HidKbRel: rel mouse report write timed out");
-                            } else {
-                                warn!(
-                                    len = d.len(),
-                                    error = %e,
-                                    kind = ?e.kind(),
-                                    "HidKbRel: rel mouse report write failed"
+                                    "HidKb: keyboard report write failed"
                                 );
                             }
                         }
@@ -272,7 +238,7 @@ fn hid_kb_write_loop(cmd_rx: std_mpsc::Receiver<HidKbWriteCmd>) {
         }
     }
 
-    info!("HidKbRel write thread stopped");
+    info!("HidKb write thread stopped");
 }
 
 fn hid_kb_led_loop(cmd_rx: std_mpsc::Receiver<HidKbLedCmd>, led_pub_tx: mpsc::Sender<KeyboardState>) {
@@ -282,7 +248,7 @@ fn hid_kb_led_loop(cmd_rx: std_mpsc::Receiver<HidKbLedCmd>, led_pub_tx: mpsc::Se
     let mut warned_open = false;
     let mut warned_read = false;
 
-    info!("HidKbRel LED thread started");
+    info!("HidKb LED thread started");
 
     loop {
         let cmd = if file.is_some() {
@@ -315,12 +281,12 @@ fn hid_kb_led_loop(cmd_rx: std_mpsc::Receiver<HidKbLedCmd>, led_pub_tx: mpsc::Se
                         Ok(f) => {
                             let _ = set_std_file_non_blocking(&f);
                             file = Some(f);
-                            info!(path = %path.display(), "HidKbRel: LED device opened");
+                            info!(path = %path.display(), "HidKb: LED device opened");
                         }
                         Err(e) => {
                             if !warned_open {
                                 warned_open = true;
-                                warn!(path = %path.display(), error = %e, "HidKbRel: failed to open LED device");
+                                warn!(path = %path.display(), error = %e, "HidKb: failed to open LED device");
                             }
                         }
                     }
@@ -331,9 +297,9 @@ fn hid_kb_led_loop(cmd_rx: std_mpsc::Receiver<HidKbLedCmd>, led_pub_tx: mpsc::Se
         if let Some(f) = file.as_mut() {
             loop {
                 match f.read(&mut led_buf) {
-                    Ok(n) if n >= 2 => {
+                    Ok(n) if n >= 1 => {
                         warned_read = false;
-                        let state = parse_keyboard_state(led_buf[1]);
+                        let state = parse_keyboard_state(led_buf[0]);
                         if last_led.replace(state) != Some(state) {
                             let _ = led_pub_tx.blocking_send(state);
                         }
@@ -345,7 +311,7 @@ fn hid_kb_led_loop(cmd_rx: std_mpsc::Receiver<HidKbLedCmd>, led_pub_tx: mpsc::Se
                         last_led = None;
                         if !warned_read {
                             warned_read = true;
-                            warn!(error = %e, kind = ?e.kind(), "HidKbRel: LED read failed");
+                            warn!(error = %e, kind = ?e.kind(), "HidKb: LED read failed");
                         }
                         break;
                     }
@@ -354,11 +320,11 @@ fn hid_kb_led_loop(cmd_rx: std_mpsc::Receiver<HidKbLedCmd>, led_pub_tx: mpsc::Se
         }
     }
 
-    info!("HidKbRel LED thread stopped");
+    info!("HidKb LED thread stopped");
 }
 
 #[async_trait]
-impl UsbChangeHandler for HidKbRelHandle {
+impl UsbChangeHandler for HidKbHandle {
     fn name(&self) -> &str {
         self.name.as_str()
     }

@@ -29,7 +29,7 @@ use crate::module::rtc_response_params::OtaState;
 use crate::webrtc::get_current_session;
 
 const OTA_PACKAGE_PATH: &str = "/userdata/arkkvm/ota/arkkvm_ota.tar";
-const OTA_PACKAGE_ROOT_PATH: &str = "/ota/img";
+pub const OTA_PACKAGE_ROOT_PATH: &str = "/ota/img";
 const OTA_CLI: &str = "rk_ota";
 const OTA_WAIT_TIME: Duration = Duration::from_mins(20);
 const SLEEP_TIME: Duration = Duration::from_mins(1);
@@ -60,6 +60,7 @@ lazy_static::lazy_static! {
 pub struct VersionInfo {
     pub app_version: String,
     pub system_version: String,
+    pub system_summary: String,
     pub web_version: String,
 }
 
@@ -149,7 +150,7 @@ pub async fn check_update(by_user: bool) -> Result<UpdateInfo> {
     let mut info = OTA_INFO.write().await;
     *info = Some(ota_info.clone());
     drop(info);
-    debug!("OTA Info: {:?}", ota_info);
+    info!("check_update: by_user: {}, auto_update: {}, OTA Info: {:?}", by_user, auto_update, ota_info);
 
     let has_update = ota_info.system_url.is_some();
     if !by_user && auto_update {
@@ -165,6 +166,7 @@ pub async fn check_update(by_user: bool) -> Result<UpdateInfo> {
         update: VersionInfo {
             app_version: ota_info.app_version.unwrap_or_default(),
             system_version: ota_info.system_version.unwrap_or_default(),
+            system_summary: ota_info.system_summary.unwrap_or_default(),
             web_version: String::new(),
         },
         app_update_available: ota_info.app_url.is_some(),
@@ -186,7 +188,7 @@ pub async fn get_current_version(is_show: bool) -> Result<VersionInfo> {
     let system_version = common::get_system_version().await?;
     let app_version = common::get_app_version(is_show);
     let web_version = common::get_web_version(is_show).await;
-    Ok(VersionInfo { app_version, system_version, web_version })
+    Ok(VersionInfo { app_version, system_version, system_summary: String::new(), web_version })
 }
 
 /// Calculate SHA256 hash of a file

@@ -60,6 +60,7 @@ pub async fn init_rustls_config(
     local_ip_v6: Option<IpAddr>,
     certificate: Option<String>,
     private_key: Option<String>,
+    extra_fqdns: &[String],
 ) -> anyhow::Result<RustlsConfig> {
     let mut domains = vec![
         "localhost".to_string(),
@@ -67,19 +68,16 @@ pub async fn init_rustls_config(
         "::1".to_string(),       // IPv6 loopback
     ];
 
-    // Add mDNS hostname (e.g., arkkvm.local) to certificate
     let config = get_config_manager();
     let network_config = config.get().await.network_config;
-    if let Some(hostname) = &network_config.hostname {
-        let fqdn = if hostname.ends_with(".local.") {
-            hostname.clone()
-        } else {
-            format!("{}.local.", hostname)
-        };
-        domains.push(fqdn);
-    } else {
-        // Default hostname if not configured
-        domains.push("arkkvm.local.".to_string());
+    let hostname = network_config.hostname.as_deref().unwrap_or("");
+    let domain = network_config.domain.as_deref().unwrap_or("");
+    let fqdn = crate::network::fqdn::build_network_fqdn(hostname, domain).await?;
+    domains.push(fqdn);
+    for extra in extra_fqdns {
+        if !extra.is_empty() && !domains.iter().any(|d| d == extra) {
+            domains.push(extra.clone());
+        }
     }
 
     if let Some(local_ip) = local_ip {

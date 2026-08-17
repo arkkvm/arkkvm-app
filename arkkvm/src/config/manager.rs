@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use bcrypt::{DEFAULT_COST, hash, verify};
 use chrono::Utc;
+use reqwest::Url;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -11,7 +13,7 @@ use uuid::Uuid;
 const AUTH_TOKEN_VALIDITY_SECS: i64 = 7 * 24 * 3600;
 
 use crate::config::persistence::ConfigPersistence;
-use crate::config::types::{Config, NetworkConfig, UsbConfig, UsbDevices};
+use crate::config::types::{Config, NetworkConfig, UsbConfig, UsbDevices, VirtualMediaItem};
 use crate::hardware::usb::storage::FileTransferTarget;
 use crate::jiggler::JigglerConfig;
 use crate::jsonrpc::handlers::UsbDevicesState;
@@ -298,7 +300,7 @@ impl ConfigManager {
     pub async fn set_usb_devices_state(&self, state: &UsbDevicesState) -> Result<()> {
         self.update(|config| {
             config.usb_devices.keyboard = state.keyboard;
-            config.usb_devices.relative_mouse = state.keyboard;
+            config.usb_devices.relative_mouse = state.relative_mouse;
             config.usb_devices.absolute_mouse = state.absolute_mouse;
             config.usb_devices.mass_storage_vm = state.mass_storage;
             config.usb_devices.microphone = state.microphone;
@@ -327,7 +329,7 @@ impl ConfigManager {
     pub async fn set_usb_devices(&self, devices: &UsbDevices) -> Result<()> {
         self.update(|config| {
             config.usb_devices.keyboard = devices.keyboard;
-            config.usb_devices.relative_mouse = devices.keyboard;
+            config.usb_devices.relative_mouse = devices.relative_mouse;
             config.usb_devices.absolute_mouse = devices.absolute_mouse;
             config.usb_devices.mass_storage_vm = devices.mass_storage_vm;
             config.usb_devices.mass_storage_ft = devices.mass_storage_ft;
@@ -351,7 +353,7 @@ impl ConfigManager {
         UsbDevicesState {
             keyboard: config.usb_devices.keyboard,
             absolute_mouse: config.usb_devices.absolute_mouse,
-            relative_mouse: config.usb_devices.keyboard,
+            relative_mouse: config.usb_devices.relative_mouse,
             mass_storage: config.usb_devices.mass_storage_vm,
             microphone: config.usb_devices.microphone,
         }
@@ -515,6 +517,84 @@ impl ConfigManager {
     /// Check if configuration file exists
     pub fn config_exists(&self) -> bool {
         self.persistence.exists()
+    }
+
+    pub async fn get_virtual_media_list(&self) -> Option<Vec<VirtualMediaItem>> {
+        self.get().await.virtual_media_list.clone()
+    }
+
+    pub async fn add_virtual_media_item(&self, item: VirtualMediaItem) -> Result<()> {
+        self.check_virtual_media_item(&item)?;
+        
+        let list = self.get().await.virtual_media_list.clone();
+        if let Some(mut list) = list {
+            if let Some(old) = list.iter().find(|p| p.name == item.name || p.url == item.url) {
+                return Err(anyhow!("Virtual media({:?}) already exists", old));
+            }
+
+            list.push(item);
+            self.update(|config| {
+                config.virtual_media_list = Some(list);
+            }).await
+        }
+        else {
+            self.update(|config| {
+                config.virtual_media_list = Some(vec![item]);
+            }).await
+        }
+    }
+
+    pub async fn remove_virtual_media_item(&self, name: &str) -> Result<()> {
+        if name.is_empty() {
+            return Err(anyhow!("Virtual media name cannot be empty"));
+        }
+
+        self.update(|config| {
+            config.virtual_media_list.as_mut().map(|list| {
+                list.retain(|item| item.name != name);
+            });
+        }).await
+    }
+
+    pub async fn update_virtual_media_list(&self, list: Option<Vec<VirtualMediaItem>>) -> Result<()> {
+        if let Some(list) = list.as_ref() {
+            let mut name_map: HashMap<String, bool> = HashMap::new();
+            let mut url_map: HashMap<String, bool> = HashMap::new();
+            for item in list {
+                self.check_virtual_media_item(&item)?;
+
+                if name_map.contains_key(&item.name) {
+                    return Err(anyhow!("Virtual media name({}) can not repeat", item.name));
+                }
+                if url_map.contains_key(&item.url) {
+                    return Err(anyhow!("Virtual media URL({}) can not repeat", item.url));
+                }
+
+                name_map.insert(item.name.clone(), true);
+                url_map.insert(item.url.clone(), true);
+            }
+        }
+        
+        self.update(|config| {
+            config.virtual_media_list = list;
+        })
+        .await
+    }
+
+    fn check_virtual_media_item(&self, item: &VirtualMediaItem) -> Result<()> {
+        if item.name.is_empty() {
+            return Err(anyhow!("Virtual media name cannot be empty"));
+        }
+
+        if item.url.is_empty() {
+            return Err(anyhow!("Virtual media({}) URL cannot be empty", item.name));
+        }
+
+        if let Err(e) = Url::parse(&item.url) { 
+            return Err(anyhow!("Virtual media({}) URL is not valid: {}", item.name, e));
+        }
+
+        Ok(())
     }
 }
 

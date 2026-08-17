@@ -126,7 +126,7 @@ impl Default for UsbDevices {
             keyboard: true,
             mass_storage_vm: true,
             mass_storage_ft: true,
-            microphone: false,
+            microphone: true,
             camera: false,
         }
     }
@@ -322,7 +322,8 @@ impl Default for NetworkConfig {
         Self {
             hostname: Some("arkkvm".to_owned()),
             http_proxy: None,
-            domain: None,
+            // UI "DHCP Provided"; fqdn treats "dhcp" as lease-derived domain.
+            domain: Some("dhcp".to_owned()),
             ipv4_mode: default_ipv4_mode(),
             static_ipv4: None,
             ipv6_mode: default_ipv6_mode(),
@@ -356,6 +357,14 @@ impl Default for UISwitch {
             hdmi_audio: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VirtualMediaItem {
+    pub name: String,
+    pub url: String,
+    pub icon_key: String
 }
 
 /// Main application configuration
@@ -429,6 +438,9 @@ pub struct Config {
 
     // Device identity
     pub device_id: String,
+
+    #[serde(default)]
+    pub virtual_media_list: Option<Vec<VirtualMediaItem>>,
 }
 
 impl Default for Config {
@@ -468,6 +480,7 @@ impl Default for Config {
             network_config: NetworkConfig::default(),
             default_log_level: "INFO".to_string(),
             device_id: crate::hardware::hw::get_device_id(),
+            virtual_media_list: None,
         }
     }
 }

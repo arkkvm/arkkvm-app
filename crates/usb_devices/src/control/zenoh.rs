@@ -13,7 +13,7 @@ use super::patch::{
     encode_get_response, encode_ums_control_response, get_response_ok,
 };
 use super::service::ControlHandle;
-use crate::control::zenoh_bus::{get_session, init};
+use crate::control::zenoh_bus::{get_session, init, try_get_session};
 use crate::proto::v1::*;
 
 pub const KEY_APPLY: &str = "arkkvm/usb_devices/query/apply_switches";
@@ -38,10 +38,11 @@ pub const KEY_GET_MIC_PROCESS_STATE: &str = "arkkvm/usb_devices/query/get_mic_pr
 pub async fn open_client() -> Result<Session> {
     zenoh::init_log_from_env_or("warn");
 
+    // init() blocks until a zenoh peer is connected (arkkvm listen ready).
     init().await?;
 
     let session = get_session();
-    info!("usb_devices zenoh session opened ");
+    info!("usb_devices zenoh session opened (peer connected)");
     Ok(session)
 }
 
@@ -677,7 +678,7 @@ pub async fn query_apply_runtime(
 
 pub async fn send_keyboard_led_event(state: KeyboardState) -> Result<()> {
     let payload = prost::Message::encode_to_vec(&state);
-    get_session()
+    try_get_session()?
         .put(KEY_EVENT_KEYBOARD_LED, ZBytes::from(payload))
         .await
         .map_err(|e| anyhow::anyhow!("Failed to send keyboard LED event: {}", e))?;
@@ -686,7 +687,7 @@ pub async fn send_keyboard_led_event(state: KeyboardState) -> Result<()> {
 
 pub async fn send_udc_state_event(state: &str) -> Result<()> {
     let payload = prost::Message::encode_to_vec(&UdcStatus { state: state.to_string() });
-    get_session()
+    try_get_session()?
         .put(KEY_EVENT_UDC_STATE, ZBytes::from(payload))
         .await
         .map_err(|e| anyhow::anyhow!("Failed to send UDC state event: {}", e))?;
@@ -695,7 +696,7 @@ pub async fn send_udc_state_event(state: &str) -> Result<()> {
 
 pub async fn send_mic_process_state_event(running: bool) -> Result<()> {
     let payload = prost::Message::encode_to_vec(&MicProcessStateEvent { running });
-    get_session()
+    try_get_session()?
         .put(KEY_EVENT_MIC_PROCESS, ZBytes::from(payload))
         .await
         .map_err(|e| anyhow::anyhow!("Failed to send mic process state event: {}", e))?;

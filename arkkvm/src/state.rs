@@ -26,34 +26,68 @@ impl AppState {
         }
     }
 
-    /// Add a new session to the state
-    pub async fn add_session(&self, session: Arc<Session>) {
+    /// Add a session, replacing any existing session with the same ID.
+    /// Returns the previous session when replaced so the caller can close its
+    /// peer connection. Same-ID replace is required for WebSocket renegotiation
+    /// that reuses `connection_id`; callers must close the returned session and
+    /// must not treat replace as "last session gone" cleanup.
+    pub async fn add_session(&self, session: Arc<Session>) -> Option<Arc<Session>> {
         let session_id = session.id.clone();
-        let (old, count) = {
+        let (previous, count) = {
             let mut sessions = self.sessions.write().await;
-            let old = sessions.insert(session_id.clone(), session);
+            let previous = sessions.insert(session_id.clone(), session);
             let count = sessions.len();
+            if previous.is_some() {
+                warn!(
+                    "Replacing active session {}; caller must close the previous peer",
+                    session_id
+                );
+            }
             info!("Added session, and session length is now {}", count);
-            (old, count)
+            (previous, count)
         };
 
-        // Update current session if this is the first one
-        // let mut current = self.current_session.write().await;
-        // if current.is_none() {
-        //     *current = Some(session_id);
-        // }
-        // drop(current);
-
-        if old.is_none() && count == 1 {
+        // Only the first registered session triggers first-connect side effects.
+        // Same-ID replace keeps count unchanged and must not clear current.
+        if previous.is_none() && count == 1 {
             tokio::spawn(crate::webrtc::on_first_session_connected());
         }
+
+        previous
     }
 
     /// Remove a session from the state
     pub async fn remove_session(&self, session_id: &str) -> Option<Arc<Session>> {
+        self.remove_session_inner(session_id, None).await
+    }
+
+    /// Remove a session only when it owns the peer connection that emitted the
+    /// callback. This prevents a delayed callback from an old connection from
+    /// removing a newer session that happens to reuse the same ID.
+    pub async fn remove_session_for_peer(
+        &self,
+        session_id: &str,
+        peer_connection: &Arc<webrtc::peer_connection::RTCPeerConnection>,
+    ) -> Option<Arc<Session>> {
+        self.remove_session_inner(session_id, Some(peer_connection)).await
+    }
+
+    async fn remove_session_inner(
+        &self,
+        session_id: &str,
+        expected_peer: Option<&Arc<webrtc::peer_connection::RTCPeerConnection>>,
+    ) -> Option<Arc<Session>> {
         let (removed, count) = {
             let mut sessions = self.sessions.write().await;
-            let removed = sessions.remove(session_id);
+            let matches_expected_peer = sessions.get(session_id).is_some_and(|session| {
+                expected_peer.is_none_or(|expected| {
+                    session
+                        .peer_connection
+                        .as_ref()
+                        .is_some_and(|actual| Arc::ptr_eq(actual, expected))
+                })
+            });
+            let removed = matches_expected_peer.then(|| sessions.remove(session_id)).flatten();
             let count = sessions.len();
             if removed.is_some() {
                 info!("Removed session {}, and session length is now {}", session_id, count);
@@ -66,15 +100,17 @@ impl AppState {
             (removed, count)
         };
 
-        // Clear current session if it was the removed one
-        let mut current = self.current_session.write().await;
-        if let Some(ref current_id) = *current
-            && current_id == session_id
-        {
-            *current = None;
+        // A stale callback for a different peer with the same ID must not
+        // clear the replacement's current-session marker.
+        if removed.is_some() {
+            let mut current = self.current_session.write().await;
+            if let Some(ref current_id) = *current
+                && current_id == session_id
+            {
+                *current = None;
+            }
         }
-        drop(current);
-        
+
         if removed.is_some() && count == 0 {
             tokio::spawn(crate::webrtc::on_last_session_disconnected());
         }
@@ -92,13 +128,51 @@ impl AppState {
         *self.current_session.write().await = session_id;
     }
 
+    /// Atomically verify and publish an exact session generation while
+    /// capturing the exact predecessor generation. Holding the sessions read
+    /// lock prevents removal or ID reuse between validation and capture.
+    pub async fn promote_session_if_registered(
+        &self,
+        session: &Arc<Session>,
+    ) -> Result<Option<Arc<Session>>, ()> {
+        let sessions = self.sessions.read().await;
+        if !sessions
+            .get(&session.id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, session))
+        {
+            return Err(());
+        }
+
+        let mut current = self.current_session.write().await;
+        let previous_id = current.replace(session.id.clone());
+        Ok(previous_id.and_then(|id| sessions.get(&id).cloned()))
+    }
+
+    pub async fn set_current_session_if_none(&self, session_id: String) -> bool {
+        let mut current = self.current_session.write().await;
+        if current.is_some() {
+            return false;
+        }
+        *current = Some(session_id);
+        true
+    }
+
+    pub async fn clear_current_session_if(&self, session_id: &str) -> bool {
+        let mut current = self.current_session.write().await;
+        if current.as_deref() != Some(session_id) {
+            return false;
+        }
+        *current = None;
+        true
+    }
+
     /// Get the current active session
     pub async fn get_current_session(&self) -> Option<Arc<Session>> {
         let session_id = {
             let current = self.current_session.read().await;
             current.clone()
         };
-        
+
         if let Some(session_id) = session_id {
             self.get_session_by_id(session_id.as_str()).await
         } else {
@@ -110,6 +184,19 @@ impl AppState {
     pub async fn get_session_by_id(&self, session_id: &str) -> Option<Arc<Session>> {
         let sessions = self.sessions.read().await;
         sessions.get(session_id).cloned()
+    }
+
+    pub async fn session_owns_peer(
+        &self,
+        session_id: &str,
+        peer_connection: &Arc<webrtc::peer_connection::RTCPeerConnection>,
+    ) -> bool {
+        self.sessions.read().await.get(session_id).is_some_and(|session| {
+            session
+                .peer_connection
+                .as_ref()
+                .is_some_and(|registered| Arc::ptr_eq(registered, peer_connection))
+        })
     }
 
     pub async fn update_session_rpc_channel(&self, session_id: &str, rpc_channel: Arc<RTCDataChannel>) {

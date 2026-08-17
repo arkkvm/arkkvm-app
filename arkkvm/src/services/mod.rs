@@ -1,8 +1,11 @@
 
 pub mod audio;
-pub mod virtual_mic;
+pub mod cmd_socket;
+pub mod ft_file;
 pub mod gui_pipeline;
+pub mod local_file;
 pub mod usb;
+pub mod virtual_mic;
 
 pub use usb::get_usb;
 
@@ -30,6 +33,14 @@ pub fn init_gui_pipeline() -> anyhow::Result<()> {
 
 pub fn uninit_gui_pipeline() {
     gui_pipeline::uninit();
+}
+
+pub fn init_cmd_socket() {
+    cmd_socket::init();
+}
+
+pub fn uninit_cmd_socket() {
+    cmd_socket::uninit();
 }
 
 pub async fn init_usb_service() -> anyhow::Result<()> {
