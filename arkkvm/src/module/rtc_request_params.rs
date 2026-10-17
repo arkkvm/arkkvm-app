@@ -144,6 +144,41 @@ pub struct TailscaleParams {
     pub login_server: Option<String>,
 }
 
+#[derive(Deserialize, Serialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NetbirdParams {
+    pub enabled: bool,
+    /// Self-hosted management URL; `None` / empty = NetBird Cloud.
+    #[serde(default)]
+    pub management_url: Option<String>,
+    /// Peer hostname used on registration; `None` / empty = device hostname.
+    #[serde(default)]
+    pub hostname: Option<String>,
+}
+
+/// `setPrivateNetwork`: choose which overlay (if any) runs.
+#[derive(Deserialize, Serialize, Debug)]
+pub struct PrivateNetworkParams {
+    pub target: crate::plugin::private_network::PrivateNetworkTarget,
+}
+
+/// `registerNetbird` / `registerNetbirdForce`. Without a setup key the
+/// response carries an SSO URL. The key is never persisted.
+#[derive(Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NetbirdRegisterParams {
+    #[serde(default)]
+    pub setup_key: Option<String>,
+}
+
+impl std::fmt::Debug for NetbirdRegisterParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetbirdRegisterParams")
+            .field("setup_key", &self.setup_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 #[derive(Deserialize, Serialize, Debug)]
 pub struct VirtualMediaListParams {
     pub list: Vec<VirtualMediaItem>,

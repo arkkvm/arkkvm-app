@@ -95,6 +95,30 @@ pub struct TailscaleStateResponse {
     pub status: Option<plugin::tailscale::StatusResult>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetbirdStateResponse {
+    /// `false` when the root filesystem ships without NetBird (no init script).
+    pub available: bool,
+    pub enabled: bool,
+    /// `None` = NetBird Cloud.
+    pub management_url: Option<String>,
+    pub hostname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_state: Option<plugin::netbird::ConnectionState>,
+    /// NetBird address of this peer (without prefix length).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fqdn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
+    pub status: Option<plugin::netbird::StatusResult>,
+    /// Status could not be read (daemon starting, crashed, ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VlanEndpointResponse {
     pub vlan_id: u16,

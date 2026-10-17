@@ -16,7 +16,7 @@ The firmware targets Rockchip RV1106 (`armv7-unknown-linux-uclibceabihf`). It is
 - **BIOS / out-of-band** — ATX power control, Wake-on-LAN, OTA firmware updates
 - **USB gadget** — Keyboard and mouse, virtual CD/ISO mounting, file transfer, virtual microphone
 - **Web & API** — Browser-based Web UI and JSON-RPC API
-- **Network** — mDNS discovery, SSH, static IP and VLAN, Tailscale plugin
+- **Network** — mDNS discovery, SSH, static IP and VLAN, Tailscale and NetBird plugins
 - **Cloud** — Built-in cloud relay with flexible local and remote access modes
 
 ## Architecture
