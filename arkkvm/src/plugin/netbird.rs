@@ -106,6 +106,17 @@ fn optional_value(stdout: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+/// NetBird emits `null` for empty lists (e.g. `"details": null` without peers);
+/// `#[serde(default)]` only covers *missing* fields, so map `null` to the default too.
+fn null_as_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    use serde::Deserialize;
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 // ---------------------------------------------------------------------------
 // Input validation
 // ---------------------------------------------------------------------------
@@ -292,14 +303,18 @@ pub enum ConnectionState {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct StatusResult {
+    #[serde(deserialize_with = "null_as_default")]
     pub peers: StatusPeers,
     pub cli_version: String,
     pub daemon_version: String,
     /// `Idle` | `Connecting` | `Connected` | `NeedsLogin` | `LoginFailed` | `SessionExpired`.
     /// Empty on clients that predate the field.
     pub daemon_status: String,
+    #[serde(deserialize_with = "null_as_default")]
     pub management: StatusEndpoint,
+    #[serde(deserialize_with = "null_as_default")]
     pub signal: StatusEndpoint,
+    #[serde(deserialize_with = "null_as_default")]
     pub relays: StatusRelays,
     /// Peer address in CIDR notation, e.g. `100.92.1.2/16`.
     pub netbird_ip: String,
@@ -309,6 +324,9 @@ pub struct StatusResult {
     pub fqdn: String,
     pub networks: Option<Vec<String>>,
     pub profile_name: String,
+    /// When the SSO login of this peer expires (RFC 3339). `None` for setup-key
+    /// peers or when login expiration is disabled in the management server.
+    pub session_expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -331,6 +349,7 @@ pub struct StatusRelays {
 pub struct StatusPeers {
     pub total: u32,
     pub connected: u32,
+    #[serde(deserialize_with = "null_as_default")]
     pub details: Vec<StatusPeer>,
 }
 
@@ -749,6 +768,25 @@ mod tests {
         assert_eq!(s.peers.details[0].connection_type, "P2P");
         assert!(s.management.connected);
         assert!(s.is_connected());
+    }
+
+    /// Shape captured from a real ArkKVM (NetBird 0.81.2, NetBird Cloud, no other peers yet).
+    /// Keys / IDs anonymized.
+    const STATUS_DEVICE_NO_PEERS: &str = r#"{"peers":{"total":0,"connected":0,"details":null},"cliVersion":"0.81.2","daemonVersion":"0.81.2","daemonStatus":"Connected","management":{"url":"https://api.netbird.io:443","connected":true,"error":""},"signal":{"url":"https://signal.netbird.io:443","connected":true,"error":""},"relays":{"total":4,"available":4,"details":[{"uri":"stun:stun.netbird.io:443","available":true,"error":""},{"uri":"rels://relay.example.netbird.io:443","available":true,"error":"","transport":"ws"}]},"netbirdIp":"100.84.0.10/16","netbirdIpv6":"fdd8::10/64","publicKey":"AAAA=","usesKernelInterface":false,"wireguardPort":51820,"fqdn":"arkkvm.netbird.cloud","quantumResistance":false,"quantumResistancePermissive":false,"networks":null,"dnsServers":[],"events":[{"id":"x","severity":"INFO","category":"SYSTEM","message":"Network map updated","userMessage":"","timestamp":"2026-10-17T14:59:49.493429405Z","metadata":null}],"lazyConnectionEnabled":true,"profileName":"default","sshServer":{"enabled":false,"sessions":[]},"sessionExpiresAt":"2026-10-18T14:59:47.27214Z"}"#;
+
+    #[test]
+    fn parses_device_status_with_null_lists() {
+        let s = StatusResult::parse_json(STATUS_DEVICE_NO_PEERS).unwrap();
+        assert_eq!(s.compute_connection_state(), ConnectionState::Connected);
+        assert!(s.peers.details.is_empty());
+        assert_eq!(s.peers.total, 0);
+        assert_eq!(s.ip().as_deref(), Some("100.84.0.10"));
+        assert_eq!(s.hostname().as_deref(), Some("arkkvm.netbird.cloud"));
+        assert_eq!(s.relays.available, 4);
+        assert_eq!(s.session_expires_at.as_deref(), Some("2026-10-18T14:59:47.27214Z"));
+
+        let s = StatusResult::parse_json(r#"{"daemonStatus":"Idle","peers":null,"management":null}"#).unwrap();
+        assert_eq!(s.compute_connection_state(), ConnectionState::Offline);
     }
 
     #[test]
