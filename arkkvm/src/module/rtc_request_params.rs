@@ -156,6 +156,12 @@ pub struct NetbirdParams {
     pub hostname: Option<String>,
 }
 
+/// `setPrivateNetwork`: choose which overlay (if any) runs.
+#[derive(Deserialize, Serialize, Debug)]
+pub struct PrivateNetworkParams {
+    pub target: crate::plugin::private_network::PrivateNetworkTarget,
+}
+
 /// `registerNetbird` / `registerNetbirdForce`. Without a setup key the
 /// response carries an SSO URL. The key is never persisted.
 #[derive(Deserialize, Serialize, Default)]

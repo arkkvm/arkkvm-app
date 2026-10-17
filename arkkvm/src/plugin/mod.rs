@@ -8,6 +8,7 @@ use crate::module::{
     rtc_response_params::{NetbirdStateResponse, TailscaleStateResponse},
 };
 pub mod netbird;
+pub mod private_network;
 pub mod tailscale;
 
 macro_rules! has_changed {
