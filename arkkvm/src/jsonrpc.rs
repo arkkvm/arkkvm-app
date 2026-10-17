@@ -38,7 +38,7 @@ use crate::hardware::usb::storage::FileTransferTarget;
 use crate::jiggler::JigglerConfig;
 use crate::jsonrpc::handlers::*;
 use crate::module::rtc_request_params::{
-    ATXPowerParams, BacklightSettingsParams, DisplayRotationParams, FilePathParams, FileUploadParams, FtFileDownloadParams, LocalFileDownloadParams, NetworkSettingsParams, PathParams, RemoveVirtualMediaItemParams, RenewVlanDhcpLeaseParams, SettingSwitchParams, SshKeyParam, TailscaleParams, VersionParams, VirtualMediaListParams, VlanSettingsParams,
+    ATXPowerParams, BacklightSettingsParams, DisplayRotationParams, FilePathParams, FileUploadParams, FtFileDownloadParams, LocalFileDownloadParams, NetworkSettingsParams, PathParams, RemoveVirtualMediaItemParams, RenewVlanDhcpLeaseParams, SettingSwitchParams, SshKeyParam, TailscaleParams, NetbirdParams, NetbirdRegisterParams, VersionParams, VirtualMediaListParams, VlanSettingsParams,
 };
 use crate::module::rtc_response_params::OtaState;
 use crate::services::gui_pipeline;
@@ -699,7 +699,9 @@ pub mod handlers {
     use crate::hardware::usb::storage::{
         self as storage_mod, FileTransferState, FileTransferTarget,
     };
-    use crate::module::rtc_request_params::{LocalFileDownloadParams, SshKeyParam, TailscaleParams};
+    use crate::module::rtc_request_params::{
+        LocalFileDownloadParams, NetbirdParams, NetbirdRegisterParams, SshKeyParam, TailscaleParams,
+    };
     use crate::module::rtc_response_params::{GuiSettingsResponse, StartDownloadResponse};
     use crate::network::{self, NetworkInterfaceState, RpcIPv6Address, RpcNetworkState};
     use crate::services::local_file::{
@@ -816,6 +818,7 @@ pub mod handlers {
         gui_pipeline::set_sleep_time(gui_config.sleep_time).await?;
 
         plugin::reset_tailscale().await?;
+        plugin::reset_netbird().await?;
         info!("Configuration reset to default and saved");
         Ok(Value::Null)
     }
@@ -2469,6 +2472,28 @@ pub mod handlers {
         let result = plugin::register_tailscale_force().await?;
         Ok(serde_json::to_value(result)?)
     }
+
+    pub async fn get_netbird_state() -> Result<Value> {
+        match plugin::get_netbird_state().await {
+            Ok(state) => Ok(serde_json::to_value(state)?),
+            Err(e) => Err(anyhow!("Failed to get netbird state: {}", e)),
+        }
+    }
+
+    pub async fn switch_netbird(params: NetbirdParams) -> Result<Value> {
+        plugin::switch_netbird(params).await?;
+        Ok(Value::Null)
+    }
+
+    pub async fn register_netbird(params: NetbirdRegisterParams) -> Result<Value> {
+        let result = plugin::register_netbird(params).await?;
+        Ok(serde_json::to_value(result)?)
+    }
+
+    pub async fn register_netbird_force(params: NetbirdRegisterParams) -> Result<Value> {
+        let result = plugin::register_netbird_force(params).await?;
+        Ok(serde_json::to_value(result)?)
+    }
 }
 
 /// Broadcast helpers to current session over RPC
@@ -3275,6 +3300,35 @@ pub fn create_default_registry() -> RpcRegistry {
 
     registry.register_async("registerTailscaleForce", |_params| {
         Box::pin(async move { Ok(handlers::register_tailscale_force().await?) })
+    });
+
+    registry.register_async("getNetbirdState", |_params| {
+        Box::pin(async move { Ok(handlers::get_netbird_state().await?) })
+    });
+
+    registry.register_async("switchNetbird", |params| {
+        Box::pin(async move {
+            let params: NetbirdParams =
+                serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
+            Ok(handlers::switch_netbird(params).await?)
+        })
+    });
+
+    // Params are optional: no setup key = SSO login.
+    registry.register_async("registerNetbird", |params| {
+        Box::pin(async move {
+            let params: NetbirdRegisterParams =
+                params.map(serde_json::from_value).transpose()?.unwrap_or_default();
+            Ok(handlers::register_netbird(params).await?)
+        })
+    });
+
+    registry.register_async("registerNetbirdForce", |params| {
+        Box::pin(async move {
+            let params: NetbirdRegisterParams =
+                params.map(serde_json::from_value).transpose()?.unwrap_or_default();
+            Ok(handlers::register_netbird_force(params).await?)
+        })
     });
 
     registry.register_async("collectEvidence", |_params| {
