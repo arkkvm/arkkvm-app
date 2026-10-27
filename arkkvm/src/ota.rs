@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use chrono::{Local, TimeZone};
+use chrono::{DateTime, Local, TimeZone};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use base64::Engine;
@@ -26,7 +26,7 @@ use crate::hardware::usb;
 use crate::jsonrpc::handlers::RebootParams;
 use crate::jsonrpc::{self, handlers};
 use crate::module::rtc_response_params::OtaState;
-use crate::webrtc::get_current_session;
+use crate::webrtc::has_any_session;
 
 const OTA_PACKAGE_PATH: &str = "/userdata/arkkvm/ota/arkkvm_ota.tar";
 pub const OTA_PACKAGE_ROOT_PATH: &str = "/ota/img";
@@ -93,7 +93,13 @@ pub async fn set_auto_update(enabled: bool) -> Result<()> {
 pub async fn check_ota_update_finished() {
     if Path::new(OTA_PACKAGE_ROOT_PATH).exists() {
         info!("OTA Update Finished, Try Lock System");
-        match Command::new(OTA_CLI).args(["--misc=now"]).output().await {
+        match crate::process_spawn::output({
+            let mut cmd = Command::new(OTA_CLI);
+            cmd.args(["--misc=now"]);
+            cmd
+        })
+        .await
+        {
             Ok(output) => {
                 if output.status.success() {
                     info!("Lock System successfully");
@@ -156,9 +162,9 @@ pub async fn check_update(by_user: bool) -> Result<UpdateInfo> {
     if !by_user && auto_update {
         if has_update {
             ready_update(false);
-        } else {
-            run_auto_update();
         }
+        // Ensure the persistent scheduler is running (no-op if already active).
+        run_auto_update();
     }
 
     Ok(UpdateInfo {
@@ -216,52 +222,76 @@ fn run_auto_update() {
     run_loop();
 }
 
+/// Next auto-check time: tomorrow at a random valid local clock time.
+fn next_check_time() -> DateTime<Local> {
+    let mut rng = rand::rng();
+    loop {
+        let naive_date = Local::now().date_naive() + chrono::Duration::days(1);
+        let Some(naive_dt) = naive_date.and_hms_opt(
+            rng.random_range(0..=23),
+            rng.random_range(0..=59),
+            rng.random_range(0..=59),
+        ) else {
+            continue;
+        };
+        match Local.from_local_datetime(&naive_dt) {
+            chrono::LocalResult::Single(dt) => return dt,
+            chrono::LocalResult::Ambiguous(earliest, _) => return earliest,
+            chrono::LocalResult::None => continue,
+        }
+    }
+}
+
 fn run_loop() {
     info!("run_loop: Starting auto update loop");
     AUTO_UPDATE_RUNNING.store(true, std::sync::atomic::Ordering::Relaxed);
     tokio::spawn(async {
-        let time = {
-            let mut rng = rand::rng();
-            (Local::now().date_naive() + chrono::Duration::days(1))
-                .and_hms_opt(
-                    rng.random_range(0..=24),
-                    rng.random_range(0..=60),
-                    rng.random_range(0..=60),
-                )
-                .unwrap()
-        };
-        let time = Local.from_local_datetime(&time).unwrap();
-        let now = Local::now();
-        let duration_until = time.signed_duration_since(now);
-
-        info!(
-            "run_loop: Scheduled next check at {} (current: {}, wait duration: {:?})",
-            time.format("%Y-%m-%d %H:%M:%S"),
-            now.format("%Y-%m-%d %H:%M:%S"),
-            duration_until
-        );
-
         loop {
             if !AUTO_UPDATE_SWITCH.load(std::sync::atomic::Ordering::Relaxed) {
                 warn!("run_loop: AUTO_UPDATE_SWITCH is false, stopping loop");
                 break;
             }
 
+            let target = next_check_time();
             let now = Local::now();
-            if now >= time {
-                info!(
-                    "run_loop: Target time reached ({} >= {}), triggering check_update",
-                    now.format("%Y-%m-%d %H:%M:%S"),
-                    time.format("%Y-%m-%d %H:%M:%S")
+            info!(
+                "run_loop: Scheduled next check at {} (current: {}, wait duration: {:?})",
+                target.format("%Y-%m-%d %H:%M:%S"),
+                now.format("%Y-%m-%d %H:%M:%S"),
+                target.signed_duration_since(now)
+            );
+
+            let mut switch_off = false;
+            while Local::now() < target {
+                if !AUTO_UPDATE_SWITCH.load(std::sync::atomic::Ordering::Relaxed) {
+                    warn!("run_loop: AUTO_UPDATE_SWITCH is false, stopping loop");
+                    switch_off = true;
+                    break;
+                }
+                debug!(
+                    "run_loop: Still waiting, time remaining: {:?}",
+                    target.signed_duration_since(Local::now())
                 );
-                let _ = check_update(false).await;
-                break;
-            } else {
-                let remaining = time.signed_duration_since(now);
-                debug!("run_loop: Still waiting, time remaining: {:?}", remaining);
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
 
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            if switch_off {
+                break;
+            }
+
+            if !AUTO_UPDATE_SWITCH.load(std::sync::atomic::Ordering::Relaxed) {
+                warn!("run_loop: AUTO_UPDATE_SWITCH is false, stopping loop");
+                break;
+            }
+
+            let now = Local::now();
+            info!(
+                "run_loop: Target time reached ({} >= {}), triggering check_update",
+                now.format("%Y-%m-%d %H:%M:%S"),
+                target.format("%Y-%m-%d %H:%M:%S")
+            );
+            let _ = check_update(false).await;
+            // Do not exit: reschedule tomorrow on the next outer-loop iteration.
         }
 
         info!("run_loop: Loop finished, resetting AUTO_UPDATE_RUNNING flag");
@@ -376,7 +406,7 @@ fn ready_update(by_user: bool) {
                         }
 
                         let mut do_update = true;
-                        if get_current_session().await.is_some() {
+                        if has_any_session().await {
                             info!("ready_update: Active session detected, checking USB input time");
                             let elapsed = usb::seconds_since_last_user_input();
                             info!(
@@ -483,7 +513,13 @@ async fn try_install() -> Result<()> {
             let args = ["--misc=update", tar_path_arg.as_str(), save_dir_arg.as_str()];
             info!("try_install: Run OTA command");
             jsonrpc::broadcast_ota_state(OtaState::system_update(50)).await;
-            match Command::new(OTA_CLI).args(args).output().await {
+            match crate::process_spawn::output({
+                let mut cmd = Command::new(OTA_CLI);
+                cmd.args(args);
+                cmd
+            })
+            .await
+            {
                 Ok(output) => {
                     if output.status.success() {
                         jsonrpc::broadcast_ota_state(OtaState::system_update(100)).await;

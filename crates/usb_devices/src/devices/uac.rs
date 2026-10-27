@@ -12,6 +12,10 @@ use crate::config::UAC1_INSTANCE;
 use crate::error::UsbError;
 use crate::events::{ChangeRequest, ChangeResponse, UsbChangeHandler};
 
+/// ISO IN only (mic); capture chmask=0 and FU disabled → no OUT / AC interrupt EP.
+pub const ENDPOINT_IN: u8 = 1;
+pub const ENDPOINT_OUT: u8 = 0;
+
 const ARKKVM_MIC_NAME: &str = "arkkvm_mic";
 const ARKKVM_MIC_PATH: &str = "/oem/usr/bin/arkkvm_mic";
 const RESTART_DELAY: Duration = Duration::from_secs(1);

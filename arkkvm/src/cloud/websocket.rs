@@ -11,10 +11,9 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::{Error, Message};
 use tracing::{debug, error, info, warn};
 
-use super::oidc::OidcAuthenticator;
-use super::types::WebRTCSessionRequest;
-use super::WEBSOCKET_PING_INTERVAL;
-use crate::config::get_config_manager;
+use super::types::{CloudConnectionState, WebRTCSessionRequest};
+use super::{CLOUD_WEBSOCKET_CONNECT_TIMEOUT, WEBSOCKET_LIVENESS_TIMEOUT, WEBSOCKET_PING_INTERVAL};
+use crate::cloud::manager::get_cloud_manager;
 use crate::{common, ota};
 
 // Global write channel for cloud WS
@@ -80,7 +79,17 @@ impl CloudWebSocketClient {
         }
 
         // Connect with request (no initial auth message)
-        let (ws_stream, _) = connect_async(req).await?;
+        let (ws_stream, _) =
+            match tokio::time::timeout(CLOUD_WEBSOCKET_CONNECT_TIMEOUT, connect_async(req)).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => {
+                    anyhow::bail!(
+                        "Cloud WebSocket connect timed out after {:?}",
+                        CLOUD_WEBSOCKET_CONNECT_TIMEOUT
+                    );
+                }
+            };
         let (mut write, mut read) = ws_stream.split();
         info!("Cloud WebSocket connection established");
 
@@ -88,6 +97,10 @@ impl CloudWebSocketClient {
         let (write_tx, mut write_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
         self.write_tx = Some(write_tx.clone());
         cloud_ws_set_tx(Some(write_tx.clone())).await;
+
+        // The handshake has completed, so the manager may now report the
+        // cloud connection as Connected (it stays Connecting until here).
+        get_cloud_manager().set_state(CloudConnectionState::Connected);
 
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
@@ -111,7 +124,7 @@ impl CloudWebSocketClient {
         });
 
         let shutdown_tx_ping = shutdown_tx.clone();
-        tokio::spawn(async move {
+        let ping_task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(WEBSOCKET_PING_INTERVAL).await;
                 if write_tx.send(Message::Ping(bytes::Bytes::new())).is_err() {
@@ -122,9 +135,17 @@ impl CloudWebSocketClient {
             }
         });
 
-        // Handle incoming messages
+        // Handle incoming messages. `last_inbound` tracks the most recent
+        // frame of any kind: the cloud answers every protocol Ping with a
+        // Pong, so a healthy connection never stays silent for long. A socket
+        // stranded by an address change keeps accepting outbound bytes into
+        // the kernel buffer but never receives anything again — the liveness
+        // deadline below is what detects that zombie and forces a reconnect.
         info!("Cloud WebSocket Starting to handle incoming messages");
+        let mut last_inbound = tokio::time::Instant::now();
         loop {
+            let remaining =
+                WEBSOCKET_LIVENESS_TIMEOUT.checked_sub(last_inbound.elapsed()).unwrap_or_default();
             tokio::select! {
                 biased;
                 changed = shutdown_rx.changed() => {
@@ -133,33 +154,53 @@ impl CloudWebSocketClient {
                         break;
                     }
                 }
-                msg = read.next() => {
+                msg = tokio::time::timeout(remaining, read.next()) => {
                     match msg {
-                        None => break,
-                        Some(Ok(msg)) => match msg {
-                            Message::Text(text) => {
-                                if let Err(e) = self.handle_message(&text).await {
-                                    error!("Failed to handle message: {}", e);
+                        Err(_) => {
+                            warn!(
+                                "Cloud WebSocket liveness timeout: no inbound frame for {:?}, closing to reconnect",
+                                WEBSOCKET_LIVENESS_TIMEOUT
+                            );
+                            write_task.abort();
+                            ping_task.abort();
+                            cloud_ws_set_tx(None).await;
+                            anyhow::bail!(
+                                "cloud websocket liveness timeout: no inbound frame for {:?}",
+                                WEBSOCKET_LIVENESS_TIMEOUT
+                            );
+                        }
+                        Ok(None) => break,
+                        Ok(Some(Ok(msg))) => {
+                            last_inbound = tokio::time::Instant::now();
+                            match msg {
+                                Message::Text(text) => {
+                                    if let Err(e) = self.handle_message(&text).await {
+                                        error!("Failed to handle message: {}", e);
+                                    }
                                 }
-                            }
-                            Message::Close(_) => {
-                                info!("WebSocket connection closed by server");
-                                break;
-                            }
-                            Message::Ping(data) => {
-                                if let Some(tx) = &self.write_tx {
-                                    let _ = tx.send(Message::Pong(data));
+                                Message::Close(_) => {
+                                    info!("WebSocket connection closed by server");
+                                    break;
                                 }
+                                Message::Ping(data) => {
+                                    if let Some(tx) = &self.write_tx {
+                                        let _ = tx.send(Message::Pong(data));
+                                    }
+                                }
+                                Message::Pong(_) => {
+                                    debug!("Received pong from cloud");
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         },
-                        Some(Err(e)) => {
+                        Ok(Some(Err(e))) => {
                             match e {
                                 Error::Io(io_err) if io_err.kind() == ErrorKind::UnexpectedEof => {
                                     info!(
                                         "WebSocket connection closed by peer without close_notify (UnexpectedEof)"
                                     );
                                     write_task.abort();
+                                    ping_task.abort();
                                     cloud_ws_set_tx(None).await;
                                     return Err(io_err.into());
                                 }
@@ -170,6 +211,7 @@ impl CloudWebSocketClient {
                                 _ => {
                                     error!("WebSocket error: {}", e);
                                     write_task.abort();
+                                    ping_task.abort();
                                     cloud_ws_set_tx(None).await;
                                     return Err(e.into());
                                 }
@@ -181,8 +223,9 @@ impl CloudWebSocketClient {
         }
         info!("Cloud WebSocket connection closed");
 
-        // Cancel the write task
+        // Cancel the write and ping tasks
         write_task.abort();
+        ping_task.abort();
         cloud_ws_set_tx(None).await;
         Ok(())
     }
@@ -205,15 +248,28 @@ impl CloudWebSocketClient {
                     self.handle_session_request(&parsed).await?;
                 }
                 "new-ice-candidate" => {
-                    if let Some(data) = parsed.get("data") {
-                        if let Some(session) = crate::web::get_global_app_state().get_current_session().await {
-                            let candidate_json = serde_json::to_string(data)?;
-                            if let Err(e) = session.add_ice_candidate(&candidate_json).await {
-                                warn!("Failed to add ICE candidate: {}", e);
+                    if let Some(session_id) =
+                        parsed.get("session_id").and_then(|v| v.as_str())
+                    {
+                        if let Some(data) = parsed.get("data") {
+                            if let Some(session) =
+                                crate::web::get_global_app_state().get_session_by_id(session_id).await
+                            {
+                                let candidate_json = serde_json::to_string(data)?;
+                                if let Err(e) = session.add_ice_candidate(&candidate_json).await {
+                                    warn!("Failed to add ICE candidate: {}", e);
+                                }
+                            } else {
+                                warn!(
+                                    "No session {} for inbound cloud ICE candidate",
+                                    session_id
+                                );
                             }
-                        } else {
-                            warn!("No current session for ICE candidate");
                         }
+                    } else {
+                        warn!(
+                            "Dropping cloud ICE candidate without top-level session_id (fail-closed)"
+                        );
                     }
                 }
                 "session_request" => {
@@ -237,41 +293,37 @@ impl CloudWebSocketClient {
         Ok(())
     }
 
-    /// Handle WebRTC session requests from cloud
+    /// Handle WebRTC session requests from cloud.
+    ///
+    /// No identity check here (doc 05 §2): the relayed offer is already
+    /// authorized by the cloud (the client WS passed BelongsToUser); the
+    /// legacy oidcGoogle comparison below never executed (serde rename
+    /// mismatch, F2) and its token was stale anyway (F9).
     async fn handle_session_request(&self, message: &Value) -> Result<()> {
         info!("Handling cloud session request");
+
+        let client_id = super::signaling_frame::parse_client_id(message);
 
         if let Some(data) = message.get("data") {
             let request: WebRTCSessionRequest = serde_json::from_value(data.clone())?;
 
-            // Verify OIDC token and match identity against stored config
-            if let Some(oidc_token) = &request.oidc_google {
-                let oidc_auth = OidcAuthenticator::new().await?;
-                let google_identity = oidc_auth.verify_token_skip_client_id(oidc_token).await?;
-
-                let config_manager = get_config_manager();
-                let cfg = config_manager.get().await;
-                let expected = cfg
-                    .google_identity
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Cloud identity not configured"))?;
-                if expected != &google_identity {
-                    return Err(anyhow::anyhow!("Google identity mismatch"));
-                }
-                debug!("OIDC token verified and identity matched for cloud session");
-            }
-
             // Create WebRTC session
-            self.create_cloud_webrtc_session(request).await?;
+            self.create_cloud_webrtc_session(request, client_id).await?;
         }
 
         Ok(())
     }
 
     /// Create WebRTC session for cloud connection
-    async fn create_cloud_webrtc_session(&self, request: WebRTCSessionRequest) -> Result<()> {
+    async fn create_cloud_webrtc_session(
+        &self,
+        request: WebRTCSessionRequest,
+        client_id: Option<String>,
+    ) -> Result<()> {
+        use crate::session::SessionRole;
+        use crate::state::ClaimRoleResult;
         use crate::web::get_global_app_state;
-        use crate::webrtc::{SessionConfig, get_webrtc_api};
+        use crate::webrtc::{IceServerConfig, SessionConfig, get_webrtc_api, resolve_ice_servers};
 
         info!("Creating cloud WebRTC session");
 
@@ -281,11 +333,31 @@ impl CloudWebSocketClient {
         // Get WebRTC API
         let webrtc_api = get_webrtc_api().await;
 
+        let role = match request.client_type.as_deref() {
+            None | Some("") => SessionRole::User,
+            Some(s) => SessionRole::parse(s)
+                .ok_or_else(|| anyhow::anyhow!("Invalid clientType: {s}"))?,
+        };
+
+        let credentialed: Vec<IceServerConfig> = request
+            .ice_servers_cred
+            .into_iter()
+            .map(|c| IceServerConfig {
+                urls: c.urls,
+                username: c.username,
+                credential: c.credential,
+            })
+            .collect();
+        // Prefer iceServersCred (TURN) when present; else bare iceServers (STUN).
+        let ice_servers = resolve_ice_servers(credentialed, request.ice_servers);
+
         // Create session configuration
         let session_config = SessionConfig {
-            ice_servers: Some(request.ice_servers),
+            ice_servers,
             local_ip: request.ip.and_then(|ip| ip.parse().ok()),
             is_cloud: true, // Mark as cloud session
+            role,
+            cloud_client_id: client_id.clone(),
         };
 
         // Generate session ID
@@ -311,28 +383,70 @@ impl CloudWebSocketClient {
             }
         };
 
-        // Send response back to cloud
-        if let Err(e) = self.send_session_response(&answer, &session_id).await {
+        match crate::webrtc::claim_and_activate_session(app_state.clone(), session.clone()).await? {
+            ClaimRoleResult::Accepted { .. } => {}
+            ClaimRoleResult::RejectedOccupied => {
+                let err = super::signaling_frame::build_agent_occupied_error(
+                    &session_id,
+                    client_id.as_deref(),
+                );
+                if let Some(tx) = &self.write_tx {
+                    let message = Message::Text(err.to_string().as_str().into());
+                    let _ = tx.send(message);
+                }
+                crate::webrtc::remove_and_close_session(&app_state, &session_id).await;
+                return Err(anyhow::anyhow!("Agent session slot is already occupied"));
+            }
+            ClaimRoleResult::RejectedMcpDisabled => {
+                let err = super::signaling_frame::build_agent_mcp_disabled_error(
+                    &session_id,
+                    client_id.as_deref(),
+                );
+                if let Some(tx) = &self.write_tx {
+                    let message = Message::Text(err.to_string().as_str().into());
+                    let _ = tx.send(message);
+                }
+                crate::webrtc::remove_and_close_session(&app_state, &session_id).await;
+                return Err(anyhow::anyhow!("MCP is disabled on the device"));
+            }
+            ClaimRoleResult::NotRegistered => {
+                crate::webrtc::remove_and_close_session(&app_state, &session_id).await;
+                return Err(anyhow::anyhow!("session is no longer registered"));
+            }
+        }
+
+        // Send response back to cloud only after successful claim
+        if let Err(e) = self
+            .send_session_response(
+                &answer,
+                &session_id,
+                Some(role.as_str()),
+                client_id.as_deref(),
+            )
+            .await
+        {
             crate::webrtc::remove_and_close_session(&app_state, &session_id).await;
             return Err(e);
         }
-
-        crate::webrtc::handle_session_takeover(app_state.clone(), session.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to promote cloud WebRTC session: {}", e))?;
 
         info!("Cloud WebRTC session created successfully with id: {}", &session_id);
         Ok(())
     }
 
     /// Send session response back to cloud
-    async fn send_session_response(&self, answer: &str, _session_id: &str) -> Result<()> {
-        let response = json!({
-            "type": "answer",
-            "data": answer,
-        });
-
-        // info!("Sending session response to cloud: {}", response);
+    async fn send_session_response(
+        &self,
+        answer: &str,
+        session_id: &str,
+        client_type: Option<&str>,
+        client_id: Option<&str>,
+    ) -> Result<()> {
+        let response = super::signaling_frame::build_answer_frame(
+            answer,
+            session_id,
+            client_type,
+            client_id,
+        );
 
         if let Some(tx) = &self.write_tx {
             let message = Message::Text(response.to_string().as_str().into());

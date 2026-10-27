@@ -3,15 +3,30 @@ use std::sync::Arc;
 
 use socketioxide::extract::SocketRef;
 use tokio::sync::RwLock;
-use tracing::{debug, warn, info};
-use webrtc::data_channel::RTCDataChannel;
+use tracing::{debug, info, warn};
+use webrtc::data_channel::DataChannel;
+use webrtc::peer_connection::PeerConnection;
 
-use crate::session::Session;
+use crate::session::{Session, SessionRole};
+
+/// Result of claiming a per-role session slot.
+#[derive(Debug)]
+pub enum ClaimRoleResult {
+    /// Slot claimed (or already held by this session). `previous` is the prior holder on user takeover.
+    Accepted { previous: Option<Arc<Session>> },
+    /// Agent slot already held by another session.
+    RejectedOccupied,
+    /// Agent claim refused because device MCP switch is off (ARKKVM-619).
+    RejectedMcpDisabled,
+    /// Session is not registered in `sessions` (or was replaced).
+    NotRegistered,
+}
 
 #[derive(Debug)]
 pub struct AppState {
     pub sessions: RwLock<HashMap<String, Arc<Session>>>,
-    pub current_session: RwLock<Option<String>>,
+    /// Official session id per role (user takeover / agent reject).
+    pub role_sessions: RwLock<HashMap<SessionRole, String>>,
     pub sockets: RwLock<HashMap<String, SocketRef>>,
     pub websocket_ice_queue: RwLock<HashMap<String, Vec<String>>>,
 }
@@ -20,7 +35,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
-            current_session: RwLock::new(None),
+            role_sessions: RwLock::new(HashMap::new()),
             sockets: RwLock::new(HashMap::new()),
             websocket_ice_queue: RwLock::new(HashMap::new()),
         }
@@ -67,7 +82,7 @@ impl AppState {
     pub async fn remove_session_for_peer(
         &self,
         session_id: &str,
-        peer_connection: &Arc<webrtc::peer_connection::RTCPeerConnection>,
+        peer_connection: &Arc<dyn PeerConnection>,
     ) -> Option<Arc<Session>> {
         self.remove_session_inner(session_id, Some(peer_connection)).await
     }
@@ -75,7 +90,7 @@ impl AppState {
     async fn remove_session_inner(
         &self,
         session_id: &str,
-        expected_peer: Option<&Arc<webrtc::peer_connection::RTCPeerConnection>>,
+        expected_peer: Option<&Arc<dyn PeerConnection>>,
     ) -> Option<Arc<Session>> {
         let (removed, count) = {
             let mut sessions = self.sessions.write().await;
@@ -100,15 +115,14 @@ impl AppState {
             (removed, count)
         };
 
-        // A stale callback for a different peer with the same ID must not
-        // clear the replacement's current-session marker.
-        if removed.is_some() {
-            let mut current = self.current_session.write().await;
-            if let Some(ref current_id) = *current
-                && current_id == session_id
-            {
-                *current = None;
-            }
+        // Clear any role slots that pointed at this session id.
+        if let Some(ref removed_session) = removed {
+            let mut roles = self.role_sessions.write().await;
+            roles.retain(|_, id| id != session_id);
+            crate::ip_forward::clear_session(session_id).await;
+            // Drop role write lock before control-lease work.
+            drop(roles);
+            crate::control_lease::on_session_removed(removed_session).await;
         }
 
         if removed.is_some() && count == 0 {
@@ -118,66 +132,84 @@ impl AppState {
         removed
     }
 
-    /// Get the current active session
-    pub async fn get_current_session_id(&self) -> Option<String> {
-        self.current_session.read().await.clone()
-    }
-
-    /// Set the current active session
-    pub async fn set_current_session_id(&self, session_id: Option<String>) {
-        *self.current_session.write().await = session_id;
-    }
-
-    /// Atomically verify and publish an exact session generation while
-    /// capturing the exact predecessor generation. Holding the sessions read
-    /// lock prevents removal or ID reuse between validation and capture.
-    pub async fn promote_session_if_registered(
-        &self,
-        session: &Arc<Session>,
-    ) -> Result<Option<Arc<Session>>, ()> {
+    /// Claim the role slot for `session`.
+    ///
+    /// - User: empty → occupy; other id → takeover (return previous); same id → ok
+    /// - Agent: empty → occupy; other id → RejectedOccupied; same id → ok
+    pub async fn claim_role_slot(&self, session: &Arc<Session>) -> ClaimRoleResult {
         let sessions = self.sessions.read().await;
-        if !sessions
-            .get(&session.id)
-            .is_some_and(|registered| Arc::ptr_eq(registered, session))
-        {
-            return Err(());
+        if !sessions.get(&session.id).is_some_and(|registered| Arc::ptr_eq(registered, session)) {
+            return ClaimRoleResult::NotRegistered;
         }
 
-        let mut current = self.current_session.write().await;
-        let previous_id = current.replace(session.id.clone());
-        Ok(previous_id.and_then(|id| sessions.get(&id).cloned()))
+        let role = session.role;
+        let mut roles = self.role_sessions.write().await;
+        match roles.get(&role) {
+            None => {
+                roles.insert(role, session.id.clone());
+                ClaimRoleResult::Accepted { previous: None }
+            }
+            Some(existing_id) if existing_id == &session.id => {
+                ClaimRoleResult::Accepted { previous: None }
+            }
+            Some(existing_id) => {
+                if role == SessionRole::Agent {
+                    ClaimRoleResult::RejectedOccupied
+                } else {
+                    let previous = sessions.get(existing_id).cloned();
+                    roles.insert(role, session.id.clone());
+                    ClaimRoleResult::Accepted { previous }
+                }
+            }
+        }
     }
 
-    pub async fn set_current_session_if_none(&self, session_id: String) -> bool {
-        let mut current = self.current_session.write().await;
-        if current.is_some() {
+    /// Fill an empty role slot only (ICE-before-claim race). Returns true if this call wrote the slot.
+    pub async fn set_role_slot_if_none(&self, role: SessionRole, session_id: String) -> bool {
+        let mut roles = self.role_sessions.write().await;
+        if roles.contains_key(&role) {
             return false;
         }
-        *current = Some(session_id);
+        roles.insert(role, session_id);
         true
     }
 
-    pub async fn clear_current_session_if(&self, session_id: &str) -> bool {
-        let mut current = self.current_session.write().await;
-        if current.as_deref() != Some(session_id) {
+    /// Clear role slot only if it still holds `session_id`.
+    pub async fn clear_role_slot_if(&self, role: SessionRole, session_id: &str) -> bool {
+        let mut roles = self.role_sessions.write().await;
+        if roles.get(&role).map(|id| id.as_str()) != Some(session_id) {
             return false;
         }
-        *current = None;
+        roles.remove(&role);
         true
     }
 
-    /// Get the current active session
-    pub async fn get_current_session(&self) -> Option<Arc<Session>> {
+    pub async fn get_session_for_role(&self, role: SessionRole) -> Option<Arc<Session>> {
         let session_id = {
-            let current = self.current_session.read().await;
-            current.clone()
+            let roles = self.role_sessions.read().await;
+            roles.get(&role).cloned()
         };
-
         if let Some(session_id) = session_id {
             self.get_session_by_id(session_id.as_str()).await
         } else {
             None
         }
+    }
+
+    pub async fn get_role_slot_id(&self, role: SessionRole) -> Option<String> {
+        self.role_sessions.read().await.get(&role).cloned()
+    }
+
+    /// True when the sessions map is non-empty or any role slot is set.
+    pub async fn has_any_session(&self) -> bool {
+        if !self.sessions.read().await.is_empty() {
+            return true;
+        }
+        !self.role_sessions.read().await.is_empty()
+    }
+
+    pub async fn is_role_slot_holder(&self, session_id: &str) -> bool {
+        self.role_sessions.read().await.values().any(|id| id == session_id)
     }
 
     /// Get a session by ID
@@ -189,7 +221,7 @@ impl AppState {
     pub async fn session_owns_peer(
         &self,
         session_id: &str,
-        peer_connection: &Arc<webrtc::peer_connection::RTCPeerConnection>,
+        peer_connection: &Arc<dyn PeerConnection>,
     ) -> bool {
         self.sessions.read().await.get(session_id).is_some_and(|session| {
             session
@@ -199,13 +231,21 @@ impl AppState {
         })
     }
 
-    pub async fn update_session_rpc_channel(&self, session_id: &str, rpc_channel: Arc<RTCDataChannel>) {
+    pub async fn update_session_rpc_channel(
+        &self,
+        session_id: &str,
+        rpc_channel: Arc<dyn DataChannel>,
+    ) {
         let sessions = self.sessions.read().await;
         let Some(session) = sessions.get(session_id) else {
             warn!("Session not found by id: {session_id}");
             return;
         };
         *session.rpc_channel.write().await = Some(rpc_channel);
+        let session = session.clone();
+        drop(sessions);
+        // Re-push control state once the rpc channel exists (claim may have raced ahead).
+        crate::control_lease::on_rpc_ready(&session).await;
     }
 
     /// Get count of active sessions
@@ -242,5 +282,104 @@ impl AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_with_role(id: &str, role: SessionRole) -> Arc<Session> {
+        Arc::new(Session::new_with_role(id.to_string(), role, false))
+    }
+
+    #[tokio::test]
+    async fn user_takeover_returns_previous() {
+        let state = AppState::new();
+        let first = session_with_role("user-1", SessionRole::User);
+        let second = session_with_role("user-2", SessionRole::User);
+        state.add_session(first.clone()).await;
+        state.add_session(second.clone()).await;
+
+        assert!(matches!(
+            state.claim_role_slot(&first).await,
+            ClaimRoleResult::Accepted { previous: None }
+        ));
+        match state.claim_role_slot(&second).await {
+            ClaimRoleResult::Accepted { previous: Some(prev) } => {
+                assert_eq!(prev.id, "user-1");
+            }
+            other => panic!("expected takeover, got {:?}", other),
+        }
+        assert_eq!(state.get_role_slot_id(SessionRole::User).await.as_deref(), Some("user-2"));
+    }
+
+    #[tokio::test]
+    async fn agent_reject_when_occupied() {
+        let state = AppState::new();
+        let first = session_with_role("agent-1", SessionRole::Agent);
+        let second = session_with_role("agent-2", SessionRole::Agent);
+        state.add_session(first.clone()).await;
+        state.add_session(second.clone()).await;
+
+        assert!(matches!(
+            state.claim_role_slot(&first).await,
+            ClaimRoleResult::Accepted { previous: None }
+        ));
+        assert!(matches!(state.claim_role_slot(&second).await, ClaimRoleResult::RejectedOccupied));
+        assert_eq!(state.get_role_slot_id(SessionRole::Agent).await.as_deref(), Some("agent-1"));
+    }
+
+    #[tokio::test]
+    async fn renegotiation_same_id_allowed() {
+        let state = AppState::new();
+        let session = session_with_role("same", SessionRole::User);
+        state.add_session(session.clone()).await;
+        assert!(matches!(
+            state.claim_role_slot(&session).await,
+            ClaimRoleResult::Accepted { previous: None }
+        ));
+        assert!(matches!(
+            state.claim_role_slot(&session).await,
+            ClaimRoleResult::Accepted { previous: None }
+        ));
+    }
+
+    #[tokio::test]
+    async fn dual_role_coexist() {
+        let state = AppState::new();
+        let user = session_with_role("u", SessionRole::User);
+        let agent = session_with_role("a", SessionRole::Agent);
+        state.add_session(user.clone()).await;
+        state.add_session(agent.clone()).await;
+
+        assert!(matches!(
+            state.claim_role_slot(&user).await,
+            ClaimRoleResult::Accepted { previous: None }
+        ));
+        assert!(matches!(
+            state.claim_role_slot(&agent).await,
+            ClaimRoleResult::Accepted { previous: None }
+        ));
+        assert!(state.get_session_for_role(SessionRole::User).await.is_some());
+        assert!(state.get_session_for_role(SessionRole::Agent).await.is_some());
+        assert!(state.is_role_slot_holder("u").await);
+        assert!(state.is_role_slot_holder("a").await);
+        assert!(state.has_any_session().await);
+    }
+
+    #[tokio::test]
+    async fn remove_session_clears_matching_role_slot_only() {
+        let state = AppState::new();
+        let user = session_with_role("u", SessionRole::User);
+        let agent = session_with_role("a", SessionRole::Agent);
+        state.add_session(user.clone()).await;
+        state.add_session(agent.clone()).await;
+        let _ = state.claim_role_slot(&user).await;
+        let _ = state.claim_role_slot(&agent).await;
+
+        state.remove_session("u").await;
+        assert!(state.get_role_slot_id(SessionRole::User).await.is_none());
+        assert_eq!(state.get_role_slot_id(SessionRole::Agent).await.as_deref(), Some("a"));
     }
 }

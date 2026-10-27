@@ -17,6 +17,9 @@ async fn main() -> anyhow::Result<()> {
             return Err(e);
         }
     };
+
+    #[cfg(feature = "env_dev")]
+    tokio::spawn(common::kmsg::follow());
     
     // Print application logo
     common::log::print_logo();
@@ -49,9 +52,7 @@ async fn main() -> anyhow::Result<()> {
     services::init_gui_pipeline()?;
     services::init_cmd_socket();
 
-    let usb_config = config.get_usb_config().await;
-    let devices = config.get_usb_devices().await;
-    if let Err(e) = usb::reconcile_usb_runtime(usb_config, devices, "init").await {
+    if let Err(e) = usb::mcp_ssh::reconcile_with_ssh_overlay("init").await {
         error!("Initial usb runtime sync failed: {:?}", e);
     } else {
         let state = services::usb::ensure_usb_state().await;

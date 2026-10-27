@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 
 use crate::config::get_config_manager;
 use crate::hardware::usb;
-use crate::webrtc::get_current_session;
+use crate::webrtc::has_any_session;
 
 const INACTIVITY_LIMIT_MIN: u64 = 30;
 
@@ -167,7 +167,7 @@ impl Jiggler {
 
                 // Only consider real user-input timing when a session is active;
                 // without a session there is no user, so treat it as fully idle.
-                let input_offset = if get_current_session().await.is_some() {
+                let input_offset = if has_any_session().await {
                     usb::seconds_since_last_user_input()
                 } else {
                     u64::MAX

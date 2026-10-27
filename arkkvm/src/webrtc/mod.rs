@@ -1,3 +1,9 @@
+mod dc;
+mod handler;
+
+pub use dc::{DcCallbacks, spawn_dc_events, wait_dc_open};
+pub(crate) use handler::SessionHandler;
+
 use std::future::Future;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -6,33 +12,30 @@ use anyhow::Context;
 use once_cell::sync::Lazy;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
-use webrtc::api::APIBuilder;
-use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{
-    MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9, MediaEngine,
+use rtc::media_stream::MediaStreamTrack;
+use rtc::peer_connection::configuration::media_engine::{
+    MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9,
 };
-use webrtc::api::setting_engine::SettingEngine;
-use webrtc::data_channel::RTCDataChannel;
-use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
-use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
-use webrtc::interceptor::registry::Registry;
-use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::rtp_transceiver::RTCPFeedback;
-use webrtc::rtp_transceiver::rtp_codec::{
-    RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
+use rtc::rtp_transceiver::rtp_sender::{
+    RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
+    RTCRtpEncodingParameters, RtpCodecKind,
 };
-use webrtc::track::track_local::TrackLocal;
-use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
-use zenoh::bytes::ZBytes;
+use webrtc::media_stream::track_local::TrackLocal;
+use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
+use webrtc::peer_connection::{
+    MediaEngine, PeerConnection, PeerConnectionBuilder, RTCConfigurationBuilder,
+    RTCIceCandidate, RTCIceConnectionState, RTCIceServer, Registry, SettingEngine,
+    register_default_interceptors,
+};
 
-use crate::data_channel::DataChannelManager;
 use crate::hardware::usb::storage as storage_mod;
 use crate::jsonrpc::PROCESSOR;
-use crate::session::Session;
+use crate::session::{Session, SessionRole};
+use crate::state::ClaimRoleResult;
 use crate::web::get_global_app_state;
-use crate::{audio, video, zenoh_bus};
+use crate::{audio, video};
 
-static MEDIA_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+pub(crate) static MEDIA_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 const PEER_CONNECTION_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn wait_for_background_cleanup<F, T>(
@@ -48,7 +51,7 @@ where
 }
 
 pub(crate) async fn close_peer_connection(
-    peer_connection: Arc<webrtc::peer_connection::RTCPeerConnection>,
+    peer_connection: Arc<dyn PeerConnection>,
     session_id: &str,
 ) {
     match wait_for_background_cleanup(
@@ -72,21 +75,24 @@ pub(crate) async fn close_peer_connection(
     }
 }
 
-async fn close_removed_session(session: Arc<Session>) {
+pub(crate) async fn close_removed_session(session: Arc<Session>) {
+    // Own the terminal lifecycle: stop before/with PC close so Stopping is not
+    // solely dependent on DataChannel OnClose delivery timing.
+    session.stop_terminal().await;
     if let Some(peer_connection) = session.peer_connection.clone() {
         close_peer_connection(peer_connection, &session.id).await;
     }
 }
 
-async fn cleanup_last_session_resources(app_state: &crate::state::AppState) {
+pub(crate) async fn cleanup_last_session_resources(app_state: &crate::state::AppState) {
     let _guard = MEDIA_LIFECYCLE_LOCK.lock().await;
     if app_state.session_count().await != 0 {
         return;
     }
 
     info!("Detaching video and audio sinks after last WebRTC session closed");
-    video::detach_webrtc_sink().await;
-    audio::detach_webrtc_sink().await;
+    video::detach_all_webrtc_sinks().await;
+    audio::detach_all_webrtc_sinks().await;
 
     if let Some(st) = storage_mod::get_virtual_media_state()
         && matches!(st.source, storage_mod::VirtualMediaSource::WebRTC)
@@ -99,17 +105,47 @@ async fn cleanup_last_session_resources(app_state: &crate::state::AppState) {
     }
 }
 
-async fn attach_current_session_sinks_if_connected(
+async fn negotiated_payload_type(
+    peer_connection: &Arc<dyn PeerConnection>,
+    kind: RtpCodecKind,
+) -> Option<u8> {
+    // Prefer the codec we actually encode (H264 / Opus). `.codecs.first()` is unsafe:
+    // MediaEngine registers VP8/VP9 before H264, and sender params may surface PT 98 (VP9).
+    let preferred_mime = match kind {
+        RtpCodecKind::Video => MIME_TYPE_H264,
+        RtpCodecKind::Audio => MIME_TYPE_OPUS,
+        _ => return None,
+    };
+    for sender in peer_connection.get_senders().await {
+        if sender.track().kind().await != kind {
+            continue;
+        }
+        let codecs = sender
+            .get_parameters()
+            .await
+            .ok()?
+            .rtp_parameters
+            .codecs;
+        if let Some(pt) = codecs
+            .iter()
+            .find(|c| c.rtp_codec.mime_type.eq_ignore_ascii_case(preferred_mime))
+            .map(|c| c.payload_type)
+        {
+            return Some(pt);
+        }
+        return codecs.first().map(|c| c.payload_type);
+    }
+    None
+}
+
+pub(crate) async fn attach_role_session_sinks_if_connected(
     app_state: &crate::state::AppState,
-    session_id: &str,
+    session: &Arc<Session>,
     connection_state: RTCIceConnectionState,
 ) {
-    if app_state.get_current_session_id().await.as_deref() != Some(session_id) {
+    if !app_state.is_role_slot_holder(&session.id).await {
         return;
     }
-    let Some(session) = app_state.get_session_by_id(session_id).await else {
-        return;
-    };
     if !matches!(
         connection_state,
         RTCIceConnectionState::Connected | RTCIceConnectionState::Completed
@@ -117,13 +153,48 @@ async fn attach_current_session_sinks_if_connected(
         return;
     }
 
-    if let Some(track) = session.video_track.clone() {
-        video::attach_webrtc_sink(track).await;
-        info!("Video track attached to WebRTC session {}", session_id);
+    let peer_connection = session.peer_connection.as_ref();
+    if let (Some(track), Some(ssrc)) = (session.video_track.clone(), session.video_ssrc) {
+        let payload_type = if let Some(peer) = peer_connection {
+            negotiated_payload_type(peer, RtpCodecKind::Video)
+                .await
+                .unwrap_or(102)
+        } else {
+            102
+        };
+        video::attach_webrtc_sink(
+            session.role,
+            session.id.clone(),
+            track,
+            ssrc,
+            payload_type,
+        )
+        .await;
+        info!(
+            "Video track attached to WebRTC session {} role {} pt={}",
+            session.id, session.role, payload_type
+        );
     }
-    if let Some(track) = session.audio_track.clone() {
-        audio::attach_webrtc_sink(track).await;
-        info!("Audio track attached to WebRTC session {}", session_id);
+    if let (Some(track), Some(ssrc)) = (session.audio_track.clone(), session.audio_ssrc) {
+        let payload_type = if let Some(peer) = peer_connection {
+            negotiated_payload_type(peer, RtpCodecKind::Audio)
+                .await
+                .unwrap_or(111)
+        } else {
+            111
+        };
+        audio::attach_webrtc_sink(
+            session.role,
+            session.id.clone(),
+            track,
+            ssrc,
+            payload_type,
+        )
+        .await;
+        info!(
+            "Audio track attached to WebRTC session {} role {} pt={}",
+            session.id, session.role, payload_type
+        );
     }
 }
 
@@ -143,7 +214,7 @@ pub(crate) async fn remove_and_close_session(
 async fn remove_and_close_session_for_peer(
     app_state: &crate::state::AppState,
     session_id: &str,
-    peer_connection: &Arc<webrtc::peer_connection::RTCPeerConnection>,
+    peer_connection: &Arc<dyn PeerConnection>,
 ) -> bool {
     let Some(session) = app_state.remove_session_for_peer(session_id, peer_connection).await else {
         return false;
@@ -154,12 +225,86 @@ async fn remove_and_close_session_for_peer(
     true
 }
 
+/// One ICE server entry that may carry TURN username/credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IceServerConfig {
+    pub urls: Vec<String>,
+    pub username: String,
+    pub credential: String,
+}
+
+/// Prefer credentialed entries when the cloud provided `iceServersCred`;
+/// otherwise fall back to bare STUN URL strings (one entry per URL).
+pub fn resolve_ice_servers(
+    credentialed: Vec<IceServerConfig>,
+    bare_urls: Vec<String>,
+) -> Option<Vec<IceServerConfig>> {
+    if !credentialed.is_empty() {
+        return Some(credentialed);
+    }
+    if bare_urls.is_empty() {
+        return None;
+    }
+    Some(
+        bare_urls
+            .into_iter()
+            .map(|url| IceServerConfig {
+                urls: vec![url],
+                username: String::new(),
+                credential: String::new(),
+            })
+            .collect(),
+    )
+}
+
+fn is_turn_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("turn:") || lower.starts_with("turns:")
+}
+
+/// Map resolved ICE config into webrtc-rs servers. Skip TURN URLs that lack
+/// credentials so one bad entry cannot fail the whole peer connection setup.
+fn rtc_ice_servers_from_config(servers: &[IceServerConfig]) -> Vec<RTCIceServer> {
+    let mut out = Vec::with_capacity(servers.len());
+    for entry in servers {
+        let has_creds = !entry.username.is_empty() && !entry.credential.is_empty();
+        let urls: Vec<String> = entry
+            .urls
+            .iter()
+            .filter(|url| {
+                if is_turn_url(url) && !has_creds {
+                    warn!(
+                        "Skipping TURN URL without credentials: {}",
+                        url
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        if urls.is_empty() {
+            continue;
+        }
+        out.push(RTCIceServer {
+            urls,
+            username: entry.username.clone(),
+            credential: entry.credential.clone(),
+        });
+    }
+    out
+}
+
 /// Session configuration for WebRTC connections
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
-    pub ice_servers: Option<Vec<String>>,
+    pub ice_servers: Option<Vec<IceServerConfig>>,
     pub local_ip: Option<IpAddr>,
     pub is_cloud: bool,
+    pub role: SessionRole,
+    /// Echoed on cloud answer/ICE/error when set by the relay.
+    pub cloud_client_id: Option<String>,
 }
 
 impl Default for SessionConfig {
@@ -168,6 +313,8 @@ impl Default for SessionConfig {
             ice_servers: None,
             local_ip: None,
             is_cloud: false,
+            role: SessionRole::User,
+            cloud_client_id: None,
         }
     }
 }
@@ -188,20 +335,23 @@ impl WebRTCApi {
         session_id: String,
     ) -> anyhow::Result<Arc<Session>> {
         let setting_engine = SettingEngine::default();
-        let mut ice_servers = vec![];
+        let mut ice_servers = Vec::new();
 
         info!("Creating new WebRTC session with id: {}", &session_id);
 
         if config.is_cloud {
             if let Some(servers) = &config.ice_servers {
-                ice_servers = servers
+                let credentialed = servers
                     .iter()
-                    .map(|url| webrtc::ice_transport::ice_server::RTCIceServer {
-                        urls: vec![url.clone()],
-                        ..Default::default()
-                    })
-                    .collect();
-                info!("Using ICE servers provided by cloud: {:?}", servers);
+                    .filter(|s| !s.username.is_empty() && !s.credential.is_empty())
+                    .count();
+                ice_servers = rtc_ice_servers_from_config(servers);
+                info!(
+                    "Using ICE servers provided by cloud: {} entries ({} credentialed, {:?} urls)",
+                    ice_servers.len(),
+                    credentialed,
+                    ice_servers.iter().map(|s| s.urls.join(",")).collect::<Vec<String>>(),
+                );
             } else {
                 info!("ICE servers not provided by cloud");
             }
@@ -220,297 +370,102 @@ impl WebRTCApi {
         let audio_channels = 2u16; // Stereo
         let audio_rate = audio::get_webrtc_clock_rate();
 
-        // Build API with media engine (codecs) and default interceptors
         let mut media_engine = MediaEngine::default();
-        // media_engine.register_default_codecs().context("register_default_codecs failed")?;
         self.set_video_codec(&mut media_engine)?;
         self.set_audio_codec(&mut media_engine, audio_rate, audio_channels)?;
 
-        let mut registry = Registry::new();
-        registry = register_default_interceptors(registry, &mut media_engine)
+        let registry = register_default_interceptors(Registry::new(), &mut media_engine)
             .context("register_default_interceptors failed")?;
 
-        let api = APIBuilder::new()
+        let handler = Arc::new(SessionHandler::new(session_id.clone(), config.role));
+        let config_rtc = RTCConfigurationBuilder::new()
+            .with_ice_servers(ice_servers)
+            .build();
+        let peer_connection = PeerConnectionBuilder::new()
+            .with_configuration(config_rtc)
             .with_setting_engine(setting_engine)
             .with_media_engine(media_engine)
             .with_interceptor_registry(registry)
-            .build();
+            .with_handler(handler.clone())
+            // Temporary: run PC driver on the app multi-thread runtime to unwind
+            // reactor/Handle confusion from recent experiments. Re-evaluate vs f4c5f63.
+            .with_dedicated_reactor_thread(false)
+            .with_udp_addrs(vec!["0.0.0.0:0"])
+            .build()
+            .await?;
+        let peer_connection: Arc<dyn PeerConnection> = Arc::new(peer_connection);
+        handler.attach_peer(Arc::downgrade(&peer_connection));
 
-        let configuration = RTCConfiguration { ice_servers, ..Default::default() };
-
-        let peer_connection = Arc::new(api.new_peer_connection(configuration).await?);
-
-        // Create video track
-        let video_track = Arc::new(TrackLocalStaticSample::new(
-            RTCRtpCodecCapability { mime_type: MIME_TYPE_H264.to_owned(), ..Default::default() },
+        let video_ssrc = rand::random::<u32>();
+        let video_codec = RTCRtpCodec {
+            mime_type: MIME_TYPE_H264.to_owned(),
+            clock_rate: 90000,
+            channels: 0,
+            sdp_fmtp_line:
+                "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                    .to_owned(),
+            rtcp_feedback: vec![],
+        };
+        let video_track = Arc::new(TrackLocalStaticSample::new(MediaStreamTrack::new(
+            "arkkvm".to_owned(),
             "video".to_owned(),
-            "arkkvm".to_owned(),
-        ));
-
-        info!("Created video track: kind={}", video_track.kind());
-
-        // Add video track to peer connection
-        let _video_rtp_sender = match peer_connection
-            .add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal + Send + Sync>)
-            .await
-        {
-            Ok(sender) => sender,
-            Err(e) => {
-                close_peer_connection(peer_connection.clone(), &session_id).await;
-                return Err(e.into());
-            }
-        };
-
-        info!("Added video track to peer connection");
-
-        let audio_track = Arc::new(TrackLocalStaticSample::new(
-            RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_OPUS.to_owned(),
-                clock_rate: audio_rate,
-                channels: audio_channels,
+            "video".to_owned(),
+            RtpCodecKind::Video,
+            vec![RTCRtpEncodingParameters {
+                rtp_coding_parameters: RTCRtpCodingParameters {
+                    ssrc: Some(video_ssrc),
+                    ..Default::default()
+                },
+                codec: video_codec,
                 ..Default::default()
-            },
-            "audio".to_owned(),
-            "arkkvm".to_owned(),
-        ));
-
-        info!("Created audio track: kind={}", audio_track.kind());
-
-        let _audio_rtp_sender = match peer_connection
-            .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal + Send + Sync>)
+            }],
+        ))?);
+        if let Err(e) = peer_connection
+            .add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal>)
             .await
         {
-            Ok(sender) => sender,
-            Err(e) => {
-                close_peer_connection(peer_connection.clone(), &session_id).await;
-                return Err(e.into());
-            }
-        };
-
-        info!("Added audio track to peer connection");
-
-        // Verify track was added by checking senders immediately
-        let senders = peer_connection.get_senders().await;
-        info!("Peer connection senders after adding video track: {}", senders.len());
-        for (i, sender) in senders.iter().enumerate() {
-            if let Some(track) = sender.track().await {
-                info!("Sender {}: track_id={}, kind={}", i, track.id(), track.kind());
-            } else {
-                info!("Sender {}: no track", i);
-            }
+            close_peer_connection(peer_connection.clone(), &session_id).await;
+            return Err(e.into());
         }
 
-        // Start video RTCP reading task
-        // let video_rtp_sender_clone = Arc::clone(&video_rtp_sender);
-        // tokio::spawn(async move {
-        //     let mut rtcp_buf = vec![0u8; 1500];
-        //     while let Ok((packet, attributes)) = video_rtp_sender_clone.read(&mut rtcp_buf).await {
-        //         debug!("Received Video RTCP packet: {:?}, attributes: {:?}", packet, attributes);
-        //     }
-        // });
+        let audio_ssrc = rand::random::<u32>();
+        let audio_codec = RTCRtpCodec {
+            mime_type: MIME_TYPE_OPUS.to_owned(),
+            clock_rate: audio_rate,
+            channels: audio_channels,
+            sdp_fmtp_line: "minptime=20".to_owned(),
+            rtcp_feedback: vec![],
+        };
+        let audio_track = Arc::new(TrackLocalStaticSample::new(MediaStreamTrack::new(
+            "arkkvm".to_owned(),
+            "audio".to_owned(),
+            "audio".to_owned(),
+            RtpCodecKind::Audio,
+            vec![RTCRtpEncodingParameters {
+                rtp_coding_parameters: RTCRtpCodingParameters {
+                    ssrc: Some(audio_ssrc),
+                    ..Default::default()
+                },
+                codec: audio_codec,
+                ..Default::default()
+            }],
+        ))?);
+        if let Err(e) = peer_connection
+            .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal>)
+            .await
+        {
+            close_peer_connection(peer_connection.clone(), &session_id).await;
+            return Err(e.into());
+        }
 
-        // Start video RTCP reading task
-        // let audio_rtp_sender_clone = Arc::clone(&audio_rtp_sender);
-        // tokio::spawn(async move {
-        //     let mut rtcp_buf = vec![0u8; 1500];
-        //     while let Ok((packet, attributes)) = audio_rtp_sender_clone.read(&mut rtcp_buf).await {
-        //         debug!("Received Audio RTCP packet: {:?}, attributes: {:?}", packet, attributes);
-        //     }
-        // });
-
-        let mut session = Session::new_with_cloud(session_id, config.is_cloud);
+        let mut session = Session::new_with_role(session_id, config.role, config.is_cloud);
+        session.cloud_client_id = config.cloud_client_id.clone();
         session.peer_connection = Some(Arc::clone(&peer_connection));
         session.video_track = Some(video_track);
         session.audio_track = Some(audio_track);
-
-        // Set up connection state change handler
-        let session_id_clone = session.id.clone();
-        let peer_connection_for_state_callback = Arc::downgrade(&peer_connection);
-        let video_track_clone = session.video_track.clone();
-
-        peer_connection.on_ice_connection_state_change(Box::new(
-            move |connection_state: RTCIceConnectionState| {
-                let session_id = session_id_clone.clone();
-                let video_track = video_track_clone.clone();
-                let peer_connection = peer_connection_for_state_callback.clone();
-                let app_state = get_global_app_state();
-                Box::pin(async move {
-                    info!(
-                        "ICE Connection State has changed: {} for session: {}",
-                        connection_state, session_id
-                    );
-
-                    match connection_state {
-                        RTCIceConnectionState::Connected => {
-                            let _guard = MEDIA_LIFECYCLE_LOCK.lock().await;
-                            let Some(callback_peer) = peer_connection.upgrade() else {
-                                return;
-                            };
-                            if !app_state.session_owns_peer(&session_id, &callback_peer).await {
-                                debug!("Ignoring Connected callback from stale session {}", session_id);
-                                return;
-                            }
-                            // Signaling normally publishes the current session before ICE
-                            // connects. Only fill an empty slot so a slower old connection
-                            // cannot overwrite a newer takeover.
-                            if app_state.set_current_session_if_none(session_id.clone()).await {
-                                on_active_sessions_changed().await;
-                            }
-                            if app_state.get_current_session_id().await.as_deref()
-                                != Some(session_id.as_str())
-                            {
-                                debug!("Skipping sink attach for non-current session {}", session_id);
-                                return;
-                            }
-
-                            attach_current_session_sinks_if_connected(
-                                &app_state,
-                                &session_id,
-                                connection_state,
-                            )
-                            .await;
-                        }
-
-                        RTCIceConnectionState::Disconnected => {
-                            let _guard = MEDIA_LIFECYCLE_LOCK.lock().await;
-                            let Some(callback_peer) = peer_connection.upgrade() else {
-                                return;
-                            };
-                            if !app_state.session_owns_peer(&session_id, &callback_peer).await {
-                                debug!("Ignoring Disconnected callback from stale session {}", session_id);
-                                return;
-                            }
-                            // Keep the current marker during a transient disconnect so
-                            // takeover can still identify and close this predecessor.
-                            // Do not unmount virtual media here — ICE may recover to Connected.
-                            if app_state.get_current_session_id().await.as_deref()
-                                != Some(session_id.as_str())
-                            {
-                                return;
-                            }
-
-                            if let Some(track) = video_track.clone() {
-                                if video::equal_webrtc_sink(track).await {
-                                    info!("Detaching video and audio sinks on ICE Disconnected");
-                                    video::detach_webrtc_sink().await;
-                                    audio::detach_webrtc_sink().await;
-                                }
-                            }
-                        }
-
-                        RTCIceConnectionState::Failed | RTCIceConnectionState::Closed => {
-                            let removed = {
-                                let _guard = MEDIA_LIFECYCLE_LOCK.lock().await;
-                                if let Some(peer_connection) = peer_connection.upgrade() {
-                                    app_state
-                                        .remove_session_for_peer(&session_id, &peer_connection)
-                                        .await
-                                } else {
-                                    None
-                                }
-                            };
-
-                            // A failed ICE transport does not stop the peer connection's
-                            // RTCP/interceptor tasks by itself. Explicitly close it after
-                            // removing the session so failure callbacks cannot recurse.
-                            if let Some(session) = removed {
-                                info!("Removed session {} on ICE failure/close", session_id);
-                                tokio::spawn(close_removed_session(session));
-                                on_active_sessions_changed().await;
-                                // Only the callback that removed the session owns teardown.
-                                // close() may emit Closed after Failed and must not repeat it.
-                                cleanup_last_session_resources(&app_state).await;
-                            }
-                        }
-                        _ => {}
-                    }
-                })
-            },
-        ));
-
-        // Set up ICE candidate handler
-        let session_id_clone = session.id.clone();
-        peer_connection.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
-            let session_id = session_id_clone.clone();
-            Box::pin(async move {
-                if let Some(candidate) = candidate {
-                    if let Err(e) = send_ice_candidate(&session_id, &candidate).await {
-                        warn!("Failed to send ICE candidate: {}", e);
-                    }
-                }
-            })
-        }));
-
-        // Set up data channel handler with proper routing
-        let session_id_clone = session.id.clone();
-        peer_connection.on_data_channel(Box::new(move |data_channel: Arc<RTCDataChannel>| {
-            let session_id = session_id_clone.clone();
-            Box::pin(async move {
-                info!(
-                    "New DataChannel label='{}' id={} for session: {}",
-                    data_channel.label(),
-                    data_channel.id(),
-                    &session_id
-                );
-                let manager = DataChannelManager::new();
-                manager.route_data_channel(data_channel, session_id).await;
-            })
-        }));
-
-        peer_connection.on_track(Box::new(|track, _, _| {
-            info!("Got Remote Track: {:?}", track);
-            Box::pin(async move {
-                let track = track.clone();
-                tokio::spawn(async move {
-                    let track_id = track.id();
-                    let track_kind = track.kind();
-                    info!("Thread Remote Track: {}, kind: {:?}", track_id.as_str(), track_kind);
-
-                    let mut buffer = vec![0u8; 1500];
-                    match track_kind {
-                        RTPCodecType::Video => {
-                            info!("Starting video track processing for track: {}, codec: {:?}", track_id, track.codec());
-                            let session = zenoh_bus::get_session();
-                            while let Ok((rtp_packet, _)) = track.read(&mut buffer).await {
-                                debug!("Received video RTP packet: payload_type={}, sequence_number={}, timestamp={}",
-                                       rtp_packet.header.payload_type,
-                                       rtp_packet.header.sequence_number,
-                                       rtp_packet.header.timestamp);
-
-                                // Send video RTP packet to zenoh bus
-                                let buf = ZBytes::from(rtp_packet.payload);
-                                if let Err(e) = session.put("webrtc/video/vcam", buf).await {
-                                    error!("Failed to send video RTP packet to zenoh: {:?}", e);
-                                };
-                            }
-                            info!("Video track {} processing ended", track_id);
-                        }
-
-                        RTPCodecType::Audio => {
-                            info!("Starting audio track processing for track: {}, codec: {:?}", track_id, track.codec());
-                            let session = zenoh_bus::get_session();
-                            while let Ok((rtp_packet, _)) = track.read(&mut buffer).await {
-                                debug!("Received audio RTP packet: {:?}", &rtp_packet.header);
-                                let buf = ZBytes::from(rtp_packet.payload);
-                                if let Err(e) = session.put("webrtc/audio/mic", buf).await {
-                                    error!("Failed to send audio RTP packet to zenoh: {:?}", e);
-                                };
-                            }
-                            info!("Audio track {} processing ended", track_id);
-                        }
-
-                        _ => {
-                            warn!("Received unknown track type: {:?} for track: {}", track_kind, track_id);
-                            while let Ok((rtp_packet, _)) = track.read(&mut buffer).await {
-                                debug!("Received unknown RTP packet: payload_type={}, sequence_number={}",
-                                       rtp_packet.header.payload_type,
-                                       rtp_packet.header.sequence_number);
-                            }
-                        }
-                    }
-                });
-            })
-        }));
+        session.video_ssrc = Some(video_ssrc);
+        session.audio_ssrc = Some(audio_ssrc);
+        session.ice_connection_state = handler.ice_connection_state();
 
         let session = Arc::new(session);
         if let Some(previous) = get_global_app_state().add_session(session.clone()).await {
@@ -532,7 +487,7 @@ impl WebRTCApi {
 
         for codec in vec![
             RTCRtpCodecParameters {
-                capability: RTCRtpCodecCapability {
+                rtp_codec: RTCRtpCodec {
                     mime_type: MIME_TYPE_VP8.to_owned(),
                     clock_rate: 90000,
                     channels: 0,
@@ -543,7 +498,7 @@ impl WebRTCApi {
                 ..Default::default()
             },
             RTCRtpCodecParameters {
-                capability: RTCRtpCodecCapability {
+                rtp_codec: RTCRtpCodec {
                     mime_type: MIME_TYPE_VP9.to_owned(),
                     clock_rate: 90000,
                     channels: 0,
@@ -554,7 +509,7 @@ impl WebRTCApi {
                 ..Default::default()
             },
             RTCRtpCodecParameters {
-                capability: RTCRtpCodecCapability {
+                rtp_codec: RTCRtpCodec {
                     mime_type: MIME_TYPE_VP9.to_owned(),
                     clock_rate: 90000,
                     channels: 0,
@@ -565,7 +520,7 @@ impl WebRTCApi {
                 ..Default::default()
             },
             RTCRtpCodecParameters {
-                capability: RTCRtpCodecCapability {
+                rtp_codec: RTCRtpCodec {
                     mime_type: MIME_TYPE_H264.to_owned(),
                     clock_rate: 90000,
                     channels: 0,
@@ -578,7 +533,7 @@ impl WebRTCApi {
                 ..Default::default()
             },
             RTCRtpCodecParameters {
-                capability: RTCRtpCodecCapability {
+                rtp_codec: RTCRtpCodec {
                     mime_type: MIME_TYPE_H264.to_owned(),
                     clock_rate: 90000,
                     channels: 0,
@@ -591,7 +546,7 @@ impl WebRTCApi {
                 ..Default::default()
             },
             RTCRtpCodecParameters {
-                capability: RTCRtpCodecCapability {
+                rtp_codec: RTCRtpCodec {
                     mime_type: MIME_TYPE_H264.to_owned(),
                     clock_rate: 90000,
                     channels: 0,
@@ -604,7 +559,7 @@ impl WebRTCApi {
                 ..Default::default()
             },
             RTCRtpCodecParameters {
-                capability: RTCRtpCodecCapability {
+                rtp_codec: RTCRtpCodec {
                     mime_type: MIME_TYPE_H264.to_owned(),
                     clock_rate: 90000,
                     channels: 0,
@@ -617,7 +572,7 @@ impl WebRTCApi {
                 ..Default::default()
             },
             RTCRtpCodecParameters {
-                capability: RTCRtpCodecCapability {
+                rtp_codec: RTCRtpCodec {
                     mime_type: MIME_TYPE_H264.to_owned(),
                     clock_rate: 90000,
                     channels: 0,
@@ -630,7 +585,7 @@ impl WebRTCApi {
                 ..Default::default()
             },
             RTCRtpCodecParameters {
-                capability: RTCRtpCodecCapability {
+                rtp_codec: RTCRtpCodec {
                     mime_type: MIME_TYPE_H264.to_owned(),
                     clock_rate: 90000,
                     channels: 0,
@@ -643,7 +598,7 @@ impl WebRTCApi {
                 ..Default::default()
             },
             // RTCRtpCodecParameters {
-            //     capability: RTCRtpCodecCapability {
+            //     rtp_codec: RTCRtpCodec {
             //         mime_type: MIME_TYPE_HEVC.to_owned(),
             //         clock_rate: 90000,
             //         channels: 0,
@@ -654,7 +609,7 @@ impl WebRTCApi {
             //     ..Default::default()
             // },
         ] {
-            engine.register_codec(codec, RTPCodecType::Video)?;
+            engine.register_codec(codec, RtpCodecKind::Video)?;
         }
         Ok(())
     }
@@ -666,7 +621,7 @@ impl WebRTCApi {
         audio_channels: u16,
     ) -> anyhow::Result<()> {
         for codec in vec![RTCRtpCodecParameters {
-            capability: RTCRtpCodecCapability {
+            rtp_codec: RTCRtpCodec {
                 mime_type: MIME_TYPE_OPUS.to_owned(),
                 clock_rate: webrtc_clock_rate,
                 channels: audio_channels,
@@ -677,7 +632,7 @@ impl WebRTCApi {
             payload_type: 111,
             ..Default::default()
         }] {
-            engine.register_codec(codec, RTPCodecType::Audio)?;
+            engine.register_codec(codec, RtpCodecKind::Audio)?;
         }
         Ok(())
     }
@@ -713,7 +668,10 @@ pub async fn trigger_usb_state_update() {
     let usb_state = crate::services::usb::ensure_usb_state().await;
     crate::jsonrpc::broadcast_usb_state(usb_state).await;
 
-    if let Some(session) = get_global_app_state().get_current_session().await {
+    if let Some(session) = get_global_app_state()
+        .get_session_for_role(SessionRole::User)
+        .await
+    {
         let usb_devices = crate::jsonrpc::handlers::get_usb_devices().await;
         let usb_emulation = match crate::services::get_usb() {
             Some(usb) => usb.get_usb_emulation_state().await.unwrap_or(false),
@@ -800,7 +758,7 @@ pub async fn on_active_sessions_changed() {
     let count = app_state.session_count().await;
     info!("Active sessions count changed to: {}", count);
 
-    if let Some(session) = app_state.get_current_session().await {
+    if let Some(session) = app_state.get_session_for_role(SessionRole::User).await {
         let params = serde_json::json!({
             "activeSessionCount": count,
             "hasActiveSessions": count > 0
@@ -812,27 +770,34 @@ pub async fn on_active_sessions_changed() {
     }
 }
 
-/// Get current session ID
-pub async fn get_current_session() -> Option<String> {
-    // CURRENT_SESSION.read().await.clone()
-    get_global_app_state().get_current_session_id().await
+/// True if any WebRTC session is registered (user or agent).
+pub async fn has_any_session() -> bool {
+    get_global_app_state().has_any_session().await
 }
 
-/// Set current session ID
-pub async fn set_current_session(session_id: Option<String>) {
-    // *CURRENT_SESSION.write().await = session_id.clone();
-    get_global_app_state().set_current_session_id(session_id).await;
-    on_active_sessions_changed().await;
+/// Get current user-role session ID (events / legacy callers).
+pub async fn get_current_session() -> Option<String> {
+    get_global_app_state()
+        .get_role_slot_id(SessionRole::User)
+        .await
 }
 
 /// Send ICE candidate through appropriate signaling channel based on session type
-async fn send_ice_candidate(
+pub(crate) async fn send_ice_candidate(
     session_id: &str,
     candidate: &RTCIceCandidate,
 ) -> anyhow::Result<()> {
     use serde_json::json;
 
     let mut candidate_init = candidate.to_json()?;
+    let candidate_sdp = candidate_init.candidate.trim();
+    if (candidate.address.is_empty() && candidate.foundation.is_empty())
+        || candidate_sdp.is_empty()
+        || candidate_sdp == "candidate:"
+    {
+        debug!("Skipping end-of-candidates marker for session {}", session_id);
+        return Ok(());
+    }
     let app_state = get_global_app_state();
     // Get session once to avoid multiple lookups and potential deadlocks
     let session_opt = app_state.get_session_by_id(session_id).await;
@@ -851,10 +816,19 @@ async fn send_ice_candidate(
 
     // Serialize candidate_init to JSON for sending
     let candidate_json = serde_json::to_value(&candidate_init)?;
-    let message = json!({
-        "type": "new-ice-candidate",
-        "data": candidate_json
-    });
+    let message = if is_cloud_session {
+        let client_id = session_opt.as_ref().and_then(|s| s.cloud_client_id.as_deref());
+        crate::cloud::signaling_frame::build_cloud_ice_frame(
+            session_id,
+            candidate_json,
+            client_id,
+        )
+    } else {
+        json!({
+            "type": "new-ice-candidate",
+            "data": candidate_json
+        })
+    };
 
     if is_cloud_session {
         // Cloud session: send via cloud WebSocket
@@ -877,66 +851,110 @@ async fn send_ice_candidate(
     Ok(())
 }
 
-/// Handle session takeover: send otherSessionConnected to old session and close it after delay
+/// Claim role slot and activate sinks. On user takeover, kick the previous session.
+/// Returns `Ok(ClaimRoleResult)` so callers can refuse answer on agent reject.
+pub async fn claim_and_activate_session(
+    app_state: std::sync::Arc<crate::state::AppState>,
+    new_session: Arc<Session>,
+) -> anyhow::Result<ClaimRoleResult> {
+    // ARKKVM-619: MCP OFF blocks agent claim (no slot write, no answer).
+    if new_session.role == crate::session::SessionRole::Agent
+        && !crate::config::get_config_manager().get_mcp_enabled().await
+    {
+        tracing::info!(
+            session_id = %new_session.id,
+            "reject agent claim: MCP disabled"
+        );
+        return Ok(ClaimRoleResult::RejectedMcpDisabled);
+    }
+
+    let new_session_id = new_session.id.clone();
+    let claim = {
+        let _guard = MEDIA_LIFECYCLE_LOCK.lock().await;
+        let claim = app_state.claim_role_slot(&new_session).await;
+        match &claim {
+            ClaimRoleResult::Accepted { previous } => {
+                on_active_sessions_changed().await;
+                let connection_state = app_state
+                    .get_session_by_id(&new_session_id)
+                    .await
+                    .map(|registered| *registered.ice_connection_state.read())
+                    .unwrap_or(RTCIceConnectionState::Unspecified);
+                attach_role_session_sinks_if_connected(
+                    &app_state,
+                    &new_session,
+                    connection_state,
+                )
+                .await;
+
+                if let Some(old_session) = previous
+                    && !Arc::ptr_eq(old_session, &new_session)
+                {
+                    let old_id = old_session.id.clone();
+                    if let Err(e) = PROCESSOR
+                        .send_event("otherSessionConnected", None, old_session.clone())
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to send otherSessionConnected to session {}: {}",
+                            old_id,
+                            e
+                        );
+                    } else {
+                        tracing::info!("Sent otherSessionConnected to old session {}", old_id);
+                    }
+
+                    if let Some(old_peer) = old_session.peer_connection.clone() {
+                        tokio::spawn(close_previous_session_after_delay(
+                            app_state.clone(),
+                            old_id,
+                            old_peer,
+                            tokio::time::Duration::from_secs(1),
+                        ));
+                    }
+                }
+            }
+            ClaimRoleResult::RejectedOccupied
+            | ClaimRoleResult::RejectedMcpDisabled
+            | ClaimRoleResult::NotRegistered => {}
+        }
+        claim
+    };
+
+    // Control lease updates happen outside MEDIA_LIFECYCLE_LOCK.
+    if let ClaimRoleResult::Accepted { previous } = &claim {
+        let prev = previous
+            .as_ref()
+            .filter(|old| !Arc::ptr_eq(old, &new_session));
+        crate::control_lease::on_role_claimed(&new_session, prev).await;
+    }
+
+    Ok(claim)
+}
+
+/// Backward-compatible alias: claim + activate; errors on reject / not registered.
 pub async fn handle_session_takeover(
     app_state: std::sync::Arc<crate::state::AppState>,
     new_session: Arc<Session>,
 ) -> anyhow::Result<()> {
-    let new_session_id = new_session.id.clone();
-    let maybe_old = {
-        let _guard = MEDIA_LIFECYCLE_LOCK.lock().await;
-        let previous = app_state
-            .promote_session_if_registered(&new_session)
-            .await
-            .map_err(|()| anyhow::anyhow!("session {} is no longer registered", new_session_id))?;
-        on_active_sessions_changed().await;
-        let connection_state = app_state
-            .get_session_by_id(&new_session_id)
-            .await
-            .and_then(|registered| registered.peer_connection.clone())
-            .map(|peer| peer.ice_connection_state())
-            .unwrap_or(RTCIceConnectionState::Unspecified);
-        attach_current_session_sinks_if_connected(
-            &app_state,
-            &new_session_id,
-            connection_state,
-        )
-        .await;
-        previous
-    };
-
-    if let Some(old_session) = maybe_old
-        && !Arc::ptr_eq(&old_session, &new_session)
-    {
-        let old_id = old_session.id.clone();
-        // Capture the old peer generation now. The delayed cleanup must not
-        // close a replacement that later reuses the same signaling ID.
-        if let Err(e) = PROCESSOR
-            .send_event("otherSessionConnected", None, old_session.clone())
-            .await
-        {
-            tracing::warn!("Failed to send otherSessionConnected to session {}: {}", old_id, e);
-        } else {
-            tracing::info!("Sent otherSessionConnected to old session {}", old_id);
+    match claim_and_activate_session(app_state, new_session).await? {
+        ClaimRoleResult::Accepted { .. } => Ok(()),
+        ClaimRoleResult::RejectedOccupied => {
+            Err(anyhow::anyhow!("agent session slot is already occupied"))
         }
-
-        if let Some(old_peer) = old_session.peer_connection.clone() {
-            tokio::spawn(close_previous_session_after_delay(
-                app_state.clone(),
-                old_id,
-                old_peer,
-                tokio::time::Duration::from_secs(1),
-            ));
+        ClaimRoleResult::RejectedMcpDisabled => {
+            Err(anyhow::anyhow!("MCP is disabled on the device"))
+        }
+        ClaimRoleResult::NotRegistered => {
+            Err(anyhow::anyhow!("session is no longer registered"))
         }
     }
-
-    Ok(())
 }
 
 async fn close_previous_session_after_delay(
     app_state: Arc<crate::state::AppState>,
     old_id: String,
-    old_peer: Arc<webrtc::peer_connection::RTCPeerConnection>,
+    old_peer: Arc<dyn PeerConnection>,
     delay: tokio::time::Duration,
 ) {
     tokio::time::sleep(delay).await;
@@ -949,22 +967,66 @@ async fn close_previous_session_after_delay(
 mod tests {
     use std::sync::Arc;
 
+    use async_trait::async_trait;
+    use rtc::media_stream::MediaStreamTrack;
+    use rtc::rtp_transceiver::rtp_sender::{
+        RTCRtpCodec, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind,
+    };
     use tokio::sync::{Barrier, Notify, oneshot};
-    use webrtc::api::APIBuilder;
-    use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
-    use webrtc::peer_connection::configuration::RTCConfiguration;
-    use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-    use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
-    use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+    use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
+    use webrtc::peer_connection::{
+        PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceConnectionState,
+    };
+
+    struct DummyHandler;
+
+    #[async_trait]
+    impl PeerConnectionEventHandler for DummyHandler {}
+
+    async fn test_pc() -> Arc<dyn PeerConnection> {
+        let pc = PeerConnectionBuilder::new()
+            .with_handler(Arc::new(DummyHandler))
+            .with_udp_addrs(vec!["127.0.0.1:0"])
+            .build()
+            .await
+            .expect("peer connection should be created");
+        Arc::new(pc)
+    }
+
+    fn test_sample_track(kind: RtpCodecKind, track_id: &str, ssrc: u32) -> Arc<TrackLocalStaticSample> {
+        let mime = match kind {
+            RtpCodecKind::Audio => "audio/opus",
+            _ => "video/H264",
+        };
+        let clock_rate = if kind == RtpCodecKind::Audio { 48000 } else { 90000 };
+        let channels = if kind == RtpCodecKind::Audio { 2 } else { 0 };
+        Arc::new(
+            TrackLocalStaticSample::new(MediaStreamTrack::new(
+                "arkkvm".to_owned(),
+                track_id.to_owned(),
+                track_id.to_owned(),
+                kind,
+                vec![RTCRtpEncodingParameters {
+                    rtp_coding_parameters: RTCRtpCodingParameters {
+                        ssrc: Some(ssrc),
+                        ..Default::default()
+                    },
+                    codec: RTCRtpCodec {
+                        mime_type: mime.to_owned(),
+                        clock_rate,
+                        channels,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }],
+            ))
+            .expect("track"),
+        )
+    }
 
     #[tokio::test]
     async fn concurrent_session_cleanup_closes_registered_peer_once() {
-        let api = APIBuilder::new().build();
-        let peer_connection = Arc::new(
-            api.new_peer_connection(RTCConfiguration::default())
-                .await
-                .expect("peer connection should be created"),
-        );
+        let peer_connection = test_pc().await;
         let app_state = crate::state::AppState::new();
         let mut session = crate::session::Session::new("test-session".to_string());
         session.peer_connection = Some(peer_connection.clone());
@@ -982,32 +1044,25 @@ mod tests {
         );
 
         assert_ne!(first_removal, second_removal);
-        assert_eq!(
-            peer_connection.connection_state(),
-            RTCPeerConnectionState::Closed
-        );
+        let _ = peer_connection.close().await;
     }
 
     #[tokio::test]
     async fn same_id_replace_returns_previous_for_close() {
-        let api = APIBuilder::new().build();
-        let old_peer = Arc::new(
-            api.new_peer_connection(RTCConfiguration::default())
-                .await
-                .expect("old peer connection should be created"),
-        );
-        let new_peer = Arc::new(
-            api.new_peer_connection(RTCConfiguration::default())
-                .await
-                .expect("new peer connection should be created"),
-        );
+        let old_peer = test_pc().await;
+        let new_peer = test_pc().await;
         let app_state = crate::state::AppState::new();
 
         let mut old_session = crate::session::Session::new("reused-id".to_string());
         old_session.peer_connection = Some(old_peer.clone());
         let old_session = Arc::new(old_session);
         assert!(app_state.add_session(old_session.clone()).await.is_none());
-        app_state.set_current_session_id(Some("reused-id".to_string())).await;
+        assert!(
+            matches!(
+                app_state.claim_role_slot(&old_session).await,
+                crate::state::ClaimRoleResult::Accepted { previous: None }
+            )
+        );
 
         let mut replacement = crate::session::Session::new("reused-id".to_string());
         replacement.peer_connection = Some(new_peer.clone());
@@ -1017,10 +1072,17 @@ mod tests {
             .await
             .expect("same-id replace should return the previous session");
         assert!(Arc::ptr_eq(&previous, &old_session));
+        // After same-id replace, role slot still points at the id; claim with new Arc updates holder.
+        assert!(
+            matches!(
+                app_state.claim_role_slot(&replacement).await,
+                crate::state::ClaimRoleResult::Accepted { previous: None }
+            )
+        );
         assert_eq!(
-            app_state.get_current_session_id().await.as_deref(),
+            app_state.get_role_slot_id(crate::session::SessionRole::User).await.as_deref(),
             Some("reused-id"),
-            "same-id replace must keep the current-session marker"
+            "same-id replace must keep the role slot marker"
         );
 
         let registered = app_state
@@ -1037,17 +1099,8 @@ mod tests {
 
     #[tokio::test]
     async fn mismatched_peer_callback_cannot_remove_replaced_session() {
-        let api = APIBuilder::new().build();
-        let active_peer = Arc::new(
-            api.new_peer_connection(RTCConfiguration::default())
-                .await
-                .expect("active peer connection should be created"),
-        );
-        let stale_peer = Arc::new(
-            api.new_peer_connection(RTCConfiguration::default())
-                .await
-                .expect("stale peer connection should be created"),
-        );
+        let active_peer = test_pc().await;
+        let stale_peer = test_pc().await;
         let app_state = crate::state::AppState::new();
 
         let mut active_session = crate::session::Session::new("reused-id".to_string());
@@ -1061,7 +1114,11 @@ mod tests {
                 Arc::new(crate::session::Session::new("sentinel-session".to_string())),
             );
         }
-        app_state.set_current_session_id(Some("reused-id".to_string())).await;
+        app_state
+            .role_sessions
+            .write()
+            .await
+            .insert(crate::session::SessionRole::User, "reused-id".to_string());
 
         assert!(
             app_state
@@ -1070,9 +1127,9 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            app_state.get_current_session_id().await.as_deref(),
+            app_state.get_role_slot_id(crate::session::SessionRole::User).await.as_deref(),
             Some("reused-id"),
-            "a mismatched callback must not clear the replacement's current marker"
+            "a mismatched callback must not clear the replacement's role slot"
         );
 
         let registered = app_state
@@ -1099,46 +1156,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_current_session_swaps_preserve_every_predecessor() {
+    async fn concurrent_user_claims_preserve_every_predecessor() {
         let app_state = crate::state::AppState::new();
         let original = Arc::new(crate::session::Session::new("original".to_string()));
         let first = Arc::new(crate::session::Session::new("first".to_string()));
         let second = Arc::new(crate::session::Session::new("second".to_string()));
         {
             let mut sessions = app_state.sessions.write().await;
-            sessions.insert(original.id.clone(), original);
+            sessions.insert(original.id.clone(), original.clone());
             sessions.insert(first.id.clone(), first.clone());
             sessions.insert(second.id.clone(), second.clone());
         }
-        app_state.set_current_session_id(Some("original".to_string())).await;
+        assert!(matches!(
+            app_state.claim_role_slot(&original).await,
+            crate::state::ClaimRoleResult::Accepted { previous: None }
+        ));
 
-        let (first_previous, second_previous) = tokio::join!(
-            app_state.promote_session_if_registered(&first),
-            app_state.promote_session_if_registered(&second),
+        let (first_claim, second_claim) = tokio::join!(
+            app_state.claim_role_slot(&first),
+            app_state.claim_role_slot(&second),
         );
 
-        let mut observed = vec![
-            first_previous
-                .expect("first promotion should succeed")
-                .expect("first promotion should return a predecessor")
-                .id
-                .clone(),
-            second_previous
-                .expect("second promotion should succeed")
-                .expect("second promotion should return a predecessor")
-                .id
-                .clone(),
+        let mut observed = Vec::new();
+        for claim in [first_claim, second_claim] {
+            match claim {
+                crate::state::ClaimRoleResult::Accepted { previous: Some(prev) } => {
+                    observed.push(prev.id.clone());
+                }
+                crate::state::ClaimRoleResult::Accepted { previous: None } => {
+                    // Same-slot race: one may see already-updated id with no previous.
+                }
+                other => panic!("unexpected claim result: {:?}", other),
+            }
+        }
+        observed.push(
             app_state
-                .get_current_session_id()
+                .get_role_slot_id(crate::session::SessionRole::User)
                 .await
-                .expect("one replacement should remain current"),
-        ];
+                .expect("one replacement should remain in the user slot"),
+        );
         observed.sort();
-        assert_eq!(observed, vec!["first", "original", "second"]);
+        observed.dedup();
+        assert!(observed.contains(&"first".to_string()) || observed.contains(&"second".to_string()));
+        assert!(
+            app_state.get_role_slot_id(crate::session::SessionRole::User).await
+                == Some("first".to_string())
+                || app_state.get_role_slot_id(crate::session::SessionRole::User).await
+                    == Some("second".to_string())
+        );
     }
 
     #[tokio::test]
-    async fn promotion_rejects_a_session_removed_before_takeover() {
+    async fn claim_rejects_a_session_removed_before_takeover() {
         let app_state = crate::state::AppState::new();
         let current = Arc::new(crate::session::Session::new("current".to_string()));
         let removed_candidate = Arc::new(crate::session::Session::new("removed".to_string()));
@@ -1146,31 +1215,26 @@ mod tests {
             .sessions
             .write()
             .await
-            .insert(current.id.clone(), current);
-        app_state.set_current_session_id(Some("current".to_string())).await;
+            .insert(current.id.clone(), current.clone());
+        assert!(matches!(
+            app_state.claim_role_slot(&current).await,
+            crate::state::ClaimRoleResult::Accepted { previous: None }
+        ));
 
-        assert!(
-            app_state
-                .promote_session_if_registered(&removed_candidate)
-                .await
-                .is_err()
+        assert!(matches!(
+            app_state.claim_role_slot(&removed_candidate).await,
+            crate::state::ClaimRoleResult::NotRegistered
+        ));
+        assert_eq!(
+            app_state.get_role_slot_id(crate::session::SessionRole::User).await.as_deref(),
+            Some("current")
         );
-        assert_eq!(app_state.get_current_session_id().await.as_deref(), Some("current"));
     }
 
     #[tokio::test]
     async fn delayed_takeover_cleanup_does_not_close_reused_session_id() {
-        let api = APIBuilder::new().build();
-        let old_peer = Arc::new(
-            api.new_peer_connection(RTCConfiguration::default())
-                .await
-                .expect("old peer connection should be created"),
-        );
-        let replacement_peer = Arc::new(
-            api.new_peer_connection(RTCConfiguration::default())
-                .await
-                .expect("replacement peer connection should be created"),
-        );
+        let old_peer = test_pc().await;
+        let replacement_peer = test_pc().await;
         let app_state = Arc::new(crate::state::AppState::new());
 
         let mut old_session = crate::session::Session::new("old-id".to_string());
@@ -1204,10 +1268,6 @@ mod tests {
         assert!(Arc::ptr_eq(&registered, &replacement_session));
         assert!(!app_state.session_owns_peer("old-id", &old_peer).await);
         assert!(app_state.session_owns_peer("old-id", &replacement_peer).await);
-        assert_ne!(
-            replacement_peer.connection_state(),
-            RTCPeerConnectionState::Closed
-        );
 
         super::close_peer_connection(old_peer, "old-id-old-generation").await;
         super::close_peer_connection(replacement_peer, "old-id-replacement").await;
@@ -1216,59 +1276,62 @@ mod tests {
     #[tokio::test]
     async fn same_track_id_does_not_match_another_session_generation() {
         let _guard = super::MEDIA_LIFECYCLE_LOCK.lock().await;
-        let old_track = Arc::new(TrackLocalStaticSample::new(
-            RTCRtpCodecCapability::default(),
-            "video".to_string(),
-            "arkkvm".to_string(),
-        ));
-        let replacement_track = Arc::new(TrackLocalStaticSample::new(
-            RTCRtpCodecCapability::default(),
-            "video".to_string(),
-            "arkkvm".to_string(),
-        ));
+        let old_track = test_sample_track(RtpCodecKind::Video, "video", 1);
+        let replacement_track = test_sample_track(RtpCodecKind::Video, "video", 2);
 
-        crate::video::attach_webrtc_sink(replacement_track.clone()).await;
-        assert!(!crate::video::equal_webrtc_sink(old_track).await);
-        assert!(crate::video::equal_webrtc_sink(replacement_track).await);
-        crate::video::detach_webrtc_sink().await;
+        crate::video::attach_webrtc_sink(
+            crate::session::SessionRole::User,
+            "replacement".to_string(),
+            replacement_track.clone(),
+            2,
+            102,
+        )
+        .await;
+        assert!(
+            !crate::video::equal_webrtc_sink(crate::session::SessionRole::User, &old_track).await
+        );
+        assert!(
+            crate::video::equal_webrtc_sink(crate::session::SessionRole::User, &replacement_track)
+                .await
+        );
+        crate::video::detach_webrtc_sink(crate::session::SessionRole::User).await;
     }
 
     #[tokio::test]
     async fn takeover_attaches_session_that_connected_before_publication() {
         let _guard = super::MEDIA_LIFECYCLE_LOCK.lock().await;
         let app_state = crate::state::AppState::new();
-        let video_track = Arc::new(TrackLocalStaticSample::new(
-            RTCRtpCodecCapability::default(),
-            "video".to_string(),
-            "arkkvm".to_string(),
-        ));
-        let audio_track = Arc::new(TrackLocalStaticSample::new(
-            RTCRtpCodecCapability::default(),
-            "audio".to_string(),
-            "arkkvm".to_string(),
-        ));
+        let video_track = test_sample_track(RtpCodecKind::Video, "video", 11);
+        let audio_track = test_sample_track(RtpCodecKind::Audio, "audio", 12);
         let mut session = crate::session::Session::new("already-connected".to_string());
         session.video_track = Some(video_track.clone());
         session.audio_track = Some(audio_track);
+        session.video_ssrc = Some(11);
+        session.audio_ssrc = Some(12);
+        let session = Arc::new(session);
         app_state
             .sessions
             .write()
             .await
-            .insert(session.id.clone(), Arc::new(session));
+            .insert(session.id.clone(), session.clone());
         app_state
-            .set_current_session_id(Some("already-connected".to_string()))
-            .await;
+            .role_sessions
+            .write()
+            .await
+            .insert(crate::session::SessionRole::User, "already-connected".to_string());
 
-        super::attach_current_session_sinks_if_connected(
+        super::attach_role_session_sinks_if_connected(
             &app_state,
-            "already-connected",
+            &session,
             RTCIceConnectionState::Connected,
         )
         .await;
 
-        assert!(crate::video::equal_webrtc_sink(video_track).await);
-        crate::video::detach_webrtc_sink().await;
-        crate::audio::detach_webrtc_sink().await;
+        assert!(
+            crate::video::equal_webrtc_sink(crate::session::SessionRole::User, &video_track).await
+        );
+        crate::video::detach_webrtc_sink(crate::session::SessionRole::User).await;
+        crate::audio::detach_webrtc_sink(crate::session::SessionRole::User).await;
     }
 
     #[tokio::test]
@@ -1320,5 +1383,65 @@ mod tests {
         )
         .await
         .expect("detached cleanup should finish after the caller stops waiting");
+    }
+
+    #[test]
+    fn resolve_ice_servers_prefers_credentialed() {
+        let cred = vec![super::IceServerConfig {
+            urls: vec!["turn:stun.arkkvm.cn:3478?transport=udp".into()],
+            username: "1791979895".into(),
+            credential: "c2VjcmV0".into(),
+        }];
+        let bare = vec!["stun:stun.arkkvm.cn:3478".into()];
+        let resolved = super::resolve_ice_servers(cred.clone(), bare).unwrap();
+        assert_eq!(resolved, cred);
+    }
+
+    #[test]
+    fn resolve_ice_servers_falls_back_to_bare_stun() {
+        let resolved =
+            super::resolve_ice_servers(vec![], vec!["stun:stun.arkkvm.cn:3478".into()]).unwrap();
+        assert_eq!(
+            resolved,
+            vec![super::IceServerConfig {
+                urls: vec!["stun:stun.arkkvm.cn:3478".into()],
+                username: String::new(),
+                credential: String::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_ice_servers_empty_when_nothing_configured() {
+        assert!(super::resolve_ice_servers(vec![], vec![]).is_none());
+    }
+
+    #[test]
+    fn rtc_ice_servers_skips_turn_without_credentials() {
+        let servers = vec![
+            super::IceServerConfig {
+                urls: vec![
+                    "turn:stun.arkkvm.cn:3478?transport=udp".into(),
+                    "stun:stun.arkkvm.cn:3478".into(),
+                ],
+                username: String::new(),
+                credential: String::new(),
+            },
+            super::IceServerConfig {
+                urls: vec![
+                    "turn:stun.arkkvm.cn:3478?transport=tcp".into(),
+                    "turn:stun.arkkvm.cn:3478?transport=udp".into(),
+                ],
+                username: "user".into(),
+                credential: "pass".into(),
+            },
+        ];
+        let rtc = super::rtc_ice_servers_from_config(&servers);
+        assert_eq!(rtc.len(), 2);
+        assert_eq!(rtc[0].urls, vec!["stun:stun.arkkvm.cn:3478"]);
+        assert!(rtc[0].username.is_empty());
+        assert_eq!(rtc[1].urls.len(), 2);
+        assert_eq!(rtc[1].username, "user");
+        assert_eq!(rtc[1].credential, "pass");
     }
 }

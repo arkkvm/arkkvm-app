@@ -1860,10 +1860,12 @@ impl FatFsDevice {
         let mut last_error = None;
 
         for cmd_name in &fsck_commands {
-            let output = std::process::Command::new(cmd_name)
-                .args(&["-a", "-v"]) // -a: auto-repair, -v: verbose
-                .arg(&self.image_path)
-                .output();
+            let output = crate::process_spawn::output_std({
+                let mut cmd = std::process::Command::new(cmd_name);
+                cmd.args(&["-a", "-v"]) // -a: auto-repair, -v: verbose
+                    .arg(&self.image_path);
+                cmd
+            });
 
             match output {
                 Ok(output) => {

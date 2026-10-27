@@ -207,6 +207,8 @@ fn schedule_cloud_reconnect_after_apply() {
             ?state0,
             "VLAN/network applied — forcing cloud reconnect; connection loop retries until WAN ready"
         );
+        // `force_reconnect` also releases the CloudManager reconnect gate, so
+        // this stays correct even if a flat-network transition is in flight.
         get_cloud_manager().force_reconnect().await;
     });
 }

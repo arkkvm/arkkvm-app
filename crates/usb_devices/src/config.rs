@@ -12,6 +12,13 @@ pub const GADGET_MAX_POWER_MA: u16 = 500;
 pub const OS_DESC_VENDOR_CODE: u8 = 0x01;
 pub const OS_DESC_QW_SIGN: &str = "MSFT100";
 
+// RV1106BG3 product function endpoint budget (excludes EP0).
+// Silicon inventory (debugfs / GHWPARAMS): IN=9 OUT=5 function slots.
+// Empirical usable budget is tighter on IN (TX FIFO): kb+dual-UMS+UAC+NCM
+// binds at IN=6/OUT=4; adding another mouse IN (7/4) fails with uac1 -ENODEV.
+pub const MAX_FUNCTION_IN_EPS: u8 = 6;
+pub const MAX_FUNCTION_OUT_EPS: u8 = 5;
+
 // HID 0: boot keyboard
 pub const HID_KB_INSTANCE: &str = "usb0";
 pub const HID_KB_PROTOCOL: u8 = 1;
@@ -82,6 +89,9 @@ pub const UVC_FRAME_HEIGHT: u32 = 480;
 // Match script dwFrameInterval: 333333,666666,1000000,2000000 (units: 100ns)
 pub const UVC_FRAME_INTERVALS_100NS: &[u32] = &[333_333, 666_666, 1_000_000, 2_000_000];
 
+// USB network adapter (NCM / RNDIS); board L3 applied by usb_devices.
+pub const NETWORK_ADAPTER_INSTANCE: &str = "usb0";
+
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UsbBaseInfo {
@@ -94,6 +104,9 @@ pub struct UsbBaseInfo {
     pub product: String,
     #[serde(default)]
     pub strict_mode: bool,
+    /// When true, ConfigFS `max_speed` is `full-speed`; otherwise `high-speed`.
+    #[serde(default)]
+    pub force_full_speed: bool,
 }
 
 impl Default for UsbBaseInfo {
@@ -107,6 +120,7 @@ impl Default for UsbBaseInfo {
             manufacturer: "ArkKVM".to_string(),
             product: "Multifunction Composite Gadget".to_string(),
             strict_mode: false,
+            force_full_speed: false,
         }
     }
 }
@@ -120,6 +134,7 @@ pub struct DeviceSwitches {
     pub ums_ft_enabled: bool,  // file transfer (mass_storage.1)
     pub uac1_enabled: bool,    // virtual microphone (uac1.gs0)
     pub uvc_enabled: bool,       // virtual camera (uvc.gs6)
+    pub network_adapter_enabled: bool, // USB net (NCM or RNDIS)
 }
 
 impl Default for DeviceSwitches {
@@ -132,8 +147,17 @@ impl Default for DeviceSwitches {
             ums_ft_enabled: false,
             uac1_enabled: false,
             uvc_enabled: false,
+            network_adapter_enabled: false,
         }
     }
+}
+
+fn network_adapter_enabled(switches: &crate::proto::v1::DeviceSwitches) -> bool {
+    switches
+        .network_adapter
+        .as_ref()
+        .map(|n| n.enable)
+        .unwrap_or(false)
 }
 
 impl crate::proto::v1::DeviceSwitches {
@@ -145,5 +169,6 @@ impl crate::proto::v1::DeviceSwitches {
             || self.ums_ft_enabled
             || self.uac1_enabled
             || self.uvc_enabled
+            || network_adapter_enabled(self)
     }
 }

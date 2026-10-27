@@ -17,6 +17,10 @@ use crate::config::{HID_KB_INSTANCE, HID_KB_PROTOCOL, HID_KB_REPORT_LENGTH, HID_
 use crate::events::{ChangeRequest, ChangeResponse, UsbChangeHandler};
 use crate::proto::v1::KeyboardState;
 
+/// Interrupt IN + OUT (LED); matches `HID_KB_NO_OUT_ENDPOINT = false`.
+pub const ENDPOINT_IN: u8 = 1;
+pub const ENDPOINT_OUT: u8 = 1;
+
 const IO_CHANNEL_CAP: usize = 32;
 const LED_CMD_POLL: Duration = Duration::from_millis(100);
 

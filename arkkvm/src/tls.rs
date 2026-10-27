@@ -50,18 +50,15 @@ pub async fn init() -> anyhow::Result<()> {
 /// - Certificate generation fails
 /// - Converting PEM data to RustlsConfig fails
 ///
-/// # Example
-/// ```
-/// let config = init_rustls_config(local_ip).await;
-/// let server = axum_server::bind_rustls(addr, config);
-/// ```
-pub async fn init_rustls_config(
+/// Build Rustls material (config + PEM) for the given addresses / optional custom cert.
+/// Prefer this when the caller needs PEM equality checks (TLS hot-reload dedupe).
+pub async fn init_rustls_material(
     local_ip: Option<IpAddr>,
     local_ip_v6: Option<IpAddr>,
     certificate: Option<String>,
     private_key: Option<String>,
     extra_fqdns: &[String],
-) -> anyhow::Result<RustlsConfig> {
+) -> anyhow::Result<(RustlsConfig, String, String)> {
     let mut domains = vec![
         "localhost".to_string(),
         "127.0.0.1".to_string(), // IPv4 loopback
@@ -93,14 +90,27 @@ pub async fn init_rustls_config(
             if let Err(e) = validate_custom_certificate(&certificate, &private_key) {
                 warn!("Custom certificate and private key validation failed: {:?}", e);
                 get_default_certificate(domains)?
-            }
-            else {
+            } else {
                 (certificate, private_key)
             }
         } else {
             get_default_certificate(domains)?
         };
-    Ok(RustlsConfig::new(Keycert::new().cert(server_cert_pem).key(server_key_pem)))
+    let rustls_config =
+        RustlsConfig::new(Keycert::new().cert(server_cert_pem.clone()).key(server_key_pem.clone()));
+    Ok((rustls_config, server_cert_pem, server_key_pem))
+}
+
+pub async fn init_rustls_config(
+    local_ip: Option<IpAddr>,
+    local_ip_v6: Option<IpAddr>,
+    certificate: Option<String>,
+    private_key: Option<String>,
+    extra_fqdns: &[String],
+) -> anyhow::Result<RustlsConfig> {
+    let (config, _, _) =
+        init_rustls_material(local_ip, local_ip_v6, certificate, private_key, extra_fqdns).await?;
+    Ok(config)
 }
 
 /// Get current TLS state from configuration
@@ -198,8 +208,6 @@ pub fn validate_custom_certificate(certificate: &str, private_key: &str) -> anyh
 }
 
 fn get_default_certificate(domains: Vec<String>) -> anyhow::Result<(String, String)> {
-    let (ca_issuer, _) = cert::load_or_init_ca().expect("init/load CA failed");
-    let (server_cert_pem, server_key_pem) = cert::generate_server_cert(&ca_issuer, domains)
-        .expect("generate server certificate failed");
-    Ok((server_cert_pem, server_key_pem))
+    let (ca_issuer, _) = cert::load_or_init_ca()?;
+    cert::get_or_create_server_cert(&ca_issuer, domains)
 }

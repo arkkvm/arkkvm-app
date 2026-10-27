@@ -93,6 +93,10 @@ pub async fn init(quality: f32) -> anyhow::Result<()> {
     Ok(())
 }
 
+struct OpusPacket {
+    bytes: Vec<u8>,
+}
+
 /// Capture audio task: continuously captures into triple buffer (in-place write + publish).
 /// Encode task reads latest from triple buffer; when behind, old frames are dropped (no blocking).
 fn capture_audio_task(
@@ -111,7 +115,11 @@ fn capture_audio_task(
             capture_timestamp_us: 0,
         };
         let (mut buf_input, buf_output) = triple_buffer(&initial);
-        let encode_handle = tokio_handle.spawn(encode_audio_task(buf_output, bitrate));
+        let encode_handle = tokio_handle.clone();
+        let encode_thread = std::thread::Builder::new()
+            .name("audio-enc".into())
+            .spawn(move || encode_audio_task(buf_output, bitrate, encode_handle))
+            .expect("Failed to spawn audio encode thread");
 
         info!("Starting audio capture task (triple buffer)");
         loop {
@@ -134,7 +142,9 @@ fn capture_audio_task(
             buf_input.publish();
         }
 
-        encode_handle.abort();
+        if let Err(e) = encode_thread.join() {
+            error!("Audio encode thread panicked: {:?}", e);
+        }
         std::thread::sleep(std::time::Duration::from_millis(100));
         AudioMPI::un_init()?;
         std::thread::sleep(std::time::Duration::from_millis(2000));
@@ -143,14 +153,28 @@ fn capture_audio_task(
     Ok(())
 }
 
-/// Encode audio task: reads latest frame from triple buffer (by ref), encodes, publishes to zenoh.
-/// When behind capture, only latest frame is encoded (drop old frames, no blocking).
-/// Owns Output (no Arc/Mutex): single consumer, moved in at spawn.
-async fn encode_audio_task(
+/// Encode on an OS thread so Opus does not occupy a tokio worker.
+/// Publishes via a single async task; a full queue drops the new packet.
+/// When behind capture, only the latest frame is encoded.
+fn encode_audio_task(
     mut buf_output: triple_buffer::Output<AudioFrame>,
     bitrate: Option<u32>,
+    tokio_handle: Handle,
 ) {
     let session = zenoh_bus::get_session();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<OpusPacket>(1);
+    tokio_handle.spawn(async move {
+        while let Some(packet) = rx.recv().await {
+            if let Err(e) = session
+                .put("hdmirx/audio/opus", ZBytes::from(packet.bytes))
+                .await
+            {
+                warn!("Failed to publish audio frame to zenoh: {:?}", e);
+            } else {
+            }
+        }
+    });
+
     let sample_rate_hz = DETECTED_SAMPLE_RATE.get().unwrap_or(&48000);
     let sample_rate = u32_to_sample_rate(sample_rate_hz);
     let channels = Channels::Stereo;
@@ -175,7 +199,7 @@ async fn encode_audio_task(
     /// 20ms period (50 fps). Advance next_tick only after consuming a frame so we stay aligned with upstream.
     const FRAME_PERIOD: Duration = Duration::from_millis(20);
     const POLL_INTERVAL: Duration = Duration::from_millis(1);
-    let mut next_tick = tokio::time::Instant::now();
+    let mut next_tick = std::time::Instant::now();
 
     info!("Starting audio encode task (triple buffer)");
     loop {
@@ -191,16 +215,19 @@ async fn encode_audio_task(
             ENCODER_CHANGED.store(false, Ordering::Release);
         }
 
-        tokio::time::sleep_until(next_tick).await;
+        let now = std::time::Instant::now();
+        if next_tick > now {
+            std::thread::sleep(next_tick - now);
+        }
 
         if !buf_output.update() {
-            next_tick = tokio::time::Instant::now() + POLL_INTERVAL;
+            next_tick = std::time::Instant::now() + POLL_INTERVAL;
             continue;
         }
 
         let frame = buf_output.output_buffer();
         if frame.data.is_empty() {
-            next_tick = tokio::time::Instant::now() + POLL_INTERVAL;
+            next_tick = std::time::Instant::now() + POLL_INTERVAL;
             continue;
         }
         next_tick += FRAME_PERIOD;
@@ -208,21 +235,26 @@ async fn encode_audio_task(
         let capture_timestamp_us = frame.capture_timestamp_us;
         convert_u8_to_u16_slice_reuse(frame.data.as_slice(), &mut audio_u16s);
 
+
         let opus_buf_len = match opus_encoder.encode_to_slice(&audio_u16s, &mut opus_buf) {
             Ok(len) => len,
             Err(e) => {
                 warn!("Failed to encode audio frame: {:?}", e);
-                next_tick = tokio::time::Instant::now() + POLL_INTERVAL;
+                next_tick = std::time::Instant::now() + POLL_INTERVAL;
                 continue;
             }
         };
+
 
         packet_buf.clear();
         packet_buf.extend_from_slice(&capture_timestamp_us.to_le_bytes());
         packet_buf.extend_from_slice(&opus_buf[..opus_buf_len]);
 
-        if let Err(e) = session.put("hdmirx/audio/opus", ZBytes::from(packet_buf.clone())).await {
-            warn!("Failed to publish audio frame to zenoh: {:?}", e);
+        let packet = OpusPacket {
+            bytes: packet_buf.clone(),
+        };
+        if tx.try_send(packet).is_err() {
+            debug!("Dropping opus packet; zenoh publish queue is full");
         }
     }
     info!("Audio encode task finished");

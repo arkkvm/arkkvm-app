@@ -12,6 +12,10 @@ use super::hid_io::{prepare_hid_write_file, write_all_with_timeout, HID_WRITE_TI
 use crate::config::{HID_ABS_INSTANCE, HID_ABS_PROTOCOL, HID_ABS_REPORT_LENGTH, HID_ABS_SUBCLASS};
 use crate::events::{ChangeRequest, ChangeResponse, UsbChangeHandler};
 
+/// Interrupt IN only; matches `HID_ABS_NO_OUT_ENDPOINT = true`.
+pub const ENDPOINT_IN: u8 = 1;
+pub const ENDPOINT_OUT: u8 = 0;
+
 const IO_CHANNEL_CAP: usize = 32;
 
 #[derive(Debug)]

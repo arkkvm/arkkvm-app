@@ -2,6 +2,17 @@ syntax = "proto3";
 
 package arkkvm.usb_devices.v1;
 
+enum NetworkAdapterType {
+  NETWORK_ADAPTER_TYPE_NCM = 0;   // default NCM (proto3 zero value)
+  NETWORK_ADAPTER_TYPE_RNDIS = 1;
+}
+
+// Gadget switch only: whether to build a net function and which class.
+message NetworkAdapterSwitch {
+  bool enable = 1;
+  NetworkAdapterType adapter_type = 2; // effective when enable; default/0 = NCM
+}
+
 // Device function switches (mirrors config::DeviceSwitches).
 message DeviceSwitches {
   bool hid_kb_enabled = 1;  // boot keyboard (hid.usb0)
@@ -11,6 +22,7 @@ message DeviceSwitches {
   bool ums_ft_enabled = 5;
   bool uac1_enabled = 6;
   bool uvc_enabled = 7;
+  NetworkAdapterSwitch network_adapter = 8; // USB net (NCM or RNDIS, mutually exclusive)
 } 
 
 enum UMS_VM_TYPE{
@@ -24,6 +36,16 @@ message UsbDeviceInfo{
   UMS_VM_TYPE ums_vm_type = 2;
   string ums_vm_path = 3;
   string ums_ft_path = 4;
+  // Board-side L3 on gadget netdev (applied by usb_devices; independent of switches rebuild).
+  NetworkAdapterL3 network_adapter_l3 = 5;
+}
+
+// Board address on the USB netdev (ArkKVM usb0), not the controlled host.
+message NetworkAdapterL3 {
+  string ip_address = 1;
+  string subnet_mask = 2;
+  optional string gateway = 3;
+  repeated string dns_servers = 4;
 }
 
 // message DeviceSwitches{
@@ -57,6 +79,8 @@ message RuntimeUsbConfig {
   string serial_number = 3;
   string manufacturer = 4;
   string product = 5;
+  // When true, ConfigFS max_speed is full-speed; otherwise high-speed (default).
+  bool force_full_speed = 6;
 }
 
 enum ApplyErrorCode {
@@ -208,5 +232,22 @@ message SetUsbEmulationStateRequest {
 message SetUsbEmulationStateResponse {
   bool ok = 1;
   bool enabled = 2;
+  optional string error = 3;
+}
+
+// Active DHCP leases issued by the USB network adapter udhcpd (controlled host).
+message NetworkAdapterLease {
+  string ip = 1;
+  string mac = 2;
+  string hostname = 3;
+  // Remaining lease lifetime in seconds when known; 0 if unknown.
+  uint32 expires_in_secs = 4;
+}
+
+message GetNetworkAdapterLeasesRequest {}
+
+message GetNetworkAdapterLeasesResponse {
+  bool ok = 1;
+  repeated NetworkAdapterLease leases = 2;
   optional string error = 3;
 }

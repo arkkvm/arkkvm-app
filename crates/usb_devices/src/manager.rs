@@ -1,7 +1,8 @@
-use crate::config::UsbBaseInfo;
+use crate::config::{GADGET_NAME, UsbBaseInfo};
 use crate::devices::hid_abs::{HidAbsController, HidAbsHandle};
 use crate::devices::hid_kb::{HidKbController, HidKbHandle};
 use crate::devices::hid_rel::{HidRelController, HidRelHandle};
+use crate::devices::network::{NetworkAdapterController, NetworkAdapterHandle};
 use crate::devices::ums1::{Ums1Controller, Ums1Handle, UmsFtEvent, UmsFtResponse};
 use crate::proto::v1::DeviceSwitches;
 // use crate::config::{DeviceSwitches, UsbBaseInfo};
@@ -14,6 +15,7 @@ use crate::events::{
 };
 use crate::system::{configfs, udc_state_watch::UdcStateWatch};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, MutexGuard, RwLock, mpsc, oneshot};
@@ -24,6 +26,9 @@ use usb_gadget::{RegGadget, Udc, UdcState as RawUdcState, default_udc};
 const UDC_RECOVER_TIMEOUT: Duration = Duration::from_secs(20);
 const UDC_RECOVER_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const UDC_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// After UDC reports NotAttached, Rockchip `android_work` may still be queued.
+/// Field logs show `android_work` Oops ~285ms after UDC, and one
+const GADGET_TEARDOWN_SETTLE: Duration = Duration::from_millis(500);
 
 pub const VIRTUAL_MEDIA_SERVICE: &str = "UMS_HANDLE";
 pub const FILE_TRANSFER_SERVICE: &str = "UMS1_HANDLE";
@@ -31,6 +36,7 @@ pub const UAC_SERVICE: &str = "UAC_HANDLE";
 pub const HID_KB_SERVICE: &str = "HID_KB_HANDLE";
 pub const HID_REL_SERVICE: &str = "HID_REL_HANDLE";
 pub const HID_ABS_SERVICE: &str = "HID_ABS_HANDLE";
+pub const NETWORK_ADAPTER_SERVICE: &str = "NETWORK_ADAPTER_HANDLE";
 
 const DEFAULT_UMS_MODE: UmsMode = UmsMode::CdRom;
 
@@ -41,6 +47,7 @@ pub enum DeviceService {
     HidKb(Arc<HidKbController>, Arc<HidKbHandle>),
     HidRel(Arc<HidRelController>, Arc<HidRelHandle>),
     HidAbs(Arc<HidAbsController>, Arc<HidAbsHandle>),
+    NetworkAdapter(Arc<NetworkAdapterController>, Arc<NetworkAdapterHandle>),
 }
 
 pub struct UsbDeviceManager {
@@ -223,6 +230,7 @@ impl UsbDeviceManager {
         }
 
         if self.active_gadget.is_none() {
+            let _ = self.release_gadget_configfs().await;
             self.emulation_enabled = false;
             return Ok(());
         }
@@ -240,21 +248,74 @@ impl UsbDeviceManager {
         let ums_mode = self.apply_device_services().await?;
         if !self.switches.has_any_enabled() {
             info!("UsbDeviceManager: no device functions enabled, skipping gadget bind");
+            // Still scrub leftovers so a later enable does not hit EEXIST.
+            let _ = self.release_gadget_configfs().await;
             return Ok(());
         }
-        let new_gadget = build_gadget(&self.base_info, &self.switches, ums_mode)?;
-        let reg_gadget =
-            new_gadget.bind(&self.udc).map_err(|e| UsbError::GadgetError(e.to_string()))?;
+        // Drop any orphaned configfs tree (e.g. prior failed register left `arkkvm/`).
+        let _ = self.release_gadget_configfs().await;
+        let (new_gadget, net_dev) = build_gadget(&self.base_info, &self.switches, ums_mode)?;
+        // Full gadget register first (function dirs exist), then network hook, then UDC.
+        let reg_gadget = new_gadget
+            .register()
+            .map_err(|e| UsbError::GadgetError(e.to_string()))?;
+        crate::devices::network::on_gadget_registered(net_dev.as_ref(), &self.switches)?;
+        reg_gadget
+            .bind(Some(&self.udc))
+            .map_err(|e| UsbError::GadgetError(e.to_string()))?;
         self.active_gadget = Some(reg_gadget);
+
+        // Keep usb-gadget Net so NetworkAdapterHandle can call ifname() (no configfs walk).
+        {
+            let services = self.device_services.read().await;
+            if let Some(DeviceService::NetworkAdapter(_, handle)) =
+                services.get(NETWORK_ADAPTER_SERVICE)
+            {
+                handle.set_net(net_dev);
+            }
+        }
         Ok(())
     }
 
     async fn unbind_active_gadget(&mut self) -> Result<(), UsbError> {
-        if let Some(old_gadget) = self.active_gadget.take() {
+        if let Some(mut old_gadget) = self.active_gadget.take() {
+            // Unbind only. Drop would rmdir configfs immediately and free the
+            // gadget kobject while Rockchip android_work is still queued.
+            if let Err(e) = old_gadget.bind(None) {
+                warn!(error = %e, "UsbDeviceManager: unbind UDC before remove failed");
+            }
+            old_gadget.detach();
             drop(old_gadget);
-            self.wait_for_udc_recovered().await?;
         }
-        Ok(())
+        self.release_gadget_configfs().await
+    }
+
+    /// Unbind a leftover tree if needed, wait for `android_work`, then rmdir.
+    /// The configfs delete does not write `UDC` again, so a second unbind
+    /// cannot requeue `android_work` against a gadget that is about to be freed.
+    async fn release_gadget_configfs(&self) -> Result<(), UsbError> {
+        let root = gadget_configfs_root();
+        if !root.exists() {
+            return Ok(());
+        }
+
+        let wrote_unbind = tokio::task::spawn_blocking(unbind_udc_file_if_bound)
+            .await
+            .map_err(|e| UsbError::GadgetError(format!("unbind UDC join: {e}")))?;
+        if wrote_unbind {
+            info!("UsbDeviceManager: UDC unbound, waiting for android_work before configfs remove");
+        } else {
+            info!("UsbDeviceManager: waiting for android_work before configfs remove");
+        }
+
+        if let Err(e) = self.wait_for_udc_recovered().await {
+            warn!(
+                error = %e,
+                "UsbDeviceManager: UDC did not reach NotAttached before configfs remove"
+            );
+        }
+        tokio::time::sleep(GADGET_TEARDOWN_SETTLE).await;
+        force_remove_gadget_tree().await
     }
 
     /// Apply a new device switch combination
@@ -348,6 +409,9 @@ impl UsbDeviceManager {
             return Err(UsbError::GadgetError("USB emulation disabled".into()));
         }
 
+        let effective = switches.as_ref().unwrap_or(&self.switches);
+        crate::devices::check_endpoint_budget(effective)?;
+
         self.request_change_approval().await?;
 
         info!("UsbDeviceManager: Change request approved, releasing resources");
@@ -438,6 +502,65 @@ impl UsbDeviceManager {
         } else {
             None
         }
+    }
+
+    pub async fn get_network_adapter(&self) -> Option<Arc<NetworkAdapterController>> {
+        let services = self.device_services.read().await;
+        if let Some(DeviceService::NetworkAdapter(controller, _)) =
+            services.get(NETWORK_ADAPTER_SERVICE)
+        {
+            Some(controller.clone())
+        } else {
+            None
+        }
+    }
+
+    pub async fn get_network_adapter_handle(&self) -> Option<Arc<NetworkAdapterHandle>> {
+        let services = self.device_services.read().await;
+        if let Some(DeviceService::NetworkAdapter(_, handle)) =
+            services.get(NETWORK_ADAPTER_SERVICE)
+        {
+            Some(handle.clone())
+        } else {
+            None
+        }
+    }
+
+    fn network_adapter_enabled(switches: &DeviceSwitches) -> bool {
+        switches
+            .network_adapter
+            .as_ref()
+            .map(|n| n.enable)
+            .unwrap_or(false)
+    }
+
+    /// Push board L3 settings into NetworkAdapterHandle (creates the service if missing).
+    pub async fn set_network_adapter_l3_config(
+        &mut self,
+        l3: Option<&crate::proto::v1::NetworkAdapterL3>,
+    ) {
+        if self.get_network_adapter_handle().await.is_none() {
+            let handle = NetworkAdapterHandle::new(Self::network_adapter_enabled(&self.switches));
+            let _ = self.add_change_handler(handle.clone()).await;
+            let mut services = self.device_services.write().await;
+            services.insert(
+                NETWORK_ADAPTER_SERVICE,
+                DeviceService::NetworkAdapter(
+                    Arc::new(NetworkAdapterController::new(handle.clone())),
+                    handle,
+                ),
+            );
+        }
+        if let Some(handle) = self.get_network_adapter_handle().await {
+            handle.set_l3_from_proto(l3);
+        }
+    }
+
+    pub async fn apply_network_adapter_l3_only(&self) -> Result<(), UsbError> {
+        let handle = self.get_network_adapter_handle().await.ok_or_else(|| {
+            UsbError::DeviceNotFound("network adapter service not initialized".into())
+        })?;
+        handle.apply_l3().await
     }
 }
 
@@ -711,6 +834,23 @@ impl UsbDeviceManager {
             );
         }
 
+        if let Some(DeviceService::NetworkAdapter(_, handle)) =
+            device_services.get(NETWORK_ADAPTER_SERVICE)
+        {
+            handle.set_enabled(Self::network_adapter_enabled(&self.switches));
+        } else {
+            let handle =
+                NetworkAdapterHandle::new(Self::network_adapter_enabled(&self.switches));
+            let _ = self.add_change_handler(handle.clone()).await;
+            device_services.insert(
+                NETWORK_ADAPTER_SERVICE,
+                DeviceService::NetworkAdapter(
+                    Arc::new(NetworkAdapterController::new(handle.clone())),
+                    handle,
+                ),
+            );
+        }
+
         Ok(ums_mode)
     }
 
@@ -881,6 +1021,173 @@ fn proto_vm_type_to_ums_mode(vm_type: i32) -> UmsMode {
         UmsMode::Disk
     } else {
         UmsMode::CdRom
+    }
+}
+
+fn gadget_configfs_root() -> std::path::PathBuf {
+    Path::new("/sys/kernel/config/usb_gadget").join(GADGET_NAME)
+}
+
+/// Write an empty UDC only when a controller is still bound.
+/// Returns true if this call performed the unbind.
+fn unbind_udc_file_if_bound() -> bool {
+    let root = gadget_configfs_root();
+    if !root.exists() {
+        return false;
+    }
+    let udc_path = root.join("UDC");
+    let bound = match std::fs::read_to_string(&udc_path) {
+        Ok(name) => !name.trim().is_empty(),
+        // Unreadable: try one unbind before the settle, not after it.
+        Err(_) => true,
+    };
+    if !bound {
+        return false;
+    }
+    match std::fs::write(&udc_path, "\n") {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(error = %e, "UsbDeviceManager: unbind UDC file failed");
+            false
+        }
+    }
+}
+
+/// Remove `/sys/kernel/config/usb_gadget/arkkvm` without writing `UDC`.
+/// Caller must already have unbound and waited for `android_work`.
+async fn force_remove_gadget_tree() -> Result<(), UsbError> {
+    tokio::task::spawn_blocking(remove_gadget_tree_sync)
+        .await
+        .map_err(|e| UsbError::GadgetError(format!("force_remove join: {e}")))?
+}
+
+fn remove_gadget_tree_sync() -> Result<(), UsbError> {
+    let root = gadget_configfs_root();
+    if !root.exists() {
+        return Ok(());
+    }
+    warn!(
+        path = %root.display(),
+        "UsbDeviceManager: removing gadget configfs tree"
+    );
+
+    // 1) os_desc symlinks
+    let os_desc = root.join("os_desc");
+    if os_desc.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&os_desc) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_symlink() || p.is_file() {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+    }
+
+    // 2) configs: unlink functions, remove strings, remove config dirs
+    let configs = root.join("configs");
+    if configs.is_dir() {
+        if let Ok(configs_entries) = std::fs::read_dir(&configs) {
+            for cfg in configs_entries.flatten() {
+                let cfg_path = cfg.path();
+                if !cfg_path.is_dir() {
+                    continue;
+                }
+                if let Ok(entries) = std::fs::read_dir(&cfg_path) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p.is_symlink() || p.is_file() {
+                            let _ = std::fs::remove_file(&p);
+                        }
+                    }
+                }
+                let strings = cfg_path.join("strings");
+                remove_lang_dirs(&strings);
+                let _ = std::fs::remove_dir(&cfg_path);
+            }
+        }
+        let _ = std::fs::remove_dir(&configs);
+    }
+
+    // 3) functions (MSD: remove lun.N N>0 first)
+    let functions = root.join("functions");
+    if functions.is_dir() {
+        if let Ok(fn_entries) = std::fs::read_dir(&functions) {
+            for func in fn_entries.flatten() {
+                let func_path = func.path();
+                if !func_path.is_dir() {
+                    continue;
+                }
+                if let Ok(entries) = std::fs::read_dir(&func_path) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        if name.starts_with("lun.") && name != "lun.0" {
+                            let _ = std::fs::remove_dir(entry.path());
+                        }
+                    }
+                }
+                // nested dirs under some functions (e.g. uvc) — shallow best-effort
+                remove_dir_contents_recursive(&func_path);
+                let _ = std::fs::remove_dir(&func_path);
+            }
+        }
+        let _ = std::fs::remove_dir(&functions);
+    }
+
+    // 4) gadget strings
+    remove_lang_dirs(&root.join("strings"));
+
+    // 5) remaining dirs (os_desc, etc.) then gadget root
+    remove_dir_contents_recursive(&root);
+    match std::fs::remove_dir(&root) {
+        Ok(()) => {
+            info!(path = %root.display(), "UsbDeviceManager: leftover gadget tree removed");
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            warn!(
+                path = %root.display(),
+                error = %e,
+                "UsbDeviceManager: failed to remove leftover gadget root"
+            );
+            Err(UsbError::GadgetError(format!(
+                "failed to remove leftover gadget {}: {}",
+                root.display(),
+                e
+            )))
+        }
+    }
+}
+
+fn remove_lang_dirs(strings: &Path) {
+    if !strings.is_dir() {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(strings) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let _ = std::fs::remove_dir(&p);
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(strings);
+}
+
+fn remove_dir_contents_recursive(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() && !p.is_symlink() {
+            remove_dir_contents_recursive(&p);
+            let _ = std::fs::remove_dir(&p);
+        } else {
+            let _ = std::fs::remove_file(&p);
+        }
     }
 }
 

@@ -20,12 +20,30 @@ pub const CLOUD_API_URL: &str = "https://api.arkkvm.com";
 #[cfg(not(feature = "env_dev"))]
 pub const CLOUD_APP_URL: &str = "https://app.arkkvm.com";
 
+fn default_wol_broadcast_address() -> String {
+    "255.255.255.255".to_string()
+}
+
+fn default_wol_port() -> u16 {
+    9
+}
+
 /// Wake-on-LAN device configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WakeOnLanDevice {
     pub name: String,
     #[serde(rename = "macAddress", alias = "mac_address")]
     pub mac_address: String,
+    /// Broadcast or directed-broadcast / unicast target for the Magic Packet.
+    #[serde(
+        default = "default_wol_broadcast_address",
+        rename = "broadcastAddress",
+        alias = "broadcast_address"
+    )]
+    pub broadcast_address: String,
+    /// UDP destination port (default 9).
+    #[serde(default = "default_wol_port")]
+    pub port: u16,
 }
 
 /// Keyboard macro step configuration
@@ -92,6 +110,9 @@ pub struct UsbConfig {
     pub serial_number: String,
     pub manufacturer: String,
     pub product: String,
+    /// When true, gadget `max_speed` is forced to full-speed; otherwise high-speed.
+    #[serde(default)]
+    pub force_full_speed: bool,
 }
 
 impl Default for UsbConfig {
@@ -102,6 +123,58 @@ impl Default for UsbConfig {
             serial_number: crate::hardware::hw::get_device_id(),
             manufacturer: "ArkKVM".to_string(),
             product: "Multifunction Composite Gadget".to_string(),
+            force_full_speed: false,
+        }
+    }
+}
+
+/// USB network adapter type (matches proto NetworkAdapterType; default NCM).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkAdapterType {
+    #[default]
+    Ncm,
+    Rndis,
+}
+
+/// Board L3 on the USB gadget netdev (ArkKVM usb0), not the controlled host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NetworkAdapterL3 {
+    pub ip_address: String,
+    pub subnet_mask: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_servers: Option<Vec<String>>,
+}
+
+impl Default for NetworkAdapterL3 {
+    fn default() -> Self {
+        Self {
+            ip_address: "172.16.0.1".to_string(),
+            subnet_mask: "255.255.255.0".to_string(),
+            gateway: None,
+            dns_servers: None,
+        }
+    }
+}
+
+/// USB network adapter (gadget enable + type + board L3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NetworkAdapter {
+    pub enable: bool,
+    #[serde(default)]
+    pub adapter_type: NetworkAdapterType,
+    #[serde(default)]
+    pub l3_config: NetworkAdapterL3,
+}
+
+impl Default for NetworkAdapter {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            adapter_type: NetworkAdapterType::Ncm,
+            l3_config: NetworkAdapterL3::default(),
         }
     }
 }
@@ -116,6 +189,8 @@ pub struct UsbDevices {
     pub mass_storage_ft: bool,
     pub microphone: bool,
     pub camera: bool,
+    #[serde(default)]
+    pub network_adapter: NetworkAdapter,
 }
 
 impl Default for UsbDevices {
@@ -128,6 +203,7 @@ impl Default for UsbDevices {
             mass_storage_ft: true,
             microphone: true,
             camera: false,
+            network_adapter: NetworkAdapter::default(),
         }
     }
 }
@@ -375,8 +451,11 @@ pub struct Config {
     pub cloud_app_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cloud_token: Option<String>,
+    /// Cloud-assigned owner user id (replaces google_identity, doc 05 §2.1).
+    /// Legacy config files carrying "google_identity" still load: serde
+    /// ignores the unknown old field, this one defaults to None.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub google_identity: Option<String>,
+    pub owner_user_id: Option<i64>,
 
     // Feature flags
     pub dev_channel_enabled: bool,
@@ -399,6 +478,13 @@ pub struct Config {
     /// Unix timestamp (seconds) when auth/CSRF token expires. None when no session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_auth_token_expires_at: Option<i64>,
+    /// Agent-role auth token (cookie `authTokenAgent`); independent of user slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_agent_auth_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_agent_csrf_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_agent_auth_token_expires_at: Option<i64>,
     #[serde(alias = "localAuthMode")]
     pub local_auth_mode: String,
     pub local_loopback_only: bool,
@@ -427,6 +513,12 @@ pub struct Config {
     /// arkkvm_mic subprocess + virtual_mic pipeline; `None` = legacy config (migrated on load).
     #[serde(default, alias = "microphoneEmulation")]
     pub microphone_emulation: Option<bool>,
+    /// MCP experimental master switch (OTA-6 §2.1.2). Default off.
+    #[serde(default)]
+    pub mcp_enabled: bool,
+    /// SSH Forwarding (USB virtual NIC for agents). Requires mcp_enabled. Default off.
+    #[serde(default)]
+    pub ssh_forwarding_enabled: bool,
     pub audio_playback: bool,
     pub file_transfer_target: FileTransferTarget,
 
@@ -449,7 +541,7 @@ impl Default for Config {
             cloud_url: CLOUD_API_URL.to_string(),
             cloud_app_url: CLOUD_APP_URL.to_string(),
             cloud_token: None,
-            google_identity: None,
+            owner_user_id: None,
             dev_channel_enabled: false,
             jiggler_enabled: false,
             jiggler_config: JigglerConfig::default(),
@@ -461,6 +553,9 @@ impl Default for Config {
             local_auth_token: None,
             local_csrf_token: None,
             local_auth_token_expires_at: None,
+            local_agent_auth_token: None,
+            local_agent_csrf_token: None,
+            local_agent_auth_token_expires_at: None,
             local_auth_mode: "".to_string(),
             local_loopback_only: false,
             wake_on_lan_devices: Vec::new(),
@@ -475,6 +570,8 @@ impl Default for Config {
             usb_config: UsbConfig::default(),
             usb_devices: UsbDevices::default(),
             microphone_emulation: Some(false),
+            mcp_enabled: false,
+            ssh_forwarding_enabled: false,
             audio_playback: true,
             file_transfer_target: FileTransferTarget::Kvm,
             network_config: NetworkConfig::default(),
@@ -539,4 +636,81 @@ impl Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevModeState {
     pub enabled: bool,
+}
+
+#[cfg(test)]
+mod wol_device_serde_tests {
+    use super::WakeOnLanDevice;
+    use crate::wol::{resolve_wol_send_target, DEFAULT_WOL_BROADCAST_ADDRESS, DEFAULT_WOL_PORT};
+
+    #[test]
+    fn legacy_json_gets_default_broadcast_and_port() {
+        let json = r#"{"name":"pc","macAddress":"aa:bb:cc:dd:ee:ff"}"#;
+        let device: WakeOnLanDevice = serde_json::from_str(json).unwrap();
+        assert_eq!(device.broadcast_address, "255.255.255.255");
+        assert_eq!(device.port, 9);
+    }
+
+    #[test]
+    fn custom_broadcast_and_port_roundtrip() {
+        let device = WakeOnLanDevice {
+            name: "pc".to_string(),
+            mac_address: "AA:BB:CC:DD:EE:FF".to_string(),
+            broadcast_address: "192.168.4.255".to_string(),
+            port: 7,
+        };
+        let json = serde_json::to_string(&device).unwrap();
+        assert!(json.contains("broadcastAddress"));
+        let parsed: WakeOnLanDevice = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, device);
+    }
+
+    /// Simulate frontend `setWakeOnLanDevices` body shape:
+    /// `params: { params: { devices: [...] } }` → inner `{ devices: [...] }`.
+    #[test]
+    fn frontend_set_wake_on_lan_devices_payload_with_new_fields() {
+        let inner = serde_json::json!({
+            "devices": [
+                {
+                    "name": "Office PC",
+                    "macAddress": "AA:BB:CC:DD:EE:FF",
+                    "broadcastAddress": "192.168.4.255",
+                    "port": 9
+                }
+            ]
+        });
+        let devices: Vec<WakeOnLanDevice> =
+            serde_json::from_value(inner.get("devices").unwrap().clone()).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].broadcast_address, "192.168.4.255");
+        assert_eq!(devices[0].port, 9);
+
+        // Frontend send still only passes macAddress; backend resolves from stored device.
+        let (addr, port) = resolve_wol_send_target(
+            None,
+            None,
+            Some(devices[0].broadcast_address.as_str()),
+            Some(devices[0].port),
+        );
+        assert_eq!(addr, "192.168.4.255");
+        assert_eq!(port, 9);
+    }
+
+    /// Legacy frontend add (name + mac only) keeps default send target.
+    #[test]
+    fn frontend_legacy_add_device_keeps_default_send_target() {
+        let device: WakeOnLanDevice = serde_json::from_value(serde_json::json!({
+            "name": "Legacy",
+            "macAddress": "00:11:22:33:44:55"
+        }))
+        .unwrap();
+        let (addr, port) = resolve_wol_send_target(
+            None,
+            None,
+            Some(device.broadcast_address.as_str()),
+            Some(device.port),
+        );
+        assert_eq!(addr, DEFAULT_WOL_BROADCAST_ADDRESS);
+        assert_eq!(port, DEFAULT_WOL_PORT);
+    }
 }

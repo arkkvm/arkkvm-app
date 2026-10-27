@@ -7,6 +7,15 @@ use serde_json::json;
 use tracing::{debug, warn};
 
 use crate::config::{get_config_manager, get_dev_mode_state};
+use crate::session::SessionRole;
+
+/// Depot key: authenticated role after `auth_middleware`.
+/// `None` means noPassword / unauthenticated bypass (no role bound).
+#[derive(Debug, Clone, Copy)]
+pub struct AuthenticatedRole(pub Option<SessionRole>);
+
+pub const AUTH_COOKIE_USER: &str = "authToken";
+pub const AUTH_COOKIE_AGENT: &str = "authTokenAgent";
 
 /// Extract Basic Auth credentials from Authorization header
 fn extract_basic_auth(auth_header: &str) -> Option<(String, String)> {
@@ -24,30 +33,60 @@ fn extract_basic_auth(auth_header: &str) -> Option<(String, String)> {
     None
 }
 
+/// Read authenticated role from depot (if auth middleware ran).
+pub fn authenticated_role_from_depot(depot: &Depot) -> Option<SessionRole> {
+    depot.obtain::<AuthenticatedRole>().ok().and_then(|r| r.0)
+}
+
 /// Authentication middleware for protected routes
 #[handler]
 pub async fn auth_middleware(
     req: &mut Request,
-    _depot: &mut Depot,
+    depot: &mut Depot,
     res: &mut Response,
     ctrl: &mut FlowCtrl,
 ) {
     let config_manager = get_config_manager();
     let config = config_manager.get().await;
 
-    // If noPassword mode, allow access
+    // If noPassword mode, allow access with unbound role
     if config.local_auth_mode.is_empty() || config.local_auth_mode == "noPassword" {
         debug!("Authentication bypassed: noPassword mode");
+        depot.inject(AuthenticatedRole(None));
         return;
     }
 
-    // Check for auth token in cookies
-    if let Some(auth_cookie) = req.cookie("authToken") {
-        let auth_token = auth_cookie.value();
+    let has_user = req.cookie(AUTH_COOKIE_USER).is_some();
+    let has_agent = req.cookie(AUTH_COOKIE_AGENT).is_some();
 
-        // Validate auth token using config manager
-        if config_manager.validate_auth_token(auth_token).await {
-            debug!("Authentication successful: valid auth token");
+    if has_user && has_agent {
+        warn!("Authentication failed: both authToken and authTokenAgent present");
+        res.status_code(StatusCode::BAD_REQUEST);
+        res.render(Json(json!({"error": "Ambiguous auth cookies"})));
+        ctrl.skip_rest();
+        return;
+    }
+
+    if let Some(auth_cookie) = req.cookie(AUTH_COOKIE_USER) {
+        let auth_token = auth_cookie.value();
+        if config_manager
+            .validate_auth_token_for_role(SessionRole::User, auth_token)
+            .await
+        {
+            debug!("Authentication successful: valid user auth token");
+            depot.inject(AuthenticatedRole(Some(SessionRole::User)));
+            return;
+        }
+    }
+
+    if let Some(auth_cookie) = req.cookie(AUTH_COOKIE_AGENT) {
+        let auth_token = auth_cookie.value();
+        if config_manager
+            .validate_auth_token_for_role(SessionRole::Agent, auth_token)
+            .await
+        {
+            debug!("Authentication successful: valid agent auth token");
+            depot.inject(AuthenticatedRole(Some(SessionRole::Agent)));
             return;
         }
     }
@@ -125,7 +164,7 @@ pub async fn developer_auth_middleware(
 #[handler]
 pub async fn csrf_middleware(
     req: &mut Request,
-    _depot: &mut Depot,
+    depot: &mut Depot,
     res: &mut Response,
     ctrl: &mut FlowCtrl,
 ) {
@@ -146,11 +185,47 @@ pub async fn csrf_middleware(
             .unwrap_or_default()
     };
 
-    if !config_manager.validate_csrf_token(token.as_str()).await {
-        warn!("CSRF validation failed: missing or invalid X-CSRF-Token");
+    let role = authenticated_role_from_depot(depot).unwrap_or(SessionRole::User);
+    if !config_manager.validate_csrf_token_for_role(role, token.as_str()).await {
+        warn!("CSRF validation failed: missing or invalid X-CSRF-Token for role {}", role);
         res.status_code(StatusCode::UNAUTHORIZED);
         res.render(Json(json!({"error": "Invalid or missing CSRF token"})));
         ctrl.skip_rest();
+    }
+}
+
+/// Agent ACL: block `/cloud/*` and `/auth/*` except `POST /auth/logout`.
+/// Must run after auth_middleware (and csrf on protected routes).
+#[handler]
+pub async fn role_acl_middleware(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) {
+    let Some(SessionRole::Agent) = authenticated_role_from_depot(depot) else {
+        return;
+    };
+
+    let path = req.uri().path();
+    let method = req.method();
+
+    if path.starts_with("/cloud/") {
+        warn!("Agent ACL denied cloud path: {}", path);
+        res.status_code(StatusCode::FORBIDDEN);
+        res.render(Json(json!({"error": "Forbidden for agent"})));
+        ctrl.skip_rest();
+        return;
+    }
+
+    if path.starts_with("/auth/") {
+        let is_logout = method == Method::POST && path == "/auth/logout";
+        if !is_logout {
+            warn!("Agent ACL denied auth path: {} {}", method, path);
+            res.status_code(StatusCode::FORBIDDEN);
+            res.render(Json(json!({"error": "Forbidden for agent"})));
+            ctrl.skip_rest();
+        }
     }
 }
 

@@ -18,6 +18,10 @@ use std::{
     },
 };
 
+/// Bulk IN + OUT for mass_storage.0 (virtual media).
+pub const ENDPOINT_IN: u8 = 1;
+pub const ENDPOINT_OUT: u8 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UmsMode {
     CdRom,

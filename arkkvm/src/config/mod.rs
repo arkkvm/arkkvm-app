@@ -163,6 +163,8 @@ mod tests {
         let wol_device = WakeOnLanDevice {
             name: "Test Server".to_string(),
             mac_address: "00:11:22:33:44:55".to_string(),
+            broadcast_address: "255.255.255.255".to_string(),
+            port: 9,
         };
 
         manager.set_wake_on_lan_device(wol_device).await.unwrap();

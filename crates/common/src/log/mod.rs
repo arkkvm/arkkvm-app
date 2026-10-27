@@ -10,7 +10,9 @@ use tracing_subscriber::{
 const LOG_FILE_PATH: &str = "/userdata/arkkvm/logs";
 const DEFAULT_LOG_LEVEL: &str = "info";
 const MAX_LOG_FILE_SIZE: usize = 50 * 1024 * 1024;
-const MAX_LOG_FILE_COUNT: usize = 5;
+/// Rotated suffix count for `AppendCount` (excludes the active file).
+/// `4` → active + `.1`…`.4` = **5 files total** per app (each up to [`MAX_LOG_FILE_SIZE`]).
+const MAX_LOG_ROTATED_COUNT: usize = 4;
 
 macro_rules! console_fmt_layer {
     () => {
@@ -65,7 +67,7 @@ impl Default for LogBuilder {
             log_file_path: LOG_FILE_PATH.to_owned(),
             log_file_name: format!("{}.log", env!("CARGO_PKG_NAME")),
             log_file_size: MAX_LOG_FILE_SIZE,
-            log_file_count: MAX_LOG_FILE_COUNT,
+            log_file_count: MAX_LOG_ROTATED_COUNT,
             log_level: DEFAULT_LOG_LEVEL.to_owned(),
             log_console: true,
             log_file: false,
@@ -90,6 +92,7 @@ impl LogBuilder {
     }
 
     pub fn set_file_count(&mut self, count: usize) -> &mut Self {
+        // Passed to AppendCount::new — number of rotated suffixes (excludes active file).
         self.log_file_count = count;
         self
     }

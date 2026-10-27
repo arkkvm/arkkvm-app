@@ -30,6 +30,8 @@ pub const KEY_GET_UDC_STATUS: &str = "arkkvm/usb_devices/query/get_udc_status";
 pub const KEY_GET_USB_EMULATION_STATE: &str = "arkkvm/usb_devices/query/get_usb_emulation_state";
 pub const KEY_SET_USB_EMULATION_STATE: &str = "arkkvm/usb_devices/query/set_usb_emulation_state";
 pub const KEY_SET_MIC_PROCESS: &str = "arkkvm/usb_devices/query/set_mic_process";
+pub const KEY_GET_NETWORK_ADAPTER_LEASES: &str =
+    "arkkvm/usb_devices/query/get_network_adapter_leases";
 
 /// Sidecar gadget rebuild + UDC recover can exceed the default Zenoh 10s query timeout.
 const ZENOH_RUNTIME_QUERY_TIMEOUT: Duration = Duration::from_secs(35);
@@ -122,6 +124,14 @@ pub fn usb_info_from_devices_with_paths(
     ums_ft_path: String,
     ums_vm_type: UmsVmType,
 ) -> UsbDeviceInfo {
+    let na = &devices.network_adapter;
+    let adapter_type = match na.adapter_type {
+        crate::config::types::NetworkAdapterType::Rndis => {
+            NetworkAdapterType::Rndis as i32
+        }
+        crate::config::types::NetworkAdapterType::Ncm => NetworkAdapterType::Ncm as i32,
+    };
+    let l3 = &na.l3_config;
     UsbDeviceInfo {
         switches: Some(DeviceSwitches {
             hid_kb_enabled: devices.keyboard,
@@ -131,10 +141,20 @@ pub fn usb_info_from_devices_with_paths(
             ums_ft_enabled: devices.mass_storage_ft,
             uac1_enabled: devices.microphone,
             uvc_enabled: devices.camera,
+            network_adapter: Some(NetworkAdapterSwitch {
+                enable: na.enable,
+                adapter_type,
+            }),
         }),
         ums_vm_type: ums_vm_type as i32,
         ums_vm_path,
         ums_ft_path,
+        network_adapter_l3: Some(crate::proto::v1::NetworkAdapterL3 {
+            ip_address: l3.ip_address.clone(),
+            subnet_mask: l3.subnet_mask.clone(),
+            gateway: l3.gateway.clone(),
+            dns_servers: l3.dns_servers.clone().unwrap_or_default(),
+        }),
     }
 }
 
@@ -145,6 +165,7 @@ pub fn runtime_usb_config_from_config(config: &UsbConfig) -> RuntimeUsbConfig {
         serial_number: config.serial_number.clone(),
         manufacturer: config.manufacturer.clone(),
         product: config.product.clone(),
+        force_full_speed: config.force_full_speed,
     }
 }
 
@@ -661,6 +682,39 @@ impl UsbClient {
             }
         } else {
             Err(anyhow!("no reply received from usb_devices get_udc_status"))
+        }
+    }
+
+    pub async fn get_network_adapter_leases(&self) -> Result<Vec<NetworkAdapterLease>> {
+        let req = GetNetworkAdapterLeasesRequest {};
+        let mut buf = Vec::new();
+        req.encode(&mut buf)?;
+
+        let replies = self
+            .session
+            .get(KEY_GET_NETWORK_ADAPTER_LEASES)
+            .payload(ZBytes::from(buf))
+            .timeout(ZENOH_UDC_QUERY_TIMEOUT)
+            .await
+            .map_err(|e| anyhow!("zenoh get_network_adapter_leases failed: {}", e))?;
+
+        if let Ok(reply) = replies.recv_async().await {
+            let sample = reply
+                .into_result()
+                .map_err(|e| anyhow!("get_network_adapter_leases query error: {}", e))?;
+            let bytes = sample.payload().to_bytes();
+            let resp = GetNetworkAdapterLeasesResponse::decode(&bytes[..])
+                .context("decode GetNetworkAdapterLeasesResponse")?;
+            if resp.ok {
+                Ok(resp.leases)
+            } else {
+                Err(anyhow!(
+                    "get_network_adapter_leases rejected: {}",
+                    resp.error.unwrap_or_default()
+                ))
+            }
+        } else {
+            Err(anyhow!("no reply received from usb_devices get_network_adapter_leases"))
         }
     }
 

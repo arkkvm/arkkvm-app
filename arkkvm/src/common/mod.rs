@@ -7,13 +7,18 @@ use crate::cloud::CloudManager;
 pub mod log;
 pub mod panic_handler;
 
+#[cfg(feature = "env_dev")]
+pub mod kmsg;
+
 const CAT_CMD: &str = "cat";
 const SYSTEM_VERSION_FILE: &str = "/etc/version/system";
 
 const DEV_TAG: &str = "-dev";
 
 pub async fn get_system_version() -> Result<String> {
-    let system_out = Command::new(CAT_CMD).args([SYSTEM_VERSION_FILE]).output().await?;
+    let mut cmd = Command::new(CAT_CMD);
+    cmd.args([SYSTEM_VERSION_FILE]);
+    let system_out = crate::process_spawn::output(cmd).await?;
     let system_version = String::from_utf8(system_out.stdout)?.replace("\n", "");
     Ok(system_version.trim().to_owned())
 }

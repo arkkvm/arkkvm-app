@@ -13,7 +13,6 @@ use salvo::http::HeaderValue;
 use tokio::io::AsyncReadExt;
 use tracing::{debug, error, info, warn};
 
-use super::oidc::OidcAuthenticator;
 use super::types::{
     CloudConnectionState, CloudRegisterRequest, CloudState, TokenExchangeRequest,
     TokenExchangeResponse,
@@ -52,9 +51,57 @@ pub fn get_cloud_manager() -> &'static CloudManager {
     CLOUD_MANAGER.get_or_init(CloudManager::new)
 }
 
+/// Gate that suspends cloud reconnects while a network transition (IP /
+/// gateway / DNS change driven by `refresh-network.sh`) is in flight.
+///
+/// Without it the connection loop observes `Disconnected` the moment the old
+/// socket is torn down and immediately reconnects on the *old* address; when
+/// the refresh then swaps the address a couple of seconds later, that fresh
+/// socket is stranded and the cloud WS turns into a zombie (see plan
+/// "云端WS僵尸连接修复"). The generation counter makes a stale
+/// `end_network_transition` from a superseded transition a no-op.
+#[derive(Debug, Default)]
+struct ReconnectGate {
+    generation: u64,
+    paused: bool,
+}
+
+impl ReconnectGate {
+    /// Close the gate and return the generation that must be handed back to
+    /// `end` to reopen it.
+    fn begin(&mut self) -> u64 {
+        self.generation += 1;
+        self.paused = true;
+        self.generation
+    }
+
+    /// Reopen the gate if `generation` is still the latest transition.
+    /// Returns whether the gate was actually released.
+    fn end(&mut self, generation: u64) -> bool {
+        if self.paused && generation == self.generation {
+            self.paused = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Force the gate open (e.g. VLAN `force_reconnect`), invalidating any
+    /// outstanding transition generation.
+    fn release(&mut self) {
+        self.generation += 1;
+        self.paused = false;
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused
+    }
+}
+
 /// Cloud manager handling cloud connections and device registration
 pub struct CloudManager {
     state: AtomicU8,
+    reconnect_gate: std::sync::Mutex<ReconnectGate>,
 }
 
 impl Default for CloudManager {
@@ -65,7 +112,48 @@ impl Default for CloudManager {
 
 impl CloudManager {
     pub fn new() -> Self {
-        Self { state: AtomicU8::new(CloudConnectionState::NotConfigured as u8) }
+        Self {
+            state: AtomicU8::new(CloudConnectionState::NotConfigured as u8),
+            reconnect_gate: std::sync::Mutex::new(ReconnectGate::default()),
+        }
+    }
+
+    fn lock_reconnect_gate(&self) -> std::sync::MutexGuard<'_, ReconnectGate> {
+        self.reconnect_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn reconnects_paused(&self) -> bool {
+        self.lock_reconnect_gate().is_paused()
+    }
+
+    /// Suspend cloud reconnects and tear down the current WS before a network
+    /// transition rewrites the interface configuration. Returns the
+    /// generation token that must be passed to
+    /// [`Self::end_network_transition`] once the new configuration is live.
+    pub async fn begin_network_transition(&self) -> u64 {
+        let generation = self.lock_reconnect_gate().begin();
+        info!(generation, "Cloud reconnects suspended for network transition");
+        self.reconnect_after_network_change().await;
+        generation
+    }
+
+    /// Resume cloud reconnects after a network transition. A stale generation
+    /// (a newer transition has begun meanwhile) is ignored so it cannot
+    /// reopen the gate early.
+    pub async fn end_network_transition(&self, generation: u64) {
+        if self.lock_reconnect_gate().end(generation) {
+            info!(generation, "Cloud reconnects resumed after network transition");
+            if self.get_state() != CloudConnectionState::NotConfigured {
+                self.set_state(CloudConnectionState::Disconnected);
+            }
+        } else {
+            debug!(
+                generation,
+                "Ignoring stale end of network transition for cloud reconnect"
+            );
+        }
     }
 
     pub fn get_state(&self) -> CloudConnectionState {
@@ -88,7 +176,12 @@ impl CloudManager {
         }
     }
 
-    /// Register device with cloud
+    /// Register device with cloud.
+    ///
+    /// De-providerized (doc auth-analysis/05 §2): no IdP verification — the
+    /// TLS response of the token exchange IS the cloud's authorization
+    /// assertion. The device stores the cloud-assigned owner user id
+    /// (replaces google_identity); provider identity never reaches the device.
     pub async fn register_device(&self, req: CloudRegisterRequest) -> Result<()> {
         info!("Starting cloud device registration");
 
@@ -103,17 +196,12 @@ impl CloudManager {
             anyhow::bail!("Cloud URL is not configured");
         };
 
-        // 1. Exchange temporary token for permanent auth token
+        // Exchange temporary token for permanent auth token. Cloud TLS response
+        // is the authorization assertion; firmware does not verify IdP tokens.
         let token_resp = self.exchange_temp_token(&req.token, &cloud_api).await?;
         info!("Token exchange successful");
 
-        // 2. Verify OIDC token
-        let oidc_auth = OidcAuthenticator::new().await?;
-        let google_identity =
-            oidc_auth.verify_token_with_client_id(&req.oidc_google, &req.client_id).await?;
-        info!("OIDC token verification successful");
-
-        // 3. Update configuration
+        // 2. Update configuration
         if cfg.cloud_url.is_empty() {
             config_manager.set_cloud_config(Some(cloud_api), Some(token_resp.secret_token)).await?;
         } else {
@@ -122,10 +210,10 @@ impl CloudManager {
                 .await?;
         }
 
-        // 4. Set Google identity
+        // 3. Record the cloud-assigned owner (replaces google_identity)
         config_manager
             .update(|config| {
-                config.google_identity = Some(google_identity);
+                config.owner_user_id = token_resp.user_id;
             })
             .await?;
 
@@ -161,7 +249,7 @@ impl CloudManager {
             config_manager.set_cloud_config(None, None).await?;
             config_manager
                 .update(|config| {
-                    config.google_identity = None;
+                    config.owner_user_id = None;
                 })
                 .await?;
 
@@ -444,6 +532,14 @@ impl CloudManager {
                     }
                 }
                 CloudConnectionState::Disconnected => {
+                    if self.reconnects_paused() {
+                        // A network transition is rewriting the interface
+                        // config; reconnecting now would bind the new socket
+                        // to the address that is about to disappear.
+                        debug!("Cloud connection loop: reconnects suspended for network transition");
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                        continue;
+                    }
                     warn!("Cloud connection loop: Disconnected");
                     self.set_state(CloudConnectionState::Connecting);
                     match self.connect_to_cloud().await {
@@ -530,6 +626,10 @@ impl CloudManager {
     /// Always tear down WS (if any) and mark Disconnected so the connection loop retries.
     /// Used after VLAN apply when WAN may only become ready later (no reboot required).
     pub async fn force_reconnect(&self) {
+        // An explicit force-reconnect overrides any in-flight network
+        // transition gate; its generation is invalidated so the transition's
+        // later `end_network_transition` cannot reopen (or re-close) anything.
+        self.lock_reconnect_gate().release();
         if matches!(self.get_state(), CloudConnectionState::NotConfigured) {
             return;
         }
@@ -552,7 +652,10 @@ impl CloudManager {
         // info!("Connecting to cloud WebSocket: {}", config.cloud_url);
         let mut client = CloudWebSocketClient::new(config.cloud_url, token, device_id);
 
-        self.set_state(CloudConnectionState::Connected);
+        // Only `Connecting` here: `Connected` is set by the WS client once
+        // the handshake has actually completed, so the internal state never
+        // claims a live cloud connection before one exists.
+        self.set_state(CloudConnectionState::Connecting);
 
         let result = match client.connect().await {
             Ok(_) => Ok(()),
@@ -611,5 +714,58 @@ impl CloudManager {
                 ));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod reconnect_gate_tests {
+    use super::ReconnectGate;
+
+    #[test]
+    fn begin_pauses_and_end_resumes() {
+        let mut gate = ReconnectGate::default();
+        assert!(!gate.is_paused());
+
+        let generation = gate.begin();
+        assert!(gate.is_paused());
+
+        assert!(gate.end(generation));
+        assert!(!gate.is_paused());
+    }
+
+    #[test]
+    fn stale_generation_cannot_reopen_gate() {
+        let mut gate = ReconnectGate::default();
+        let first = gate.begin();
+        let second = gate.begin();
+        assert_ne!(first, second);
+
+        // The first transition was superseded; its end must not reopen.
+        assert!(!gate.end(first));
+        assert!(gate.is_paused());
+
+        assert!(gate.end(second));
+        assert!(!gate.is_paused());
+    }
+
+    #[test]
+    fn release_forces_gate_open_and_invalidates_generation() {
+        let mut gate = ReconnectGate::default();
+        let generation = gate.begin();
+        assert!(gate.is_paused());
+
+        gate.release();
+        assert!(!gate.is_paused());
+
+        // The invalidated generation can no longer affect the gate.
+        assert!(!gate.end(generation));
+        assert!(!gate.is_paused());
+    }
+
+    #[test]
+    fn end_without_begin_is_noop() {
+        let mut gate = ReconnectGate::default();
+        assert!(!gate.end(42));
+        assert!(!gate.is_paused());
     }
 }

@@ -605,10 +605,9 @@ pub async fn run(subcommand: &str, args: &[&str]) -> Result<CommandOutput> {
         return Err(anyhow!("Tailscale init script not found: {INIT_SCRIPT_PATH}"));
     }
 
-    let output = Command::new(INIT_SCRIPT_PATH)
-        .arg(subcommand)
-        .args(args)
-        .output()
+    let mut cmd = Command::new(INIT_SCRIPT_PATH);
+    cmd.arg(subcommand).args(args);
+    let output = crate::process_spawn::output(cmd)
         .await
         .with_context(|| format!("failed to execute {INIT_SCRIPT_PATH} {subcommand}"))?;
 
@@ -715,12 +714,14 @@ async fn run_register(subcommand: &str) -> Result<RegisterResult> {
         return Err(anyhow!("Tailscale init script not found: {INIT_SCRIPT_PATH}"));
     }
 
-    let mut child = Command::new(INIT_SCRIPT_PATH)
-        .arg(subcommand)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to spawn {INIT_SCRIPT_PATH} {subcommand}"))?;
+    let mut child = {
+        let mut cmd = Command::new(INIT_SCRIPT_PATH);
+        cmd.arg(subcommand)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        crate::process_spawn::spawn_tokio(cmd)
+            .with_context(|| format!("failed to spawn {INIT_SCRIPT_PATH} {subcommand}"))?
+    };
 
     let stdout = BufReader::new(
         child

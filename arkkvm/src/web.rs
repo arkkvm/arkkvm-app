@@ -13,7 +13,7 @@ use salvo::websocket::{Message, WebSocket, WebSocketUpgrade};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -27,20 +27,29 @@ use crate::config::types::UISwitch;
 use crate::hardware::usb;
 use crate::jsonrpc::handlers;
 use crate::middleware::{
-    self, auth_middleware, csrf_middleware, developer_auth_middleware, public_middleware, security_middleware
+    self, auth_middleware, authenticated_role_from_depot, csrf_middleware,
+    developer_auth_middleware, public_middleware, role_acl_middleware, security_middleware,
+    AUTH_COOKIE_AGENT, AUTH_COOKIE_USER,
 };
 use crate::module::rtc_request_params::SettingSwitchParams;
 use crate::services::ft_file;
 use crate::services::local_file::{self, ByteRange};
-use crate::{common, ota};
-use crate::state::AppState;
+use crate::session::SessionRole;
+use crate::state::{AppState, ClaimRoleResult};
 use crate::{
+    common, ota,
     tls::{self, TlsMode},
     util, webrtc,
 };
 
 static GLOBAL_APP_STATE: OnceLock<Arc<AppState>> = OnceLock::new();
 static TLS_CONFIG_TX: OnceLock<mpsc::UnboundedSender<RustlsConfig>> = OnceLock::new();
+/// Last leaf PEM pushed to Salvo; used to skip no-op TLS hot reloads.
+static LAST_PUSHED_TLS_PEM: OnceLock<Mutex<Option<(String, String)>>> = OnceLock::new();
+
+fn last_pushed_tls_pem() -> &'static Mutex<Option<(String, String)>> {
+    LAST_PUSHED_TLS_PEM.get_or_init(|| Mutex::new(None))
+}
 
 /// Stream of TLS configs pushed via `TLS_CONFIG_TX` for Salvo hot reload.
 struct RustlsConfigStream {
@@ -70,8 +79,7 @@ struct WebRTCSessionRequest {
     #[serde(default)]
     ip: Option<String>,
     #[serde(default)]
-    #[serde(rename = "OidcGoogle")]
-    oidc_google: Option<String>,
+    client_type: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -84,6 +92,8 @@ struct WebRTCSessionResponse {
 #[serde(rename_all = "camelCase")]
 struct LoginRequest {
     password: String,
+    #[serde(default)]
+    client_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,12 +188,15 @@ pub async fn init() -> anyhow::Result<JoinHandle<()>> {
     let rustls_config = build_rustls_config(local_ip, local_ip_v6).await?;
 
     // Build acceptor based on available protocols
-    let handle = if let Some(initial_rustls_config) = rustls_config {
+    let handle = if let Some((initial_rustls_config, cert_pem, key_pem)) = rustls_config {
         info!("Starting HTTP server on {} and {}", http_addr, https_addr);
         let (tls_tx, tls_rx) = mpsc::unbounded_channel();
         tls_tx
             .send(initial_rustls_config)
             .map_err(|_| anyhow::anyhow!("failed to seed initial TLS config"))?;
+        if let Ok(mut last) = last_pushed_tls_pem().lock() {
+            *last = Some((cert_pem, key_pem));
+        }
         let _ = TLS_CONFIG_TX.set(tls_tx);
         let tls_stream = RustlsConfigStream::new(tls_rx);
         let acceptor = TcpListener::new(https_addr)
@@ -227,8 +240,20 @@ pub async fn reload_tls_config_with_fqdn(extra_fqdn: &str) -> anyhow::Result<()>
     } else {
         vec![extra_fqdn.trim().to_string()]
     };
-    let new_config =
-        tls::init_rustls_config(local_ip, local_ip_v6, None, None, &extra_fqdns).await?;
+    let (new_config, cert_pem, key_pem) =
+        tls::init_rustls_material(local_ip, local_ip_v6, None, None, &extra_fqdns).await?;
+
+    {
+        let mut last = last_pushed_tls_pem()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("TLS PEM lock poisoned"))?;
+        if last.as_ref().is_some_and(|(c, k)| c == &cert_pem && k == &key_pem) {
+            info!("TLS reload skipped, leaf unchanged");
+            return Ok(());
+        }
+        *last = Some((cert_pem, key_pem));
+    }
+
     tls_tx
         .send(new_config)
         .map_err(|_| anyhow::anyhow!("failed to push TLS config reload"))?;
@@ -262,20 +287,27 @@ async fn determine_binding_addresses(ipv6_available: bool) -> (&'static str, &'s
     }
 }
 
-/// Build Rustls configuration based on TLS mode
+/// Build Rustls configuration based on TLS mode.
+/// Returns `(config, cert_pem, key_pem)` so the caller can seed reload dedupe state.
 async fn build_rustls_config(
     local_ip: Option<IpAddr>,
     local_ip_v6: Option<IpAddr>,
-) -> anyhow::Result<Option<salvo::conn::rustls::RustlsConfig>> {
+) -> anyhow::Result<Option<(salvo::conn::rustls::RustlsConfig, String, String)>> {
     let tls_mode = tls::get_tls_mode().await;
     let rustls_config = match tls_mode {
         TlsMode::Disabled => None,
         TlsMode::SelfSigned => {
-            Some(tls::init_rustls_config(local_ip, local_ip_v6, None, None, &[]).await?)
+            Some(tls::init_rustls_material(local_ip, local_ip_v6, None, None, &[]).await?)
         }
         TlsMode::Custom(certificate, private_key) => Some(
-            tls::init_rustls_config(local_ip, local_ip_v6, Some(certificate), Some(private_key), &[])
-                .await?,
+            tls::init_rustls_material(
+                local_ip,
+                local_ip_v6,
+                Some(certificate),
+                Some(private_key),
+                &[],
+            )
+            .await?,
         ),
     };
     Ok(rustls_config)
@@ -297,6 +329,7 @@ async fn init_public_routes() -> anyhow::Result<Router> {
 async fn init_local_file_routes() -> anyhow::Result<Router> {
     let router = Router::new()
         .hoop(auth_middleware)
+        .hoop(role_acl_middleware)
         .push(Router::with_path("/local/file").get(handle_local_file_get).head(handle_local_file_head));
     Ok(router)
 }
@@ -305,6 +338,7 @@ async fn init_local_file_routes() -> anyhow::Result<Router> {
 async fn init_ft_file_routes() -> anyhow::Result<Router> {
     let router = Router::new()
         .hoop(auth_middleware)
+        .hoop(role_acl_middleware)
         .push(Router::with_path("/ft/file").get(handle_ft_file_get).head(handle_ft_file_head))
         .push(Router::with_path("/ft/upload").post(handle_ft_upload));
     Ok(router)
@@ -315,6 +349,7 @@ async fn init_protected_routes() -> anyhow::Result<Router> {
     let router = Router::new()
         .hoop(auth_middleware)
         .hoop(csrf_middleware)
+        .hoop(role_acl_middleware)
         // WebRTC routes
         .push(Router::with_path("/webrtc/session").post(handle_webrtc_session))
         .push(Router::with_path("/webrtc/signaling/client").get(handle_webrtc_signaling_client))
@@ -399,13 +434,16 @@ async fn handle_login_local(
         .await
         .map_err(|e| StatusError::bad_request().brief(format!("Invalid JSON: {e}")))?;
 
+    let role = parse_client_type(login_req.client_type.as_deref())
+        .map_err(|e| StatusError::bad_request().brief(e))?;
+
     if !config_manager.validate_password(&login_req.password).await {
         return Err(StatusError::unauthorized().brief("Invalid password"));
     }
 
     let auth_token = Uuid::new_v4().to_string();
     let csrf_token = config_manager
-        .set_auth_token(Some(auth_token.clone()))
+        .set_auth_token_for_role(role, Some(auth_token.clone()))
         .await
         .map_err(|_| StatusError::internal_server_error().brief("Failed to save configuration"))?
         .ok_or_else(|| {
@@ -413,12 +451,16 @@ async fn handle_login_local(
         })?;
 
     let updated_config = config_manager.get().await;
-    if updated_config.local_auth_token != Some(auth_token.clone()) {
+    let saved_ok = match role {
+        SessionRole::User => updated_config.local_auth_token == Some(auth_token.clone()),
+        SessionRole::Agent => updated_config.local_agent_auth_token == Some(auth_token.clone()),
+    };
+    if !saved_ok {
         warn!("Auth token not properly saved to configuration");
         return Err(StatusError::internal_server_error().brief("Failed to save configuration"));
     }
 
-    set_token(req, res, auth_token.as_str());
+    set_token(req, res, role, auth_token.as_str());
     
     // Return CSRF token in header and body so frontend can use it without a separate request
     res.headers_mut()
@@ -428,18 +470,23 @@ async fn handle_login_local(
 }
 
 #[endpoint]
-async fn handle_logout(req: &mut Request, res: &mut Response) -> Result<Json<ApiResponse>, StatusError> {
+async fn handle_logout(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<Json<ApiResponse>, StatusError> {
     #[cfg(not(feature = "env_unsafe"))]
     validate_setup_origin_referer(req)?;
 
     let config_manager = get_config_manager();
+    let role = authenticated_role_from_depot(depot).unwrap_or(SessionRole::User);
 
     config_manager
-        .set_auth_token(None)
+        .set_auth_token_for_role(role, None)
         .await
         .map_err(|_| StatusError::internal_server_error().brief("Failed to save configuration"))?;
 
-    clear_token(req, res);
+    clear_token(res, role);
 
     Ok(Json(ApiResponse { message: "Logout successful".to_string(), csrf_token: None }))
 }
@@ -496,7 +543,7 @@ async fn create_password_local(
         .map_err(|_| StatusError::internal_server_error().brief("Failed to save configuration"))?;
 
     // Set auth cookie
-    set_token(req, res, auth_token.as_str());
+    set_token(req, res, SessionRole::User, auth_token.as_str());
 
     res.headers_mut()
         .insert("X-CSRF-Token", salvo::http::HeaderValue::from_str(&csrf_token).unwrap());
@@ -559,7 +606,7 @@ async fn modify_password_local(
         })?;
 
     // Set new auth cookie
-    set_token(req, res, new_auth_token.as_str());
+    set_token(req, res, SessionRole::User, new_auth_token.as_str());
 
     res.headers_mut()
         .insert("X-CSRF-Token", salvo::http::HeaderValue::from_str(&csrf_token).unwrap());
@@ -607,7 +654,7 @@ async fn disable_local_password(
         .await
         .map_err(|_| StatusError::internal_server_error().brief("Failed to save configuration"))?;
     config_manager
-        .set_auth_token(None)
+        .clear_all_auth_tokens()
         .await
         .map_err(|_| StatusError::internal_server_error().brief("Failed to save configuration"))?;
     config_manager
@@ -615,8 +662,9 @@ async fn disable_local_password(
         .await
         .map_err(|_| StatusError::internal_server_error().brief("Failed to save configuration"))?;
 
-    // Clear auth cookie
-    clear_token(req, res);
+    // Clear both role cookies
+    clear_token(res, SessionRole::User);
+    clear_token(res, SessionRole::Agent);
 
     Ok(Json(ApiResponse {
         message: "Password disabled successfully".to_string(),
@@ -841,7 +889,7 @@ async fn handle_device_setup(
             .ok_or_else(|| StatusError::internal_server_error().brief("Failed to save config"))?;
 
         // Set auth cookie
-        set_token(req, res, auth_token.as_str());
+        set_token(req, res, SessionRole::User, auth_token.as_str());
         
         res.headers_mut()
             .insert("X-CSRF-Token", salvo::http::HeaderValue::from_str(&csrf_token).unwrap());
@@ -851,7 +899,7 @@ async fn handle_device_setup(
             .await
             .map_err(|_| StatusError::internal_server_error().brief("Failed to save config"))?;
         config_manager
-            .set_auth_token(None)
+            .clear_all_auth_tokens()
             .await
             .map_err(|_| StatusError::internal_server_error().brief("Failed to save config"))?;
     }
@@ -1208,7 +1256,11 @@ async fn handle_storage_upload(
             Err(_) => return Err(StatusError::not_found().brief("Upload not found")),
         };
 
-    let mut total_bytes_written = already_uploaded;
+    // Durable progress comes only from append/complete — never from request body length.
+    let already_before = already_uploaded;
+    let mut already = already_uploaded;
+    let mut body_frames: u64 = 0;
+    let mut body_bytes: u64 = 0;
     let mut stream = req.take_body().into_stream();
 
     while let Some(item) = stream.next().await {
@@ -1234,24 +1286,32 @@ async fn handle_storage_upload(
                     // empty chunk is not EOF; continue
                     continue;
                 }
-                if let Err(e) =
-                    crate::hardware::usb::storage::append_upload_data(&upload_id, bytes.as_ref())
-                        .await
+                body_frames += 1;
+                body_bytes += bytes.len() as u64;
+                match crate::hardware::usb::storage::append_upload_data(
+                    &upload_id,
+                    bytes.as_ref(),
+                )
+                .await
                 {
-                    warn!("failed to write upload chunk {}: {}", upload_id, e);
-                    if let Err(fin_err) =
-                        crate::hardware::usb::storage::complete_upload(&upload_id).await
-                    {
-                        warn!(
-                            "failed to finalize upload after write error {}: {}",
-                            upload_id, fin_err
+                    Ok((_size, next_already)) => {
+                        already = next_already;
+                    }
+                    Err(e) => {
+                        warn!("failed to write upload chunk {}: {}", upload_id, e);
+                        if let Err(fin_err) =
+                            crate::hardware::usb::storage::complete_upload(&upload_id).await
+                        {
+                            warn!(
+                                "failed to finalize upload after write error {}: {}",
+                                upload_id, fin_err
+                            );
+                        }
+                        return Err(
+                            StatusError::internal_server_error().brief("Failed to write upload data")
                         );
                     }
-                    return Err(
-                        StatusError::internal_server_error().brief("Failed to write upload data")
-                    );
                 }
-                total_bytes_written += bytes.len() as i64;
             }
             Err(_non_data_frame) => {
                 // Ignore non-DATA frames (e.g., trailers)
@@ -1260,29 +1320,42 @@ async fn handle_storage_upload(
         }
     }
 
-    // Finalize and integrity check
+    let already_after_append = already;
+
+    // Finalize: status uses durable on-disk length from complete_upload.
     match crate::hardware::usb::storage::complete_upload(&upload_id).await {
-        Ok(_) => {
-            if total_bytes_written == size {
-                info!(
-                    "Upload {} completed successfully: {}/{}",
-                    upload_id, total_bytes_written, size
-                );
+        Ok(durable) => {
+            info!(
+                "upload http {}: already_before={} body_frames={} body_bytes={} already_after_append={} durable={} size={}",
+                upload_id,
+                already_before,
+                body_frames,
+                body_bytes,
+                already_after_append,
+                durable,
+                size
+            );
+            already = durable;
+            if already == size {
+                info!("Upload {} completed successfully: {}/{}", upload_id, already, size);
                 Ok(Json(ApiResponse { message: "Upload completed".to_string(), csrf_token: None }))
             } else {
                 warn!(
                     "Upload {} ended before complete file received: {}/{}",
-                    upload_id, total_bytes_written, size
+                    upload_id, already, size
                 );
                 res.status_code(StatusCode::ACCEPTED);
                 Ok(Json(ApiResponse {
-                    message: format!("Upload partial: {total_bytes_written}/{size}"),
+                    message: format!("Upload partial: {already}/{size}"),
                     csrf_token: None,
                 }))
             }
         }
         Err(e) => {
-            warn!("failed to finalize upload {}: {}", upload_id, e);
+            warn!(
+                "failed to finalize upload {}: {} (already_before={} body_frames={} body_bytes={} already_after_append={} size={})",
+                upload_id, e, already_before, body_frames, body_bytes, already_after_append, size
+            );
             Err(StatusError::internal_server_error().brief("Failed to finalize upload"))
         }
     }
@@ -1297,6 +1370,7 @@ async fn handle_metrics() -> &'static str {
 #[endpoint]
 async fn handle_webrtc_session(
     req: &mut Request,
+    depot: &mut Depot,
 ) -> Result<Json<WebRTCSessionResponse>, StatusError> {
     info!("Received WebRTC session request");
 
@@ -1305,13 +1379,26 @@ async fn handle_webrtc_session(
         .await
         .map_err(|e| StatusError::bad_request().brief(format!("Invalid JSON: {e}")))?;
 
+    let role = parse_client_type(request.client_type.as_deref())
+        .map_err(|e| StatusError::bad_request().brief(e))?;
+
+    if let Some(cookie_role) = authenticated_role_from_depot(depot)
+        && cookie_role != role
+    {
+        return Err(StatusError::forbidden().brief("clientType does not match auth cookie role"));
+    }
+
     let app_state = get_global_app_state();
 
     let webrtc_api = webrtc::get_webrtc_api().await;
     let session_config = webrtc::SessionConfig {
-        ice_servers: request.ice_servers,
+        // LAN: is_cloud=false so new_session ignores ICE lists; still map
+        // the wire field so the type stays consistent.
+        ice_servers: webrtc::resolve_ice_servers(vec![], request.ice_servers.unwrap_or_default()),
         local_ip: request.ip.and_then(|ip| ip.parse().ok()),
         is_cloud: false,
+        role,
+        cloud_client_id: None,
     };
 
     let session =
@@ -1332,17 +1419,30 @@ async fn handle_webrtc_session(
     };
 
     let session_id = session.id.clone();
-    info!("WebRTC session created successfully with id: {}", &session_id);
-    // Takeover: close previous current session after 1s
-    crate::webrtc::handle_session_takeover(app_state.clone(), session.clone())
+    match crate::webrtc::claim_and_activate_session(app_state.clone(), session.clone())
         .await
         .map_err(|e| {
             StatusError::internal_server_error()
-                .brief(format!("Failed to promote WebRTC session: {e}"))
-        })?;
+                .brief(format!("Failed to claim WebRTC session: {e}"))
+        })? {
+        ClaimRoleResult::Accepted { .. } => {}
+        ClaimRoleResult::RejectedOccupied => {
+            crate::webrtc::remove_and_close_session(&app_state, &session_id).await;
+            return Err(StatusError::conflict().brief("Agent session slot is already occupied"));
+        }
+        ClaimRoleResult::RejectedMcpDisabled => {
+            crate::webrtc::remove_and_close_session(&app_state, &session_id).await;
+            return Err(StatusError::forbidden().brief(
+                "MCP is disabled on the device; enable MCP before agent control",
+            ));
+        }
+        ClaimRoleResult::NotRegistered => {
+            crate::webrtc::remove_and_close_session(&app_state, &session_id).await;
+            return Err(StatusError::internal_server_error().brief("Session is no longer registered"));
+        }
+    }
 
-    // app_state.add_session(session).await;
-    // app_state.set_current_session_id(Some(session_id)).await;
+    info!("WebRTC session created successfully with id: {}", &session_id);
 
     Ok(Json(WebRTCSessionResponse { sd: answer }))
 }
@@ -1350,16 +1450,38 @@ async fn handle_webrtc_session(
 #[endpoint]
 async fn handle_webrtc_signaling_client(
     req: &mut Request,
+    depot: &mut Depot,
     res: &mut Response,
 ) -> Result<(), StatusError> {
     let source = req.remote_addr().to_string();
     let connection_id = Uuid::new_v4().to_string();
 
+    // Some(role) = explicit query; None = legacy (offer may omit clientType → user).
+    let ws_role = match req.query::<String>("clientType") {
+        Some(raw) => {
+            let role = SessionRole::parse(&raw).ok_or_else(|| {
+                StatusError::bad_request().brief(format!("Invalid clientType: {raw}"))
+            })?;
+            Some(role)
+        }
+        None => None,
+    };
+
+    // Password mode: cookie role must match effective signaling role (legacy omit ≡ user).
+    if let Some(cookie_role) = authenticated_role_from_depot(depot) {
+        let effective = ws_role.unwrap_or(SessionRole::User);
+        if effective != cookie_role {
+            return Err(
+                StatusError::forbidden().brief("clientType does not match auth cookie role")
+            );
+        }
+    }
+
     info!("WebRTC WebSocket connection from {}", source);
 
     let _ = WebSocketUpgrade::new()
-        .upgrade(req, res, |ws| async move {
-            if let Err(e) = handle_webrtc_websocket(ws, connection_id, source).await {
+        .upgrade(req, res, move |ws| async move {
+            if let Err(e) = handle_webrtc_websocket(ws, connection_id, source, ws_role).await {
                 warn!("WebSocket handler error: {}", e);
             }
         })
@@ -1607,6 +1729,7 @@ async fn handle_webrtc_websocket(
     mut ws: WebSocket,
     connection_id: String,
     source: String,
+    ws_role: Option<SessionRole>,
 ) -> anyhow::Result<()> {
     let device_metadata = serde_json::json!({
         "type": "device-metadata",
@@ -1637,6 +1760,7 @@ async fn handle_webrtc_websocket(
                     &source,
                     &app_state,
                     &mut ws,
+                    ws_role,
                 )
                 .await
                 {
@@ -1695,6 +1819,7 @@ async fn handle_webrtc_websocket_message(
     source: &str,
     app_state: &Arc<AppState>,
     ws: &mut WebSocket,
+    ws_role: Option<SessionRole>,
 ) -> anyhow::Result<bool> {
     if message == "ping" {
         ws.send(Message::text("pong")).await?;
@@ -1720,10 +1845,41 @@ async fn handle_webrtc_websocket_message(
                 if let Some(data) = parsed.get("data") {
                     let request: WebRTCSessionRequest = serde_json::from_value(data.clone())?;
 
+                    let effective_role = if let Some(bound) = ws_role {
+                        let offer_role = request
+                            .client_type
+                            .as_deref()
+                            .and_then(SessionRole::parse)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("offer clientType required and must match ws clientType")
+                            })?;
+                        if offer_role != bound {
+                            let err = serde_json::json!({
+                                "type": "error",
+                                "data": {
+                                    "code": "clientTypeMismatch",
+                                    "message": "offer clientType must match WebSocket clientType"
+                                }
+                            });
+                            let _ = ws.send(Message::text(err.to_string())).await;
+                            return Ok(true);
+                        }
+                        bound
+                    } else {
+                        parse_client_type(request.client_type.as_deref())
+                            .map_err(|e| anyhow::anyhow!(e))?
+                    };
+
                     let config = webrtc::SessionConfig {
-                        ice_servers: request.ice_servers,
+                        // LAN: is_cloud=false so new_session ignores ICE lists.
+                        ice_servers: webrtc::resolve_ice_servers(
+                            vec![],
+                            request.ice_servers.unwrap_or_default(),
+                        ),
                         local_ip: request.ip.and_then(|ip| ip.parse().ok()),
                         is_cloud: false,
+                        role: effective_role,
+                        cloud_client_id: None,
                     };
 
                     match webrtc::get_webrtc_api()
@@ -1734,27 +1890,71 @@ async fn handle_webrtc_websocket_message(
                         Ok(session) => {
                             match session.exchange_offer(&request.sd).await {
                                 Ok(answer) => {
-                                    let response = serde_json::json!({
-                                        "type": "answer",
-                                        "data": answer
-                                    });
-                                    let response_str = response.to_string();
-
-                                    if ws.send(Message::text(response_str)).await.is_err() {
-                                        crate::webrtc::remove_and_close_session(
-                                            app_state,
-                                            connection_id,
-                                        )
-                                        .await;
-                                        return Err(anyhow::anyhow!("Failed to send answer"));
-                                    }
-
-                                    // Takeover: make this the current session, close the previous after 1s
-                                    crate::webrtc::handle_session_takeover(
+                                    match crate::webrtc::claim_and_activate_session(
                                         app_state.clone(),
                                         session.clone(),
                                     )
-                                    .await?;
+                                    .await?
+                                    {
+                                        ClaimRoleResult::Accepted { .. } => {
+                                            let response = serde_json::json!({
+                                                "type": "answer",
+                                                "data": answer
+                                            });
+                                            let response_str = response.to_string();
+
+                                            if ws.send(Message::text(response_str)).await.is_err() {
+                                                crate::webrtc::remove_and_close_session(
+                                                    app_state,
+                                                    connection_id,
+                                                )
+                                                .await;
+                                                return Err(anyhow::anyhow!("Failed to send answer"));
+                                            }
+                                        }
+                                        ClaimRoleResult::RejectedOccupied => {
+                                            let err = serde_json::json!({
+                                                "type": "error",
+                                                "data": {
+                                                    "code": "agentSlotOccupied",
+                                                    "message": "Agent session slot is already occupied"
+                                                }
+                                            });
+                                            let _ = ws.send(Message::text(err.to_string())).await;
+                                            crate::webrtc::remove_and_close_session(
+                                                app_state,
+                                                connection_id,
+                                            )
+                                            .await;
+                                            return Ok(true);
+                                        }
+                                        ClaimRoleResult::RejectedMcpDisabled => {
+                                            let err = serde_json::json!({
+                                                "type": "error",
+                                                "data": {
+                                                    "code": "mcpDisabled",
+                                                    "message": "MCP is disabled on the device; enable MCP before agent control"
+                                                }
+                                            });
+                                            let _ = ws.send(Message::text(err.to_string())).await;
+                                            crate::webrtc::remove_and_close_session(
+                                                app_state,
+                                                connection_id,
+                                            )
+                                            .await;
+                                            return Ok(true);
+                                        }
+                                        ClaimRoleResult::NotRegistered => {
+                                            crate::webrtc::remove_and_close_session(
+                                                app_state,
+                                                connection_id,
+                                            )
+                                            .await;
+                                            return Err(anyhow::anyhow!(
+                                                "session is no longer registered"
+                                            ));
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     error!("Failed to exchange offer: {}", e);
@@ -1805,11 +2005,25 @@ pub fn get_global_app_state() -> Arc<AppState> {
     GLOBAL_APP_STATE.get_or_init(|| Arc::new(AppState::new())).clone()
 }
 
-fn set_token(req: &mut Request, res: &mut Response, auth_token: &str) {
+fn parse_client_type(raw: Option<&str>) -> Result<SessionRole, String> {
+    match raw {
+        None | Some("") => Ok(SessionRole::User),
+        Some(s) => SessionRole::parse(s).ok_or_else(|| format!("Invalid clientType: {s}")),
+    }
+}
+
+fn cookie_name_for_role(role: SessionRole) -> &'static str {
+    match role {
+        SessionRole::User => AUTH_COOKIE_USER,
+        SessionRole::Agent => AUTH_COOKIE_AGENT,
+    }
+}
+
+fn set_token(req: &mut Request, res: &mut Response, role: SessionRole, auth_token: &str) {
     let is_https = middleware::request_is_https(req);
 
     // Set auth cookie (7 days expiry, HttpOnly, SameSite)
-    let cookie = Cookie::build(("authToken", auth_token))
+    let cookie = Cookie::build((cookie_name_for_role(role), auth_token))
         .max_age(time::Duration::days(7))
         .path("/")
         .http_only(true)
@@ -1822,11 +2036,12 @@ fn set_token(req: &mut Request, res: &mut Response, auth_token: &str) {
         .append("Set-Cookie", salvo::http::HeaderValue::from_str(&set_cookie_auth).unwrap());
 }
 
-/// Clear session cookies. Emit both Secure and non-Secure variants so logout works
+/// Clear session cookie for a role. Emit both Secure and non-Secure variants so logout works
 /// after HTTP-only or HTTPS-only logins (or switching between them on LAN).
-fn clear_token(_req: &mut Request, res: &mut Response) {
+fn clear_token(res: &mut Response, role: SessionRole) {
+    let name = cookie_name_for_role(role);
     for secure in [false, true] {
-        append_expired_cookie(res, "authToken", secure);
+        append_expired_cookie(res, name, secure);
     }
 }
 

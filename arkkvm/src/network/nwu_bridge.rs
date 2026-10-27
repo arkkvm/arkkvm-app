@@ -31,11 +31,11 @@ fn refresh_script_path() -> &'static str {
 
 async fn run_command(program: &str, args: &[&str]) -> Result<()> {
     info!("Running: {} {}", program, args.join(" "));
-    let output = Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+        .stderr(Stdio::piped());
+    let output = crate::process_spawn::output(cmd)
         .await
         .with_context(|| format!("Failed to execute {program}"))?;
 
@@ -89,7 +89,13 @@ pub async fn apply_hostname(name: &str, domain: &str) -> Result<()> {
         .await
         .with_context(|| "Failed to write /etc/hostname")?;
 
-    match Command::new("hostname").arg(name).output().await {
+    match crate::process_spawn::output({
+        let mut cmd = Command::new("hostname");
+        cmd.arg(name);
+        cmd
+    })
+    .await
+    {
         Ok(out) if out.status.success() => {}
         Ok(out) => {
             warn!(

@@ -2,17 +2,20 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use parking_lot::Mutex;
-use tracing::{debug, error, info, warn};
-use webrtc::data_channel::RTCDataChannel;
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use tracing::{debug, info, warn};
+use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelMessage};
 
 use crate::hardware::usb::storage::{
-    append_ft_upload_data, append_upload_data, complete_ft_upload, complete_upload, get_ft_upload_progress, get_upload_progress, set_webrtc_read_handler
+    append_ft_upload_data, append_upload_data, claim_ft_upload_channel, claim_upload_channel,
+    complete_ft_upload, complete_upload, get_ft_upload_progress, get_upload_progress,
+    set_webrtc_read_handler,
 };
+use crate::ip_forward::IpForward;
 use crate::jsonrpc::PROCESSOR;
 use crate::remote_mount;
-use crate::terminal::setup_terminal_channel;
+use crate::terminal::WebTerminal;
 use crate::web::get_global_app_state;
+use crate::webrtc::{spawn_dc_events, DcCallbacks};
 
 /// Handle incoming RPC messages through WebRTC data channel
 // pub async fn handle_rpc_message(msg: DataChannelMessage, session: &Session) {
@@ -26,52 +29,76 @@ use crate::web::get_global_app_state;
 //     processor.handle_message(msg, session).await;
 // }
 
-/// Handle terminal data channel - implements the full terminal functionality
-pub async fn handle_terminal_channel(channel: Arc<RTCDataChannel>) {
-    let label = channel.label().to_string();
+/// Handle local WebTerminal data channel (label `terminal`).
+pub async fn handle_terminal_channel(channel: Arc<dyn DataChannel>, session_id: String) {
+    let label = channel.label().await.unwrap_or_default();
     let channel_id = channel.id();
     info!("Terminal data channel '{}' (ID: {:?}) established", label, channel_id);
 
-    // Create terminal handler which automatically sets up all event handlers
-    match setup_terminal_channel(channel).await {
-        Ok(_handler) => {
-            // Handler is now managing the entire terminal lifecycle
-            info!("Terminal handler successfully initialized");
+    match WebTerminal::attach_async(channel).await {
+        Ok(handle) => {
+            if let Some(session) = get_global_app_state().get_session_by_id(&session_id).await {
+                if let Err(rejected) = session.install_terminal(handle) {
+                    warn!("session {} already closing; stopping terminal", session_id);
+                    rejected.stop_and_wait().await;
+                } else {
+                    info!("WebTerminal handler registered on session {}", session_id);
+                }
+            } else {
+                warn!("WebTerminal attached but session {} gone; stopping terminal", session_id);
+                handle.stop_and_wait().await;
+            }
         }
+        Err(e) => warn!("Failed to setup WebTerminal channel: {}", e),
+    }
+}
+
+/// Handle IP forward DataChannel after consuming a one-shot ticket.
+pub async fn handle_ip_forward_channel(channel: Arc<dyn DataChannel>, session_id: String) {
+    let label = channel.label().await.unwrap_or_default();
+    let channel_id = channel.id();
+    info!("IP forward data channel '{}' (ID: {:?}) for session {}", label, channel_id, session_id);
+
+    let params = match crate::ip_forward::consume(&label, &session_id).await {
+        Ok(params) => params,
         Err(e) => {
-            warn!("Failed to setup terminal channel: {}", e);
+            warn!("Rejecting ip forward channel '{}': {}", label, e);
+            let _ = channel.close().await;
+            return;
         }
+    };
+
+    if let Err(e) = IpForward::attach_async(channel.clone(), params).await {
+        warn!("Failed to setup IpForward channel '{}': {}", label, e);
+        let _ = channel.close().await;
+    } else {
+        info!("IpForward handler finished for '{}'", label);
     }
 }
 
 /// Handle serial data channel
-pub async fn handle_serial_channel(channel: Arc<RTCDataChannel>) {
-    let label = channel.label().to_string();
+pub async fn handle_serial_channel(channel: Arc<dyn DataChannel>) {
+    let label = channel.label().await.unwrap_or_default();
     info!("Serial data channel '{}' established", label);
 
     // Set up message handler for serial data
-    channel.on_message(Box::new(move |msg: DataChannelMessage| {
-        Box::pin(async move {
-            handle_serial_message(msg).await;
-        })
-    }));
-
-    // Set up channel state handlers
-    channel.on_open(Box::new(move || {
-        Box::pin(async move {
-            info!("Serial channel opened");
-        })
-    }));
-
-    channel.on_close(Box::new(move || {
-        Box::pin(async move {
-            info!("Serial channel closed");
-        })
-    }));
+    spawn_dc_events(
+        channel,
+        DcCallbacks {
+            on_message: Some(Box::new(move |msg: RTCDataChannelMessage| {
+                tokio::spawn(async move {
+                    handle_serial_message(msg).await;
+                });
+            })),
+            on_open: Some(Box::new(|| info!("Serial channel opened"))),
+            on_close: Some(Box::new(|| info!("Serial channel closed"))),
+            ..Default::default()
+        },
+    );
 }
 
 /// Handle serial messages
-async fn handle_serial_message(msg: DataChannelMessage) {
+async fn handle_serial_message(msg: RTCDataChannelMessage) {
     debug!("Received serial data: {} bytes", msg.data.len());
 
     // TODO: Forward serial data to/from actual serial port
@@ -82,9 +109,11 @@ async fn handle_serial_message(msg: DataChannelMessage) {
     // - Data format handling
 }
 
-/// Handle upload data channels (dynamic channels with upload_ prefix)
-pub async fn handle_upload_channel(channel: Arc<RTCDataChannel>) {
-    let label = channel.label().to_string();
+/// Handle upload data channels (dynamic channels with upload_ prefix).
+/// This function is already the channel's single task: each chunk and the
+/// final rename run here, in order, before the next event is read.
+pub async fn handle_upload_channel(channel: Arc<dyn DataChannel>) {
+    let label = channel.label().await.unwrap_or_default();
     info!("Upload data channel '{}' established", label);
 
     if !label.starts_with("upload_") {
@@ -92,101 +121,150 @@ pub async fn handle_upload_channel(channel: Arc<RTCDataChannel>) {
         return;
     }
 
-    let upload_id = label.clone();
+    let upload_id = label;
     info!("Starting file upload with ID: {}", upload_id);
+    if let Err(e) = claim_upload_channel(&upload_id).await {
+        warn!("Rejecting upload channel {}: {}", upload_id, e);
+        let _ = channel.close().await;
+        return;
+    }
 
-    // Throttle progress to ~200ms using non-poisoning mutex
     let last_progress = Arc::new(Mutex::new(std::time::Instant::now()));
-
-    // Message handler: write chunk + throttled progress feedback
-    let ch_for_msg = channel.clone();
-    let upload_id_for_msg = upload_id.clone();
-    let last_for_msg = last_progress.clone();
-    channel.on_message(Box::new(move |msg: DataChannelMessage| {
-        let ch = ch_for_msg.clone();
-        let upload_id = upload_id_for_msg.clone();
-        let last = last_for_msg.clone();
-        Box::pin(async move {
-            // Write chunk
-            if let Err(e) = append_upload_data(&upload_id, &msg.data).await {
-                warn!("failed to write upload chunk {}: {}", upload_id, e);
-                return;
-            }
-
-            // Throttle progress send to ~200ms
-            let mut should_send = false;
-            {
-                let mut t = last.lock();
-                if t.elapsed() >= std::time::Duration::from_millis(200) {
-                    *t = std::time::Instant::now();
-                    should_send = true;
-                }
-            }
-
-            // Read current progress
-            match get_upload_progress(&upload_id).await {
-                Ok((size, already)) => {
-                    // Force-send final progress when done, even if throttled
-                    if already >= size {
-                        let progress = serde_json::json!({
-                            "Size": size,
-                            "AlreadyUploadedBytes": already,
-                        });
-                        if let Err(e) = ch.send_text(progress.to_string()).await {
-                            warn!("failed to send final upload progress {}: {}", upload_id, e);
-                        }
-                        if let Err(e) = ch.close().await {
-                            warn!("failed to close upload channel {}: {}", upload_id, e);
-                        }
-                        return;
-                    }
-
-                    if should_send {
-                        let progress = serde_json::json!({
-                            "Size": size,
-                            "AlreadyUploadedBytes": already,
-                        });
-                        if let Err(e) = ch.send_text(progress.to_string()).await {
-                            warn!("failed to send upload progress {}: {}", upload_id, e);
+    let mut last_reported = 0i64;
+    let mut finalized = false;
+    let mut finished = false;
+    let mut progress_tick = tokio::time::interval(std::time::Duration::from_millis(200));
+    progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    progress_tick.tick().await;
+    loop {
+        tokio::select! {
+            event = channel.poll() => {
+                let Some(event) = event else { break };
+                match event {
+                    DataChannelEvent::OnMessage(msg) if !finished => {
+                        if write_storage_chunk(&channel, &upload_id, &last_progress, &mut last_reported, msg).await {
+                            finished = true;
                         }
                     }
-                }
-                Err(e) => {
-                    // Not fatal; just log
-                    warn!("failed to get upload progress {}: {}", upload_id, e);
-                }
-            }
-        })
-    }));
-
-    // Finalize on close (rename .incomplete -> final if complete)
-    let upload_id_for_close = upload_id.clone();
-    channel.on_close(Box::new(move || {
-        let upload_id = upload_id_for_close.clone();
-        Box::pin(async move {
-            match get_upload_progress(&upload_id).await {
-                Ok((size, already)) => {
-                    if already >= size {
-                        info!("Upload {} completed (on close): {}/{}", upload_id, already, size);
-                    } else {
-                        warn!("Upload {} channel closed early: {}/{}", upload_id, already, size);
+                    DataChannelEvent::OnError => {
+                        warn!("DC error on label={} id={}", upload_id, channel.id());
+                        finalize_storage_upload(&upload_id).await;
+                        finalized = true;
+                        break;
                     }
-                }
-                Err(e) => {
-                    // Not found likely means already finalized earlier
-                    debug!("Upload {} close: progress not available: {}", upload_id, e);
+                    DataChannelEvent::OnClose | DataChannelEvent::OnClosing => {
+                        finalize_storage_upload(&upload_id).await;
+                        finalized = true;
+                        break;
+                    }
+                    _ => {}
                 }
             }
-            // Try to finalize if still pending; ignore 'not found'
-            if let Err(e) = complete_upload(&upload_id).await {
-                debug!("complete_upload on close ({}): {}", upload_id, e);
+            _ = progress_tick.tick(), if !finished => {
+                report_storage_progress_if_advanced(&channel, &upload_id, &last_progress, &mut last_reported).await;
             }
-        })
-    }));
+        }
+    }
+    if !finalized {
+        finalize_storage_upload(&upload_id).await;
+    }
 }
 
-pub async fn handle_ft_upload_channel(channel: Arc<RTCDataChannel>) {
-    let label = channel.label().to_string();
+async fn write_storage_chunk(
+    channel: &Arc<dyn DataChannel>,
+    upload_id: &str,
+    last_progress: &Mutex<std::time::Instant>,
+    last_reported: &mut i64,
+    msg: RTCDataChannelMessage,
+) -> bool {
+    let (size, already) = match append_upload_data(upload_id, &msg.data).await {
+        Ok(progress) => progress,
+        Err(e) => {
+            warn!("failed to write upload chunk {}: {}", upload_id, e);
+            return false;
+        }
+    };
+
+    let mut should_send = false;
+    {
+        let mut t = last_progress.lock();
+        if t.elapsed() >= std::time::Duration::from_millis(200) {
+            *t = std::time::Instant::now();
+            should_send = true;
+        }
+    }
+
+    if already >= size {
+        let progress = serde_json::json!({
+            "Size": size,
+            "AlreadyUploadedBytes": already,
+        });
+        if let Err(e) = channel.send_text(&progress.to_string()).await {
+            warn!("failed to send final upload progress {}: {}", upload_id, e);
+        } else {
+            *last_reported = already;
+        }
+        return true;
+    }
+
+    if should_send {
+        let progress = serde_json::json!({
+            "Size": size,
+            "AlreadyUploadedBytes": already,
+        });
+        if let Err(e) = channel.send_text(&progress.to_string()).await {
+            warn!("failed to send upload progress {}: {}", upload_id, e);
+        } else {
+            *last_reported = already;
+        }
+    }
+    false
+}
+
+async fn report_storage_progress_if_advanced(
+    channel: &Arc<dyn DataChannel>,
+    upload_id: &str,
+    last_progress: &Mutex<std::time::Instant>,
+    last_reported: &mut i64,
+) {
+    let Ok((size, already)) = get_upload_progress(upload_id).await else {
+        return;
+    };
+    if already <= *last_reported {
+        return;
+    }
+    let progress = serde_json::json!({
+        "Size": size,
+        "AlreadyUploadedBytes": already,
+    });
+    if let Err(e) = channel.send_text(&progress.to_string()).await {
+        warn!("failed to send upload progress {}: {}", upload_id, e);
+        return;
+    }
+    *last_reported = already;
+    *last_progress.lock() = std::time::Instant::now();
+}
+
+async fn finalize_storage_upload(upload_id: &str) {
+    match get_upload_progress(upload_id).await {
+        Ok((size, already)) => {
+            if already >= size {
+                info!("Upload {} completed (on close): {}/{}", upload_id, already, size);
+            } else {
+                warn!("Upload {} channel closed early: {}/{}", upload_id, already, size);
+            }
+        }
+        Err(e) => {
+            debug!("Upload {} close: progress not available: {}", upload_id, e);
+        }
+    }
+    if let Err(e) = complete_upload(upload_id).await {
+        debug!("complete_upload on close ({}): {}", upload_id, e);
+    }
+}
+
+pub async fn handle_ft_upload_channel(channel: Arc<dyn DataChannel>) {
+    let label = channel.label().await.unwrap_or_default();
     info!("Upload data channel '{}' established", label);
 
     if !label.starts_with("ft_upload_") {
@@ -194,121 +272,174 @@ pub async fn handle_ft_upload_channel(channel: Arc<RTCDataChannel>) {
         return;
     }
 
-    let upload_id = label.clone();
+    let upload_id = label;
     info!("Starting file upload with ID: {}", upload_id);
+    if let Err(e) = claim_ft_upload_channel(&upload_id).await {
+        warn!("Rejecting upload channel {}: {}", upload_id, e);
+        let _ = channel.close().await;
+        return;
+    }
 
-    // Throttle progress to ~200ms using non-poisoning mutex
     let last_progress = Arc::new(Mutex::new(std::time::Instant::now()));
-
-    // Message handler: write chunk + throttled progress feedback
-    let ch_for_msg = channel.clone();
-    let upload_id_for_msg = upload_id.clone();
-    let last_for_msg = last_progress.clone();
-
-    channel.on_message(Box::new(move |msg: DataChannelMessage| {
-        let ch = ch_for_msg.clone();
-        let upload_id = upload_id_for_msg.clone();
-        let last = last_for_msg.clone();
-        Box::pin(async move {
-            // Write chunk
-            if let Err(e) = append_ft_upload_data(&upload_id, &msg.data).await {
-                warn!("failed to write upload chunk {}: {}", upload_id, e);
-                return;
-            }
-
-            // Throttle progress send to ~200ms
-            let mut should_send = false;
-            {
-                let mut t = last.lock();
-                if t.elapsed() >= std::time::Duration::from_millis(200) {
-                    *t = std::time::Instant::now();
-                    should_send = true;
-                }
-            }
-
-            // Read current progress
-            match get_ft_upload_progress(&upload_id).await {
-                Ok((size, already)) => {
-                    // Force-send final progress when done, even if throttled
-                    if already >= size {
-                        let progress = serde_json::json!({
-                            "Size": size,
-                            "AlreadyUploadedBytes": already,
-                        });
-                        if let Err(e) = ch.send_text(progress.to_string()).await {
-                            warn!("failed to send final upload progress {}: {}", upload_id, e);
-                        }
-                        if let Err(e) = ch.close().await {
-                            warn!("failed to close upload channel {}: {}", upload_id, e);
-                        }
-                        return;
-                    }
-
-                    if should_send {
-                        let progress = serde_json::json!({
-                            "Size": size,
-                            "AlreadyUploadedBytes": already,
-                        });
-                        if let Err(e) = ch.send_text(progress.to_string()).await {
-                            warn!("failed to send upload progress {}: {}", upload_id, e);
+    let mut last_reported = 0i64;
+    let mut finalized = false;
+    let mut finished = false;
+    let mut progress_tick = tokio::time::interval(std::time::Duration::from_millis(200));
+    progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    progress_tick.tick().await;
+    loop {
+        tokio::select! {
+            event = channel.poll() => {
+                let Some(event) = event else { break };
+                match event {
+                    DataChannelEvent::OnMessage(msg) if !finished => {
+                        if write_ft_chunk(&channel, &upload_id, &last_progress, &mut last_reported, msg).await {
+                            finished = true;
                         }
                     }
-                }
-                Err(e) => {
-                    // Not fatal; just log
-                    warn!("failed to get upload progress {}: {}", upload_id, e);
-                }
-            }
-        })
-    }));
-
-    // Finalize on close (rename .incomplete -> final if complete)
-    let upload_id_for_close = upload_id.clone();
-    channel.on_close(Box::new(move || {
-        let upload_id = upload_id_for_close.clone();
-        Box::pin(async move {
-            match get_ft_upload_progress(&upload_id).await {
-                Ok((size, already)) => {
-                    if already >= size {
-                        info!("Upload {} completed (on close): {}/{}", upload_id, already, size);
-                    } else {
-                        warn!("Upload {} channel closed early: {}/{}", upload_id, already, size);
+                    DataChannelEvent::OnError => {
+                        warn!("DC error on label={} id={}", upload_id, channel.id());
+                        finalize_ft_upload(&upload_id).await;
+                        finalized = true;
+                        break;
                     }
-                }
-                Err(e) => {
-                    // Not found likely means already finalized earlier
-                    debug!("Upload {} close: progress not available: {}", upload_id, e);
+                    DataChannelEvent::OnClose | DataChannelEvent::OnClosing => {
+                        finalize_ft_upload(&upload_id).await;
+                        finalized = true;
+                        break;
+                    }
+                    _ => {}
                 }
             }
-            // Try to finalize if still pending; ignore 'not found'
-            if let Err(e) = complete_ft_upload(&upload_id).await {
-                debug!("complete_upload on close ({}): {}", upload_id, e);
+            _ = progress_tick.tick(), if !finished => {
+                report_ft_progress_if_advanced(&channel, &upload_id, &last_progress, &mut last_reported).await;
             }
-        })
-    }));
+        }
+    }
+    if !finalized {
+        finalize_ft_upload(&upload_id).await;
+    }
+}
+
+async fn write_ft_chunk(
+    channel: &Arc<dyn DataChannel>,
+    upload_id: &str,
+    last_progress: &Mutex<std::time::Instant>,
+    last_reported: &mut i64,
+    msg: RTCDataChannelMessage,
+) -> bool {
+    let (size, already) = match append_ft_upload_data(upload_id, &msg.data).await {
+        Ok(progress) => progress,
+        Err(e) => {
+            warn!("failed to write upload chunk {}: {}", upload_id, e);
+            return false;
+        }
+    };
+
+    let mut should_send = false;
+    {
+        let mut t = last_progress.lock();
+        if t.elapsed() >= std::time::Duration::from_millis(200) {
+            *t = std::time::Instant::now();
+            should_send = true;
+        }
+    }
+
+    if already >= size {
+        let progress = serde_json::json!({
+            "Size": size,
+            "AlreadyUploadedBytes": already,
+        });
+        if let Err(e) = channel.send_text(&progress.to_string()).await {
+            warn!("failed to send final upload progress {}: {}", upload_id, e);
+        } else {
+            *last_reported = already;
+        }
+        return true;
+    }
+
+    if should_send {
+        let progress = serde_json::json!({
+            "Size": size,
+            "AlreadyUploadedBytes": already,
+        });
+        if let Err(e) = channel.send_text(&progress.to_string()).await {
+            warn!("failed to send upload progress {}: {}", upload_id, e);
+        } else {
+            *last_reported = already;
+        }
+    }
+    false
+}
+
+async fn report_ft_progress_if_advanced(
+    channel: &Arc<dyn DataChannel>,
+    upload_id: &str,
+    last_progress: &Mutex<std::time::Instant>,
+    last_reported: &mut i64,
+) {
+    let Ok((size, already)) = get_ft_upload_progress(upload_id).await else {
+        return;
+    };
+    if already <= *last_reported {
+        return;
+    }
+    let progress = serde_json::json!({
+        "Size": size,
+        "AlreadyUploadedBytes": already,
+    });
+    if let Err(e) = channel.send_text(&progress.to_string()).await {
+        warn!("failed to send upload progress {}: {}", upload_id, e);
+        return;
+    }
+    *last_reported = already;
+    *last_progress.lock() = std::time::Instant::now();
+}
+
+async fn finalize_ft_upload(upload_id: &str) {
+    match get_ft_upload_progress(upload_id).await {
+        Ok((size, already)) => {
+            if already >= size {
+                info!("Upload {} completed (on close): {}/{}", upload_id, already, size);
+            } else {
+                warn!("Upload {} channel closed early: {}/{}", upload_id, already, size);
+            }
+        }
+        Err(e) => {
+            debug!("Upload {} close: progress not available: {}", upload_id, e);
+        }
+    }
+    if let Err(e) = complete_ft_upload(upload_id).await {
+        debug!("complete_upload on close ({}): {}", upload_id, e);
+    }
 }
 
 /// Data channel management utilities
 pub struct DataChannelManager {
     upload_prefix: String,
     ft_upload_prefix: String,
+    ip_forward_prefix: String,
 }
 
 impl DataChannelManager {
     pub fn new() -> Self {
-        Self { upload_prefix: "upload_".to_string(), ft_upload_prefix: "ft_upload_".to_string()}
+        Self {
+            upload_prefix: "upload_".to_string(),
+            ft_upload_prefix: "ft_upload_".to_string(),
+            ip_forward_prefix: crate::ip_forward::IP_FORWARD_PREFIX.to_string(),
+        }
     }
 
     /// Route data channel based on its label
-    pub async fn route_data_channel(&self, channel: Arc<RTCDataChannel>, session_id: String) {
-        let label = channel.label().to_string();
+    pub async fn route_data_channel(&self, channel: Arc<dyn DataChannel>, session_id: String) {
+        let label = channel.label().await.unwrap_or_default();
 
         match label.as_str() {
             "rpc" => {
                 info!("Setting up RPC data channel for session: {}", &session_id);
                 self.setup_rpc_channel(channel, session_id).await;
             }
-            
+
             "input" => {
                 info!("Setting up input data channel for session: {}", &session_id);
                 self.setup_input_channel(channel, session_id).await;
@@ -323,17 +454,17 @@ impl DataChannelManager {
                 info!("Setting up disk data channel for session: {}", &session_id);
                 self.setup_disk_channel(channel, session_id).await;
             }
-            
+
             "terminal" => {
-                info!("Setting up terminal data channel");
-                handle_terminal_channel(channel).await;
+                info!("Setting up WebTerminal data channel for session: {}", &session_id);
+                handle_terminal_channel(channel, session_id).await;
             }
-            
+
             "serial" => {
                 info!("Setting up serial data channel");
                 handle_serial_channel(channel).await;
             }
-            
+
             _ if label.starts_with(&self.upload_prefix) => {
                 info!("Setting up upload data channel");
                 tokio::spawn(handle_upload_channel(channel));
@@ -342,43 +473,54 @@ impl DataChannelManager {
             _ if label.starts_with(&self.ft_upload_prefix) => {
                 tokio::spawn(handle_ft_upload_channel(channel));
             }
-            
+
+            _ if label.starts_with(&self.ip_forward_prefix) => {
+                // Must not await here: blocking on_data_channel prevents on_open from
+                // running, so wait_dc_open would deadlock until timeout.
+                info!("Setting up IpForward data channel");
+                tokio::spawn(handle_ip_forward_channel(channel, session_id));
+            }
+
             _ => {
                 warn!("Unknown data channel type: {}", label);
             }
         }
     }
 
-    async fn setup_rpc_channel(&self, channel: Arc<RTCDataChannel>, session_id: String) {
+    async fn setup_rpc_channel(&self, channel: Arc<dyn DataChannel>, session_id: String) {
         // Store the RPC channel globally for this session
         // crate::webrtc::store_rpc_channel(&session.id, channel.clone()).await;
-        get_global_app_state().update_session_rpc_channel(session_id.as_str(), channel.clone()).await;
+        get_global_app_state()
+            .update_session_rpc_channel(session_id.as_str(), channel.clone())
+            .await;
 
         // let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let channel_clone = channel.clone();
-        channel.on_message(Box::new(move |msg: DataChannelMessage| {
+        let session_id_for_msg = session_id.clone();
+        let on_message = Box::new(move |msg: RTCDataChannelMessage| {
             // let tx = tx.clone();
             let channel = channel_clone.clone();
-            Box::pin(async move {
+            let session_id = session_id_for_msg.clone();
+            tokio::spawn(async move {
                 // if let Err(e) = tx.send(msg).await {
                 //     error!("failed to send message to RPC channel: {}", e);
                 // }
-                tokio::spawn(PROCESSOR.handle_message(msg, channel.clone()));
-            })
-        }));
+                tokio::spawn(PROCESSOR.handle_message(msg, channel, session_id));
+            });
+        });
 
         // let channel_clone = channel.clone();
         // tokio::spawn(async move {
         //     let channel = channel_clone.clone();
         //     while let Some(msg) = rx.recv().await {
-                
+
         //     }
         // });
 
         // When the RPC data channel is opened, trigger state updates so
         // events are sent only after the channel is ready and stored
-        channel.on_open(Box::new(move || {
-            Box::pin(async move {
+        let on_open = Box::new(move || {
+            tokio::spawn(async move {
                 info!("RPC channel opened - triggering state updates");
                 // crate::webrtc::trigger_ota_state_update().await;
                 crate::webrtc::trigger_video_state_update().await;
@@ -389,56 +531,79 @@ impl DataChannelManager {
                 crate::webrtc::on_active_sessions_changed().await;
 
                 // crate::jsonrpc::broadcast_virtual_cm_state(crate::module::VirtualCMState { camera: true, microphone: true }).await;
-            })
-        }));
+            });
+        });
+        spawn_dc_events(
+            channel,
+            DcCallbacks {
+                on_open: Some(on_open),
+                on_message: Some(on_message),
+                ..Default::default()
+            },
+        );
     }
 
-    async fn setup_input_channel(&self, channel: Arc<RTCDataChannel>, _session_id: String) {
-        channel.on_message(Box::new(move |msg: DataChannelMessage| {
-            Box::pin(async move {
-                PROCESSOR.handle_input_message(msg).await;
-            })
-        }));
+    async fn setup_input_channel(&self, channel: Arc<dyn DataChannel>, session_id: String) {
+        spawn_dc_events(
+            channel,
+            DcCallbacks {
+                on_message: Some(Box::new(move |msg: RTCDataChannelMessage| {
+                    let session_id = session_id.clone();
+                    tokio::spawn(async move {
+                        PROCESSOR.handle_input_message(msg, session_id).await;
+                    });
+                })),
+                ..Default::default()
+            },
+        );
     }
 
-    async fn setup_disk_channel(&self, channel: Arc<RTCDataChannel>, session_id: String) {
-
+    async fn setup_disk_channel(&self, channel: Arc<dyn DataChannel>, session_id: String) {
         // On open: install sender and bridge
         let ch_for_open = channel.clone();
-        channel.on_open(Box::new(move || {
+        let on_open = Box::new(move || {
             let ch = ch_for_open.clone();
-            Box::pin(async move {
+            tokio::spawn(async move {
                 let rt = tokio::runtime::Handle::current();
                 remote_mount::webrtc_disk_set_sender(Arc::new(move |text: &str| {
                     let ch = ch.clone();
                     let text = text.to_string();
                     rt.spawn(async move {
-                        let _ = ch.send_text(text).await.map_err(|e| anyhow!(e.to_string()));
+                        let _ = ch.send_text(&text).await.map_err(|e| anyhow!(e.to_string()));
                     });
                     Ok(())
                 }));
                 remote_mount::install_webrtc_disk_bridge();
                 info!("Disk data channel opened and bridge installed");
-            })
-        }));
+            });
+        });
 
         // Forward inbound data to remote_mount
-        channel.on_message(Box::new(move |msg: DataChannelMessage| {
+        let on_message = Box::new(move |msg: RTCDataChannelMessage| {
             let session_id = session_id.clone();
-            Box::pin(async move {
+            tokio::spawn(async move {
                 debug!("disk msg {} bytes (session={})", msg.data.len(), session_id);
                 remote_mount::webrtc_disk_on_message(&msg.data);
-            })
-        }));
+            });
+        });
 
         // On close: clear sender and handler
-        channel.on_close(Box::new(move || {
-            Box::pin(async move {
+        let on_close = Box::new(move || {
+            tokio::spawn(async move {
                 info!("Disk data channel closed");
                 remote_mount::webrtc_disk_clear_sender();
                 set_webrtc_read_handler(None);
-            })
-        }));
+            });
+        });
+        spawn_dc_events(
+            channel,
+            DcCallbacks {
+                on_open: Some(on_open),
+                on_message: Some(on_message),
+                on_close: Some(on_close),
+                ..Default::default()
+            },
+        );
     }
 }
 

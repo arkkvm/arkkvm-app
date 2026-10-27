@@ -34,6 +34,8 @@ pub const KEY_GET_USB_EMULATION_STATE: &str = "arkkvm/usb_devices/query/get_usb_
 pub const KEY_SET_USB_EMULATION_STATE: &str = "arkkvm/usb_devices/query/set_usb_emulation_state";
 pub const KEY_SET_MIC_PROCESS: &str = "arkkvm/usb_devices/query/set_mic_process";
 pub const KEY_GET_MIC_PROCESS_STATE: &str = "arkkvm/usb_devices/query/get_mic_process_state";
+pub const KEY_GET_NETWORK_ADAPTER_LEASES: &str =
+    "arkkvm/usb_devices/query/get_network_adapter_leases";
 
 pub async fn open_client() -> Result<Session> {
     zenoh::init_log_from_env_or("warn");
@@ -83,8 +85,14 @@ pub async fn serve(session: Session, control: ControlHandle) -> Result<()> {
         .declare_queryable(KEY_GET_MIC_PROCESS_STATE)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to declare get_mic_process_state queryable: {}", e))?;
+    let get_network_adapter_leases = session
+        .declare_queryable(KEY_GET_NETWORK_ADAPTER_LEASES)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("Failed to declare get_network_adapter_leases queryable: {}", e)
+        })?;
     info!(
-        "zenoh queryables ready: {}, {}, {}, {}, {}, {}, {}, {}, {}",
+        "zenoh queryables ready: {}, {}, {}, {}, {}, {}, {}, {}, {}, {}",
         KEY_APPLY,
         KEY_APPLY_RUNTIME,
         KEY_GET,
@@ -93,7 +101,8 @@ pub async fn serve(session: Session, control: ControlHandle) -> Result<()> {
         KEY_GET_USB_EMULATION_STATE,
         KEY_SET_USB_EMULATION_STATE,
         KEY_SET_MIC_PROCESS,
-        KEY_GET_MIC_PROCESS_STATE
+        KEY_GET_MIC_PROCESS_STATE,
+        KEY_GET_NETWORK_ADAPTER_LEASES
     );
     let sub = session
         .declare_subscriber("arkkvm/usb_devices/event/**")
@@ -249,6 +258,21 @@ pub async fn serve(session: Session, control: ControlHandle) -> Result<()> {
         }
     });
 
+    let get_leases_task = tokio::spawn(async move {
+        loop {
+            let query = match get_network_adapter_leases.recv_async().await {
+                Ok(q) => q,
+                Err(e) => {
+                    warn!("get_network_adapter_leases queryable closed: {}", e);
+                    break;
+                }
+            };
+            if let Err(e) = handle_get_network_adapter_leases_query(query).await {
+                error!("get_network_adapter_leases query failed: {:?}", e);
+            }
+        }
+    });
+
     let control_put = control.clone();
     let put_task = tokio::spawn(async move {
         loop {
@@ -331,6 +355,7 @@ pub async fn serve(session: Session, control: ControlHandle) -> Result<()> {
         _ = set_emulation_task => {},
         _ = set_mic_process_task => {},
         _ = get_mic_process_task => {},
+        _ = get_leases_task => {},
         _ = ums_task => {},
         _ = put_task => {},
     }
@@ -458,6 +483,35 @@ async fn handle_set_usb_emulation_state_query(query: Query, control: ControlHand
     }
 }
 
+async fn handle_get_network_adapter_leases_query(query: Query) -> Result<()> {
+    let resp = match crate::devices::network::read_active_leases() {
+        Ok(leases) => {
+            if leases.len() > 1 {
+                warn!(
+                    count = leases.len(),
+                    "multiple active USB DHCP leases reported to arkkvm"
+                );
+            }
+            let leases = leases
+                .into_iter()
+                .map(|l| NetworkAdapterLease {
+                    ip: l.ip.to_string(),
+                    mac: l.mac_string(),
+                    hostname: l.hostname,
+                    expires_in_secs: l.expires_in_secs,
+                })
+                .collect();
+            GetNetworkAdapterLeasesResponse { ok: true, leases, error: None }
+        }
+        Err(e) => GetNetworkAdapterLeasesResponse {
+            ok: false,
+            leases: Vec::new(),
+            error: Some(e),
+        },
+    };
+    reply_bytes(&query, prost::Message::encode_to_vec(&resp)).await
+}
+
 async fn handle_get_mic_process_state_query(query: Query, control: ControlHandle) -> Result<()> {
     match control.get_mic_process_state().await {
         Ok(running) => {
@@ -516,7 +570,10 @@ fn classify_runtime_error(err: &str) -> (i32, bool) {
         || lower.contains("recover")
     {
         (ApplyErrorCode::UsbGadgetBusy as i32, true)
-    } else if lower.contains("invalid") || lower.contains("missing") {
+    } else if lower.contains("invalid")
+        || lower.contains("missing")
+        || lower.contains("endpoint budget")
+    {
         (ApplyErrorCode::InvalidArgument as i32, false)
     } else {
         (ApplyErrorCode::Internal as i32, false)

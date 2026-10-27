@@ -57,11 +57,11 @@ impl NativeSupervisor {
         let binary = self.binary_path.clone();
         // run spawn in blocking pool
         let child = tokio::task::spawn_blocking(move || {
-            std::process::Command::new(&binary)
-                .stdin(Stdio::null())
+            let mut cmd = std::process::Command::new(&binary);
+            cmd.stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
+                .stderr(Stdio::null());
+            crate::process_spawn::spawn_std(cmd)
                 .with_context(|| format!("failed to start native binary: {}", &binary))
         })
         .await
@@ -108,12 +108,13 @@ impl NativeSupervisor {
                     if need_spawn {
                         // allow a short cooldown before restart
                         sleep(Duration::from_secs(10)).await;
-                        match Command::new(&this.binary_path)
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .spawn()
-                        {
+                        match {
+                            let mut cmd = Command::new(&this.binary_path);
+                            cmd.stdin(Stdio::null())
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null());
+                            crate::process_spawn::spawn_std(cmd)
+                        } {
                             Ok(child) => {
                                 info!("restarted native pid={}", child.id());
                                 *child_guard = Some(child);

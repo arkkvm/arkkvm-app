@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 use bytes::Bytes;
 use once_cell::sync::Lazy;
@@ -9,13 +10,14 @@ use serde_json as serde_json_crate;
 use tokio::sync::{RwLock, mpsc};
 // use tokio::time::Instant;
 use tracing::{debug, info, warn, error};
-use webrtc::media::Sample;
-use webrtc::track::track_local::{TrackLocal, track_local_static_sample::TrackLocalStaticSample};
+use rtc::media::Sample;
+use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 use anyhow::anyhow;
 
 use crate::config::get_config_manager;
 use crate::jsonrpc::PROCESSOR;
 use crate::hardware::hdmi::HdmiCapture;
+use crate::session::SessionRole;
 
 /// Video input state
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -44,9 +46,16 @@ static LAST_VIDEO_STATE: RwLock<VideoInputState> = RwLock::const_new(VideoInputS
 
 // ----- Native video FFI bridge (authoritative path) -----
 
-static VIDEO_SINK: tokio::sync::RwLock<Option<Arc<TrackLocalStaticSample>>> =
-    tokio::sync::RwLock::const_new(None);
-type FramePacket = (Bytes, u64, f64);
+struct SinkEntry {
+    session_id: String,
+    track: Arc<TrackLocalStaticSample>,
+    ssrc: u32,
+    payload_type: u8,
+}
+
+static VIDEO_SINK: Lazy<tokio::sync::RwLock<HashMap<SessionRole, SinkEntry>>> =
+    Lazy::new(|| tokio::sync::RwLock::new(HashMap::new()));
+type FramePacket = (Bytes, u64, f64, bool);
 static VIDEO_FRAME_TX: tokio::sync::OnceCell<mpsc::Sender<FramePacket>> =
     tokio::sync::OnceCell::const_new();
 
@@ -100,93 +109,126 @@ pub async fn ensure_video_pipeline_started() -> anyhow::Result<()> {
         .map(|_| ())
 }
 
-pub async fn attach_webrtc_sink(track: Arc<TrackLocalStaticSample>) {
-    *VIDEO_SINK.write().await = Some(track);
-    info!("video webrtc sink attached");
+pub async fn attach_webrtc_sink(
+    role: SessionRole,
+    session_id: String,
+    track: Arc<TrackLocalStaticSample>,
+    ssrc: u32,
+    payload_type: u8,
+) {
+    VIDEO_SINK.write().await.insert(
+        role,
+        SinkEntry {
+            session_id: session_id.clone(),
+            track,
+            ssrc,
+            payload_type,
+        },
+    );
+    info!("video webrtc sink attached for role {} session {}", role, session_id);
 }
 
-pub async fn detach_webrtc_sink() {
-    *VIDEO_SINK.write().await = None;
-    info!("video webrtc sink detached");
+pub async fn detach_if_session(role: SessionRole, session_id: &str) {
+    let mut sinks = VIDEO_SINK.write().await;
+    let should_remove = sinks
+        .get(&role)
+        .is_some_and(|entry| entry.session_id == session_id);
+    if should_remove {
+        sinks.remove(&role);
+        info!(
+            "video webrtc sink detached for role {} session {}",
+            role, session_id
+        );
+    }
 }
 
-pub async fn equal_webrtc_sink(track: Arc<TrackLocalStaticSample>) -> bool {
-    if let Some(sink) = VIDEO_SINK.read().await.as_ref() {
-        Arc::ptr_eq(sink, &track)
+pub async fn detach_webrtc_sink(role: SessionRole) {
+    if VIDEO_SINK.write().await.remove(&role).is_some() {
+        info!("video webrtc sink detached for role {}", role);
     }
-    else {
-        false
+}
+
+pub async fn detach_all_webrtc_sinks() {
+    let mut sinks = VIDEO_SINK.write().await;
+    if !sinks.is_empty() {
+        sinks.clear();
+        info!("all video webrtc sinks detached");
     }
+}
+
+pub async fn equal_webrtc_sink(role: SessionRole, track: &Arc<TrackLocalStaticSample>) -> bool {
+    VIDEO_SINK
+        .read()
+        .await
+        .get(&role)
+        .is_some_and(|entry| Arc::ptr_eq(&entry.track, track))
 }
 
 async fn video_frame_writer(mut rx: mpsc::Receiver<FramePacket>) {
     const VIDEO_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
-    const VIDEO_WRITE_FAIL_DETACH_THRESHOLD: u32 = 3;
-    let mut consecutive_write_failures: u32 = 0;
 
-    // let mut last_ts: Option<u64> = None;
-    // let mut last_time: Option<Instant> = None;
-    while let Some((data, pts_us, fps)) = rx.recv().await {
-        // let duration = match last_ts {
-        //     Some(prev) => Duration::from_micros(pts_us.saturating_sub(prev)),
-        //     None => Duration::from_millis((1000.0 / fps) as u64),
-        // };
+    while let Some((data, pts_us, fps, is_keyframe)) = rx.recv().await {
+        let entries: Vec<(SessionRole, String, Arc<TrackLocalStaticSample>, u32, u8)> = {
+            let sinks = VIDEO_SINK.read().await;
+            sinks
+                .iter()
+                .filter(|(role, _)| **role == SessionRole::User || is_keyframe)
+                .map(|(role, entry)| {
+                    (
+                        *role,
+                        entry.session_id.clone(),
+                        entry.track.clone(),
+                        entry.ssrc,
+                        entry.payload_type,
+                    )
+                })
+                .collect()
+        };
 
-        // let duration = if let Some(last_time) = last_time {
-        //     last_time.elapsed()
-        // }
-        // else {
-        //     Duration::from_millis(0)
-        // };
-        // last_time = Some(Instant::now());
+        let _ = pts_us;
+        let duration = Duration::from_millis((1000.0 / fps) as u64);
 
-        let mut should_detach_sink = false;
-        if let Some(track) = VIDEO_SINK.read().await.clone() {
-            // data is already Bytes, no conversion needed
-            let capture_time = UNIX_EPOCH + Duration::from_micros(pts_us);
-            let sample = Sample { data, duration: Duration::from_millis((1000.0 / fps) as u64), timestamp: capture_time, ..Default::default() };
-            match tokio::time::timeout(VIDEO_WRITE_TIMEOUT, track.write_sample(&sample)).await {
+        for (role, session_id, track, ssrc, payload_type) in entries {
+            let sample = Sample {
+                data: data.clone(),
+                duration,
+                ..Default::default()
+            };
+            let write_ok = match tokio::time::timeout(
+                VIDEO_WRITE_TIMEOUT,
+                track.write_sample(ssrc, payload_type, &sample, &[]),
+            )
+            .await
+            {
                 Ok(Ok(())) => {
-                    consecutive_write_failures = 0;
+                    true
                 }
                 Ok(Err(e)) => {
-                    consecutive_write_failures = consecutive_write_failures.saturating_add(1);
-                    warn!("error writing video sample: {}", e);
+                    warn!("error writing video sample for role {}: {}", role, e);
                     VIDEO_DROP_COUNTER.inc();
+                    false
                 }
                 Err(_) => {
-                    consecutive_write_failures = consecutive_write_failures.saturating_add(1);
                     warn!(
-                        "timed out writing video sample after {:?}",
-                        VIDEO_WRITE_TIMEOUT
+                        "timed out writing video sample for role {} after {:?}",
+                        role, VIDEO_WRITE_TIMEOUT
                     );
                     VIDEO_DROP_COUNTER.inc();
+                    false
                 }
-            }
+            };
 
-            if consecutive_write_failures > VIDEO_WRITE_FAIL_DETACH_THRESHOLD {
-                warn!(
-                    "detaching video sink after {} consecutive write failures",
-                    consecutive_write_failures
-                );
-                should_detach_sink = true;
-                consecutive_write_failures = 0;
+            if !write_ok {
+                detach_if_session(role, &session_id).await;
             }
         }
-
-        if should_detach_sink {
-            detach_webrtc_sink().await;
-        }
-
-        // last_ts = Some(pts_us);
     }
     error!("video frame writer stopped");
 }
 
-pub fn on_frame_received(data: &[u8], pts_us: u64, fps: f64) {
+pub fn on_frame_received(data: &[u8], pts_us: u64, fps: f64, is_keyframe: bool) {
     if let Some(tx) = VIDEO_FRAME_TX.get() {
-        if let Err(e) = tx.try_send((Bytes::copy_from_slice(data), pts_us, fps)) {
-            // warn!("Failed to send video frame: {:?}", e);
+        if let Err(_e) = tx.try_send((Bytes::copy_from_slice(data), pts_us, fps, is_keyframe)) {
             VIDEO_DROP_COUNTER.inc();
         }
     }
@@ -323,7 +365,7 @@ pub async fn stop_native_video() {
 
 pub async fn shutdown_video_pipeline() {
     stop_native_video().await;
-    detach_webrtc_sink().await;
+    detach_all_webrtc_sinks().await;
 }
 
 /// Update video quality dynamically
@@ -363,7 +405,7 @@ pub async fn get_video_stats() -> anyhow::Result<VideoStats> {
         width: state.width,
         height: state.height,
         fps: state.frame_per_second,
-        has_sink: VIDEO_SINK.read().await.is_some(),
+        has_sink: !VIDEO_SINK.read().await.is_empty(),
         pipeline_started: VIDEO_PIPELINE_STARTED.get().is_some(),
     };
     Ok(stats)
@@ -399,7 +441,10 @@ pub async fn trigger_video_state_update_rpc() {
     let video_state = LAST_VIDEO_STATE.read().await.clone();
     info!("Triggering video state update: {:?}", video_state);
 
-    if let Some(session) = crate::web::get_global_app_state().get_current_session().await {
+    if let Some(session) = crate::web::get_global_app_state()
+        .get_session_for_role(SessionRole::User)
+        .await
+    {
         // let mut session = crate::session::Session::new(session_id.clone());
         // if let Some(rpc_channel) = crate::webrtc::get_rpc_channel(&session_id).await {
         //     // Optional: check channel open state like webrtc.rs does

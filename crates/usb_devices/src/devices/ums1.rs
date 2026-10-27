@@ -5,6 +5,10 @@ use tracing::error;
 use crate::{config, error::UsbError, events::{ChangeRequest, ChangeResponse, UsbChangeHandler}};
 use std::{path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicBool, Ordering}}};
 
+/// Bulk IN + OUT for mass_storage.1 (file transfer).
+pub const ENDPOINT_IN: u8 = 1;
+pub const ENDPOINT_OUT: u8 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UmsFtEvent {
     Mount(String),
@@ -208,19 +212,21 @@ impl UsbChangeHandler for Ums1Handle {
 
     async fn on_change_request(&self, req: &ChangeRequest) -> ChangeResponse {
         match req {
-            ChangeRequest::RequestChange => {
-                if self.file_path.lock().await.is_some() {
-                    ChangeResponse::Reject(format!("{} is busy", self.name()))
-                }
-                else {
-                    self.udc_updating.store(true, Ordering::Release);
-                    ChangeResponse::Proceed
-                }
-            }
+            // Allow composite rebuild (e.g. SSH Forwarding enabling USB net); unmount in PrepareChange.
+            ChangeRequest::RequestChange => ChangeResponse::Proceed,
 
             ChangeRequest::PrepareChange => {
-                *self.lun_file_path.lock().await = None;
-                ChangeResponse::Proceed
+                match self.unmount_ums1().await {
+                    Ok(_) => {
+                        self.udc_updating.store(true, Ordering::Release);
+                        ChangeResponse::Proceed
+                    }
+                    Err(UsbError::DeviceNotEnabled(_)) | Err(UsbError::DeviceNotFound(_)) => {
+                        self.udc_updating.store(true, Ordering::Release);
+                        ChangeResponse::Proceed
+                    }
+                    Err(e) => ChangeResponse::Reject(format!("failed to unmount: {:?}", e)),
+                }
             }
 
             ChangeRequest::ChangeCompleted | ChangeRequest::ChangeCanceled => {

@@ -2,6 +2,7 @@ pub mod hid_abs;
 mod hid_io;
 pub mod hid_kb;
 pub mod hid_rel;
+pub mod network;
 pub mod uac;
 pub mod ums;
 pub mod ums1;
@@ -9,25 +10,90 @@ pub mod ums1;
 use std::path::{Path, PathBuf};
 
 use crate::config::*;
+use crate::devices::network::{adapter_type_from_i32, build_net_function};
 use crate::devices::ums::UmsMode;
 use crate::error::UsbError;
-use crate::proto::v1::DeviceSwitches;
+use crate::proto::v1::{DeviceSwitches, NetworkAdapterType};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use usb_gadget::function::audio::{Channel, Uac1, Uac1Config};
 use usb_gadget::function::hid::Hid as LibHid;
 use usb_gadget::function::msd::{Lun, Msd};
+use usb_gadget::function::net::Net;
 use usb_gadget::function::video::{Format, Uvc, UvcFrame};
-use usb_gadget::{Class, Config, Gadget, Id, OsDescriptor, Strings};
+use usb_gadget::{Class, Config, Gadget, Id, OsDescriptor, Speed, Strings};
 
 const USB_MAX_STRING_LEN: usize = 126;
+
+/// UVC streaming + status interrupt IN (no OUT in current build_gadget config).
+pub const UVC_ENDPOINT_IN: u8 = 2;
+pub const UVC_ENDPOINT_OUT: u8 = 0;
+
+/// Sum function IN/OUT endpoints for the given switches (excludes EP0).
+pub fn endpoint_usage(switches: &DeviceSwitches) -> (u8, u8) {
+    let mut inn: u8 = 0;
+    let mut out: u8 = 0;
+
+    if switches.hid_kb_enabled {
+        inn = inn.saturating_add(hid_kb::ENDPOINT_IN);
+        out = out.saturating_add(hid_kb::ENDPOINT_OUT);
+    }
+    if switches.hid_abs_enabled {
+        inn = inn.saturating_add(hid_abs::ENDPOINT_IN);
+        out = out.saturating_add(hid_abs::ENDPOINT_OUT);
+    }
+    if switches.hid_rel_enabled {
+        inn = inn.saturating_add(hid_rel::ENDPOINT_IN);
+        out = out.saturating_add(hid_rel::ENDPOINT_OUT);
+    }
+    if switches.ums_vm_enabled {
+        inn = inn.saturating_add(ums::ENDPOINT_IN);
+        out = out.saturating_add(ums::ENDPOINT_OUT);
+    }
+    if switches.ums_ft_enabled {
+        inn = inn.saturating_add(ums1::ENDPOINT_IN);
+        out = out.saturating_add(ums1::ENDPOINT_OUT);
+    }
+    if switches.uac1_enabled {
+        inn = inn.saturating_add(uac::ENDPOINT_IN);
+        out = out.saturating_add(uac::ENDPOINT_OUT);
+    }
+    if switches.uvc_enabled {
+        inn = inn.saturating_add(UVC_ENDPOINT_IN);
+        out = out.saturating_add(UVC_ENDPOINT_OUT);
+    }
+    if let Some(na) = switches.network_adapter.as_ref() {
+        if na.enable {
+            let (ein, eout) = match adapter_type_from_i32(na.adapter_type) {
+                NetworkAdapterType::Rndis => (network::rndis::ENDPOINT_IN, network::rndis::ENDPOINT_OUT),
+                _ => (network::ncm::ENDPOINT_IN, network::ncm::ENDPOINT_OUT),
+            };
+            inn = inn.saturating_add(ein);
+            out = out.saturating_add(eout);
+        }
+    }
+
+    (inn, out)
+}
+
+/// Reject switch sets that exceed RV1106BG3 function endpoint limits.
+pub fn check_endpoint_budget(switches: &DeviceSwitches) -> Result<(), UsbError> {
+    let (inn, out) = endpoint_usage(switches);
+    if inn > MAX_FUNCTION_IN_EPS || out > MAX_FUNCTION_OUT_EPS {
+        return Err(UsbError::EndpointBudgetExceeded(format!(
+            "in={inn}/{MAX_FUNCTION_IN_EPS} out={out}/{MAX_FUNCTION_OUT_EPS}"
+        )));
+    }
+    Ok(())
+}
 
 pub fn build_gadget(
     base_info: &UsbBaseInfo,
     switches: &DeviceSwitches,
     device_config: (UmsMode),
-) -> Result<Gadget, UsbError> {
+) -> Result<(Gadget, Option<Net>), UsbError> {
     let (ums_vm_mode) = device_config;
+    let mut net_dev: Option<Net> = None;
 
     // 1. Build device base info
     let strings = Strings::new(
@@ -44,12 +110,28 @@ pub fn build_gadget(
     );
     gadget.name = Some(GADGET_NAME.into());
     gadget.device_release = base_info.bcd_device;
+    // Always set max_speed explicitly (ConfigFS: "full-speed" / "high-speed").
+    gadget.max_speed = Some(if base_info.force_full_speed {
+        Speed::FullSpeed
+    } else {
+        Speed::HighSpeed
+    });
 
     // 2. Build config
     let mut config = Config::new(GADGET_CONFIG_NAME);
     config.max_power = GADGET_MAX_POWER_MA;
 
     // 3. Add functions dynamically
+    // USB net early to reduce composite EP pressure vs UMS/UAC.
+    if let Some(na) = switches.network_adapter.as_ref() {
+        if na.enable {
+            let adapter_type = adapter_type_from_i32(na.adapter_type);
+            let (net, handle) = build_net_function(adapter_type);
+            config.functions.push(handle);
+            net_dev = Some(net);
+        }
+    }
+
     if switches.hid_kb_enabled {
         let mut builder = LibHid::builder();
         builder.sub_class = HID_KB_SUBCLASS;
@@ -133,10 +215,8 @@ pub fn build_gadget(
 
         let mut builder = Uac1::builder();
         builder.function_name = Some(UAC1_INSTANCE.to_string());
-        let (_uac1, handle) = builder
-            .with_capture_config(uac1_capture)
-            .with_playback_config(uac1_playback)
-            .build();
+        let (_uac1, handle) =
+            builder.with_capture_config(uac1_capture).with_playback_config(uac1_playback).build();
         config.functions.push(handle);
     }
 
@@ -173,7 +253,7 @@ pub fn build_gadget(
         config: 0, // first config
     });
 
-    Ok(gadget)
+    Ok((gadget, net_dev))
 }
 
 fn validate_strings(strings: &Strings) -> Result<(), UsbError> {
@@ -181,9 +261,9 @@ fn validate_strings(strings: &Strings) -> Result<(), UsbError> {
     let product_len = strings.product.len();
     let serial_number_len = strings.serial_number.len();
 
-    if manufacturer_len > USB_MAX_STRING_LEN ||
-        product_len > USB_MAX_STRING_LEN || 
-        serial_number_len > USB_MAX_STRING_LEN
+    if manufacturer_len > USB_MAX_STRING_LEN
+        || product_len > USB_MAX_STRING_LEN
+        || serial_number_len > USB_MAX_STRING_LEN
     {
         return Err(UsbError::InvalidArgument(format!(
             "length of manufacturer, product or serial_number must not exceed {USB_MAX_STRING_LEN} characters"
@@ -336,4 +416,61 @@ pub(crate) async fn write_file(path: &Path, data: &str) -> Result<(), UsbError> 
     })?;
     writer.flush().await.ok();
     Ok(())
+}
+
+#[cfg(test)]
+mod endpoint_budget_tests {
+    use super::*;
+    use crate::proto::v1::{NetworkAdapterSwitch, NetworkAdapterType};
+
+    fn ncm_on() -> Option<NetworkAdapterSwitch> {
+        Some(NetworkAdapterSwitch {
+            enable: true,
+            adapter_type: NetworkAdapterType::Ncm as i32,
+        })
+    }
+
+    /// Board-proven OK: kb + dual UMS + UAC + NCM → IN=6 OUT=4.
+    fn switches_kb_dual_ums_uac_ncm() -> DeviceSwitches {
+        DeviceSwitches {
+            hid_kb_enabled: true,
+            hid_abs_enabled: false,
+            hid_rel_enabled: false,
+            ums_vm_enabled: true,
+            ums_ft_enabled: true,
+            uac1_enabled: true,
+            uvc_enabled: false,
+            network_adapter: ncm_on(),
+        }
+    }
+
+    /// Board-failed: 3×HID + dual UMS + UAC + NCM → IN=8 OUT=4.
+    fn switches_three_hid_dual_ums_uac_ncm() -> DeviceSwitches {
+        DeviceSwitches {
+            hid_kb_enabled: true,
+            hid_abs_enabled: true,
+            hid_rel_enabled: true,
+            ums_vm_enabled: true,
+            ums_ft_enabled: true,
+            uac1_enabled: true,
+            uvc_enabled: false,
+            network_adapter: ncm_on(),
+        }
+    }
+
+    #[test]
+    fn kb_dual_ums_uac_ncm_fits_budget() {
+        let s = switches_kb_dual_ums_uac_ncm();
+        assert_eq!(endpoint_usage(&s), (6, 4));
+        assert!(check_endpoint_budget(&s).is_ok());
+    }
+
+    #[test]
+    fn three_hid_dual_ums_uac_ncm_exceeds_in_budget() {
+        let s = switches_three_hid_dual_ums_uac_ncm();
+        assert_eq!(endpoint_usage(&s), (8, 4));
+        let err = check_endpoint_budget(&s).unwrap_err();
+        assert!(matches!(err, UsbError::EndpointBudgetExceeded(_)));
+        assert!(err.to_string().contains("in=8/6"));
+    }
 }

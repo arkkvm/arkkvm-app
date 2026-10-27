@@ -1,32 +1,78 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::anyhow;
 use bytes::Bytes;
-use parking_lot::RwLock;
+use once_cell::sync::Lazy;
+use parking_lot::RwLock as ParkingRwLock;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn, error};
-use webrtc::media::Sample;
-use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+use rtc::media::Sample;
+use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 
 use crate::config::get_config_manager;
+use crate::session::SessionRole;
 use crate::zenoh_bus;
 
-static AUDIO_SINK: tokio::sync::RwLock<Option<Arc<TrackLocalStaticSample>>> =
-    tokio::sync::RwLock::const_new(None);
+struct SinkEntry {
+    session_id: String,
+    track: Arc<TrackLocalStaticSample>,
+    ssrc: u32,
+    payload_type: u8,
+}
+
+static AUDIO_SINK: Lazy<tokio::sync::RwLock<HashMap<SessionRole, SinkEntry>>> =
+    Lazy::new(|| tokio::sync::RwLock::new(HashMap::new()));
 
 lazy_static::lazy_static! {
     pub static ref AUDIO_RUNNING: AtomicBool = AtomicBool::new(false);
-    static ref AUDIO_HANDLE: Arc<RwLock<Option<JoinHandle<()>>>> = Arc::new(RwLock::new(None));
+    static ref AUDIO_HANDLE: Arc<ParkingRwLock<Option<JoinHandle<()>>>> = Arc::new(ParkingRwLock::new(None));
 }
 
-pub async fn attach_webrtc_sink(track: Arc<TrackLocalStaticSample>) {
-    *AUDIO_SINK.write().await = Some(track);
+pub async fn attach_webrtc_sink(
+    role: SessionRole,
+    session_id: String,
+    track: Arc<TrackLocalStaticSample>,
+    ssrc: u32,
+    payload_type: u8,
+) {
+    AUDIO_SINK.write().await.insert(
+        role,
+        SinkEntry {
+            session_id: session_id.clone(),
+            track,
+            ssrc,
+            payload_type,
+        },
+    );
+    info!("audio webrtc sink attached for role {} session {}", role, session_id);
 }
 
-pub async fn detach_webrtc_sink() {
-    *AUDIO_SINK.write().await = None;
+pub async fn detach_if_session(role: SessionRole, session_id: &str) {
+    let mut sinks = AUDIO_SINK.write().await;
+    let should_remove = sinks
+        .get(&role)
+        .is_some_and(|entry| entry.session_id == session_id);
+    if should_remove {
+        sinks.remove(&role);
+        info!(
+            "audio webrtc sink detached for role {} session {}",
+            role, session_id
+        );
+    }
+}
+
+pub async fn detach_webrtc_sink(role: SessionRole) {
+    if AUDIO_SINK.write().await.remove(&role).is_some() {
+        info!("audio webrtc sink detached for role {}", role);
+    }
+}
+
+pub async fn detach_all_webrtc_sinks() {
+    AUDIO_SINK.write().await.clear();
+    info!("all audio webrtc sinks detached");
 }
 
 pub fn init_native_audio() -> anyhow::Result<()> {
@@ -38,8 +84,7 @@ pub async fn shutdown_native_audio() {
     info!("Shutting down audio engine");
     stop_native_audio().await;
 
-    // Clear video sink
-    detach_webrtc_sink().await;
+    detach_all_webrtc_sinks().await;
     info!("Audio Engine shutdown complete");
 }
 
@@ -70,49 +115,63 @@ pub async fn start_native_audio() -> anyhow::Result<()> {
         .expect("Failed to declare subscriber");
 
     let handle = tokio::spawn(async move {
+        const AUDIO_FRAME_DURATION: Duration = Duration::from_millis(20);
+        const AUDIO_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+
         info!("Starting audio stream");
 
         loop {
-            if !AUDIO_RUNNING.load(Ordering::Acquire) {
-                break;
-            }
-
-            let reply = match subscriber.recv_timeout(Duration::from_millis(21)) {
-                Ok(Some(data)) => data,
-                Ok(None) => continue,
+            let reply = tokio::select! {
+                biased;
+                _ = wait_until_audio_stopped() => break,
+                result = subscriber.recv_async() => result,
+            };
+            let reply = match reply {
+                Ok(data) => data,
                 Err(e) => {
                     error!("Failed to receive audio frame: {:?}", e);
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
-                },
+                }
             };
-            
-            let Some(track) = AUDIO_SINK.read().await.clone() else {
-                continue;
+
+            let entries: Vec<(SessionRole, String, Arc<TrackLocalStaticSample>, u32, u8)> = {
+                let sinks = AUDIO_SINK.read().await;
+                if sinks.is_empty() {
+                    continue;
+                }
+                sinks
+                    .iter()
+                    .map(|(role, entry)| {
+                        (
+                            *role,
+                            entry.session_id.clone(),
+                            entry.track.clone(),
+                            entry.ssrc,
+                            entry.payload_type,
+                        )
+                    })
+                    .collect()
             };
 
             let payload = reply.payload();
             let payload_bytes = payload.to_bytes();
-            
+
             // Parse packet: [8 bytes timestamp][audio data]
-            // Support backward compatibility with old format (no timestamp)
-            let (audio_data, capture_time) = if payload_bytes.len() >= 8 {
-                // New format: extract timestamp and audio data
+            let audio_data = if payload_bytes.len() >= 8 {
                 match payload_bytes[0..8].try_into() {
                     Ok(timestamp_bytes) => {
                         let timestamp_us = u64::from_le_bytes(timestamp_bytes);
                         let audio_data = &payload_bytes[8..];
-                        
+
                         if audio_data.is_empty() {
                             warn!("Received audio frame with timestamp but no audio data");
                             continue;
                         }
-                        
-                        // Log timestamp for debugging (optional, can be removed in production)
-                        let capture_time = UNIX_EPOCH + Duration::from_micros(timestamp_us);
-                        debug!("Received audio frame with capture timestamp: {:?}", &capture_time);
-                        
-                        (audio_data, capture_time)
+
+                        debug!("Received audio frame with capture timestamp: {}", timestamp_us);
+
+                        audio_data
                     }
                     Err(_) => {
                         warn!("Failed to extract timestamp bytes, treating as old format");
@@ -120,22 +179,40 @@ pub async fn start_native_audio() -> anyhow::Result<()> {
                     }
                 }
             } else {
-                // Old format: entire payload is audio data
                 debug!("Received audio frame in old format (no timestamp), len: {}", payload_bytes.len());
                 continue;
             };
-            
-            // TODO: Use timestamp_us for WebRTC synchronization when webrtc-rs supports it
-            // For now, we just pass the audio data to write_sample
-            
-            let _ = track
-                    .write_sample(&Sample {
-                        data: Bytes::copy_from_slice(audio_data),
-                        duration: Duration::from_millis(20),
-                        timestamp: capture_time,
-                        ..Default::default()
-                    })
-                    .await;
+
+            let sample_data = Bytes::copy_from_slice(audio_data);
+            for (role, session_id, track, ssrc, payload_type) in entries {
+                let sample = Sample {
+                    data: sample_data.clone(),
+                    duration: AUDIO_FRAME_DURATION,
+                    ..Default::default()
+                };
+                let write_ok = match tokio::time::timeout(
+                    AUDIO_WRITE_TIMEOUT,
+                    track.write_sample(ssrc, payload_type, &sample, &[]),
+                )
+                .await
+                {
+                    Ok(Ok(())) => true,
+                    Ok(Err(e)) => {
+                        warn!("error writing audio sample for role {}: {}", role, e);
+                        false
+                    }
+                    Err(_) => {
+                        warn!(
+                            "timed out writing audio sample for role {} after {:?}",
+                            role, AUDIO_WRITE_TIMEOUT
+                        );
+                        false
+                    }
+                };
+                if !write_ok {
+                    detach_if_session(role, &session_id).await;
+                }
+            }
         }
         info!("Audio track piping finished");
     });
@@ -155,6 +232,12 @@ pub async fn stop_native_audio() {
         }
     }
     info!("Audio engine stopped")
+}
+
+async fn wait_until_audio_stopped() {
+    while AUDIO_RUNNING.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 pub fn get_webrtc_clock_rate() -> u32 {

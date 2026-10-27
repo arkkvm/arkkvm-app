@@ -131,9 +131,9 @@ pub async fn start_sshd() -> Result<()> {
         return Err(anyhow!("SSHD init script not found: {}", SSHD_PATH));
     }
 
-    let output = Command::new(SSHD_PATH)
-        .arg("start")
-        .output()
+    let mut cmd = Command::new(SSHD_PATH);
+    cmd.arg("start");
+    let output = crate::process_spawn::output(cmd)
         .await
         .map_err(|e| anyhow!("failed to execute SSHD start command: {:?}", e))?;
 
@@ -153,9 +153,9 @@ pub async fn stop_sshd() -> Result<()> {
         return Err(anyhow!("SSHD init script not found: {}", SSHD_PATH));
     }
 
-    let output = Command::new(SSHD_PATH)
-        .arg("stop")
-        .output()
+    let mut cmd = Command::new(SSHD_PATH);
+    cmd.arg("stop");
+    let output = crate::process_spawn::output(cmd)
         .await
         .map_err(|e| anyhow!("failed to execute SSHD stop command: {:?}", e))?;
 
@@ -175,9 +175,9 @@ pub async fn restart_sshd() -> Result<()> {
         return Err(anyhow!("SSHD init script not found: {}", SSHD_PATH));
     }
 
-    let output = Command::new(SSHD_PATH)
-        .arg("restart")
-        .output()
+    let mut cmd = Command::new(SSHD_PATH);
+    cmd.arg("restart");
+    let output = crate::process_spawn::output(cmd)
         .await
         .map_err(|e| anyhow!("failed to execute SSHD restart command: {:?}", e))?;
 

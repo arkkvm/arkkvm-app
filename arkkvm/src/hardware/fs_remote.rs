@@ -876,9 +876,11 @@ impl RemoteFs {
 
         let data_size = metadata.len();
         // Use stat command to get file blocks and block size for storage size
-        let output = Command::new("stat")
-            .args(["-c", "%b", &full_path.to_string_lossy()])
-            .output()
+        let output = crate::process_spawn::output({
+            let mut cmd = Command::new("stat");
+            cmd.args(["-c", "%b", &full_path.to_string_lossy()]);
+            cmd
+        })
             .await
             .context("Failed to execute stat command")?;
 
@@ -897,9 +899,11 @@ impl RemoteFs {
             .with_context(|| format!("Failed to parse blocks: {}", blocks_str))?;
 
         // Get block size
-        let block_size_output = Command::new("stat")
-            .args(["-c", "%B", &full_path.to_string_lossy()])
-            .output()
+        let block_size_output = crate::process_spawn::output({
+            let mut cmd = Command::new("stat");
+            cmd.args(["-c", "%B", &full_path.to_string_lossy()]);
+            cmd
+        })
             .await
             .context("Failed to execute stat command for block size")?;
 
@@ -926,49 +930,61 @@ impl RemoteFs {
         Ok((storage_size, data_size))
     }
 
-    /// Get total size of the mounted filesystem
+    /// Run `df -k` on the mount point and return (total, used, available) in **bytes**.
     ///
-    /// # Returns
-    /// * `Result<u64>` - Total size in bytes
-    pub async fn get_total_size(&self) -> Result<u64> {
-        self.ensure_mounted()?;
-
-        debug!("Getting total size for mount point: {:?}", self.mount_point);
-
-        // Use df command to get filesystem total size
-        let output = Command::new("df")
-            .args(["-B1", &self.mount_point.to_string_lossy()])
-            .output()
-            .await
-            .context("Failed to execute df command")?;
+    /// Board BusyBox has no GNU `df -B1`. Use `-k` (1K-blocks, also BusyBox default)
+    /// and multiply by 1024 so RPC fields stay byte-sized for the frontend
+    /// (`bytesTotal` / `getFtStorageDetails`).
+    async fn df_sizes_bytes(&self) -> Result<(u64, u64, u64)> {
+        let output = crate::process_spawn::output({
+            let mut cmd = Command::new("df");
+            cmd.args(["-k", &self.mount_point.to_string_lossy()]);
+            cmd
+        })
+        .await
+        .context("Failed to execute df command")?;
 
         if !output.status.success() {
             return Err(anyhow!(
-                "Failed to get filesystem total size: {}",
+                "Failed to get filesystem usage: {}",
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
 
         let output_str = String::from_utf8(output.stdout).context("Invalid UTF-8 in df output")?;
 
-        // Parse df output to get total size
-        // df output format: Filesystem 1K-blocks Used Available Use% Mounted-on
+        // df -k: Filesystem 1K-blocks Used Available Use% Mounted-on
         let lines: Vec<&str> = output_str.trim().split('\n').collect();
         if lines.len() < 2 {
             return Err(anyhow!("Invalid df output format"));
         }
 
-        let data_line = lines[1];
-        let fields: Vec<&str> = data_line.split_whitespace().collect();
+        let fields: Vec<&str> = lines[1].split_whitespace().collect();
         if fields.len() < 4 {
             return Err(anyhow!("Invalid df output format: insufficient fields"));
         }
 
-        // Parse total size (2nd field, 1-indexed)
-        let total_size = fields[1]
+        let total_k = fields[1]
             .parse::<u64>()
             .with_context(|| format!("Failed to parse total size: {}", fields[1]))?;
+        let used_k = fields[2]
+            .parse::<u64>()
+            .with_context(|| format!("Failed to parse used size: {}", fields[2]))?;
+        let available_k = fields[3]
+            .parse::<u64>()
+            .with_context(|| format!("Failed to parse available size: {}", fields[3]))?;
 
+        Ok((total_k * 1024, used_k * 1024, available_k * 1024))
+    }
+
+    /// Get total size of the mounted filesystem
+    ///
+    /// # Returns
+    /// * `Result<u64>` - Total size in bytes
+    pub async fn get_total_size(&self) -> Result<u64> {
+        self.ensure_mounted()?;
+        debug!("Getting total size for mount point: {:?}", self.mount_point);
+        let (total_size, _, _) = self.df_sizes_bytes().await?;
         debug!("Total size: {} bytes for {:?}", total_size, self.mount_point);
         Ok(total_size)
     }
@@ -979,43 +995,8 @@ impl RemoteFs {
     /// * `Result<u64>` - Used size in bytes
     pub async fn get_used_size(&self) -> Result<u64> {
         self.ensure_mounted()?;
-
         debug!("Getting used size for mount point: {:?}", self.mount_point);
-
-        // Use df command to get filesystem usage
-        let output = Command::new("df")
-            .args(["-B1", &self.mount_point.to_string_lossy()])
-            .output()
-            .await
-            .context("Failed to execute df command")?;
-
-        if !output.status.success() {
-            return Err(anyhow!(
-                "Failed to get filesystem usage: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-
-        let output_str = String::from_utf8(output.stdout).context("Invalid UTF-8 in df output")?;
-
-        // Parse df output to get used size
-        // df output format: Filesystem 1K-blocks Used Available Use% Mounted-on
-        let lines: Vec<&str> = output_str.trim().split('\n').collect();
-        if lines.len() < 2 {
-            return Err(anyhow!("Invalid df output format"));
-        }
-
-        let data_line = lines[1];
-        let fields: Vec<&str> = data_line.split_whitespace().collect();
-        if fields.len() < 4 {
-            return Err(anyhow!("Invalid df output format: insufficient fields"));
-        }
-
-        // Parse used size (3rd field, 1-indexed)
-        let used_size = fields[2]
-            .parse::<u64>()
-            .with_context(|| format!("Failed to parse used size: {}", fields[2]))?;
-
+        let (_, used_size, _) = self.df_sizes_bytes().await?;
         debug!("Used size: {} bytes for {:?}", used_size, self.mount_point);
         Ok(used_size)
     }
@@ -1026,43 +1007,8 @@ impl RemoteFs {
     /// * `Result<u64>` - Available size in bytes
     pub async fn get_available_size(&self) -> Result<u64> {
         self.ensure_mounted()?;
-
         debug!("Getting available size for mount point: {:?}", self.mount_point);
-
-        // Use df command to get filesystem available size
-        let output = Command::new("df")
-            .args(["-B1", &self.mount_point.to_string_lossy()])
-            .output()
-            .await
-            .context("Failed to execute df command")?;
-
-        if !output.status.success() {
-            return Err(anyhow!(
-                "Failed to get filesystem available size: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-
-        let output_str = String::from_utf8(output.stdout).context("Invalid UTF-8 in df output")?;
-
-        // Parse df output to get available size
-        // df output format: Filesystem 1K-blocks Used Available Use% Mounted-on
-        let lines: Vec<&str> = output_str.trim().split('\n').collect();
-        if lines.len() < 2 {
-            return Err(anyhow!("Invalid df output format"));
-        }
-
-        let data_line = lines[1];
-        let fields: Vec<&str> = data_line.split_whitespace().collect();
-        if fields.len() < 4 {
-            return Err(anyhow!("Invalid df output format: insufficient fields"));
-        }
-
-        // Parse available size (4th field, 1-indexed)
-        let available_size = fields[3]
-            .parse::<u64>()
-            .with_context(|| format!("Failed to parse available size: {}", fields[3]))?;
-
+        let (_, _, available_size) = self.df_sizes_bytes().await?;
         debug!("Available size: {} bytes for {:?}", available_size, self.mount_point);
         Ok(available_size)
     }
@@ -1070,51 +1016,13 @@ impl RemoteFs {
     /// Get filesystem usage information
     ///
     /// # Returns
-    /// * `Result<(u64, u64, u64)>` - (total_size, used_size, available_size) in bytes
+    /// * `Result<FileSystemInfo>` - total / used / free space in bytes
     pub async fn get_filesystem_usage(&self) -> Result<FileSystemInfo> {
         self.ensure_mounted()?;
 
         debug!("Getting filesystem usage for mount point: {:?}", self.mount_point);
 
-        // Use df command to get filesystem usage
-        let output = Command::new("df")
-            .args(&[self.mount_point.to_string_lossy().to_string().as_str()])
-            .output()
-            .await
-            .context("Failed to execute df command")?;
-
-        if !output.status.success() {
-            return Err(anyhow!(
-                "Failed to get filesystem usage: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-
-        let output_str = String::from_utf8(output.stdout).context("Invalid UTF-8 in df output")?;
-
-        // Parse df output to get usage information
-        // df output format: Filesystem 1K-blocks Used Available Use% Mounted-on
-        let lines: Vec<&str> = output_str.trim().split('\n').collect();
-        if lines.len() < 2 {
-            return Err(anyhow!("Invalid df output format"));
-        }
-
-        let data_line = lines[1];
-        let fields: Vec<&str> = data_line.split_whitespace().collect();
-        if fields.len() < 4 {
-            return Err(anyhow!("Invalid df output format: insufficient fields"));
-        }
-
-        // Parse sizes (2nd, 3rd, 4th fields, 1-indexed)
-        let total_size = fields[1]
-            .parse::<u64>()
-            .with_context(|| format!("Failed to parse total size: {}", fields[1]))?;
-        let used_size = fields[2]
-            .parse::<u64>()
-            .with_context(|| format!("Failed to parse used size: {}", fields[2]))?;
-        let available_size = fields[3]
-            .parse::<u64>()
-            .with_context(|| format!("Failed to parse available size: {}", fields[3]))?;
+        let (total_size, used_size, available_size) = self.df_sizes_bytes().await?;
 
         debug!(
             "Filesystem usage for {:?}: total={} bytes, used={} bytes, available={} bytes",
@@ -1165,10 +1073,12 @@ impl RemoteFs {
         let mut last_error = None;
 
         for cmd_name in &fsck_commands {
-            let output = Command::new(cmd_name)
-                .args(&["-a", "-v"]) // -a: auto-repair, -v: verbose
-                .arg(&self.image_path)
-                .output()
+            let output = crate::process_spawn::output({
+                let mut cmd = Command::new(cmd_name);
+                cmd.args(&["-a", "-v"]); // -a: auto-repair, -v: verbose
+                cmd.arg(&self.image_path);
+                cmd
+            })
                 .await;
 
             match output {
@@ -1263,10 +1173,12 @@ impl RemoteFs {
         let mut last_error = None;
 
         for cmd_name in &mkfs_commands {
-            let output = Command::new(cmd_name)
-                .args(&["-F", "32"]) // -F 32: Force FAT32 format
-                .arg(&self.image_path)
-                .output()
+            let output = crate::process_spawn::output({
+                let mut cmd = Command::new(cmd_name);
+                cmd.args(&["-F", "32"]); // -F 32: Force FAT32 format
+                cmd.arg(&self.image_path);
+                cmd
+            })
                 .await;
 
             match output {
@@ -1399,10 +1311,12 @@ impl RemoteFs {
 
     /// Check if the mount point is already in use
     async fn is_mount_point_in_use(&self) -> Result<bool> {
-        let output = Command::new("mountpoint")
-            .arg("-q")
-            .arg(&self.mount_point)
-            .output()
+        let output = crate::process_spawn::output({
+            let mut cmd = Command::new("mountpoint");
+            cmd.arg("-q");
+            cmd.arg(&self.mount_point);
+            cmd
+        })
             .await
             .context("Failed to execute mountpoint command")?;
 
@@ -1412,9 +1326,11 @@ impl RemoteFs {
     /// Setup loop device and associate it with the image file
     async fn setup_loop_device(&self) -> Result<String> {
         // First, try to find an available loop device
-        let output = Command::new("losetup")
-            .args(["-f"])
-            .output()
+        let output = crate::process_spawn::output({
+            let mut cmd = Command::new("losetup");
+            cmd.args(["-f"]);
+            cmd
+        })
             .await
             .context("Failed to execute losetup -f command")?;
 
@@ -1433,9 +1349,11 @@ impl RemoteFs {
         debug!("Found available loop device: {}", loop_device);
 
         // Associate the image file with the loop device
-        let output = Command::new("losetup")
-            .args([&loop_device, self.image_path.to_str().unwrap()])
-            .output()
+        let output = crate::process_spawn::output({
+            let mut cmd = Command::new("losetup");
+            cmd.args([&loop_device, self.image_path.to_str().unwrap()]);
+            cmd
+        })
             .await
             .context("Failed to execute losetup command")?;
 
@@ -1459,16 +1377,18 @@ impl RemoteFs {
 
         let mut cmd = Command::new("mount");
 
+        // utf8/iocharset=utf8: map VFAT LFN (UTF-16) <-> userspace UTF-8 so Chinese
+        // filenames round-trip with Windows. Requires CONFIG_NLS_UTF8 in the kernel.
         cmd.args(&[
-            // "-t",
-            // fs_type.as_str(),
-            // "-o",
-            // "loop",
+            "-t",
+            "vfat",
+            "-o",
+            "utf8,iocharset=utf8,codepage=437",
             loop_device,
             &self.mount_point.to_string_lossy(),
         ]);
 
-        let output = cmd.output().await.context("Failed to execute mount command")?;
+        let output = crate::process_spawn::output(cmd).await.context("Failed to execute mount command")?;
 
         if !output.status.success() {
             return Err(anyhow!(
@@ -1487,13 +1407,15 @@ impl RemoteFs {
     /// Detect filesystem type of the loop device
     async fn detect_filesystem_type(&self, loop_device: &str) -> Result<String> {
         // Try to detect filesystem type using blkid
-        let output = Command::new("blkid")
-            .arg("-s")
-            .arg("TYPE")
-            .arg("-o")
-            .arg("value")
-            .arg(loop_device)
-            .output()
+        let output = crate::process_spawn::output({
+            let mut cmd = Command::new("blkid");
+            cmd.arg("-s");
+            cmd.arg("TYPE");
+            cmd.arg("-o");
+            cmd.arg("value");
+            cmd.arg(loop_device);
+            cmd
+        })
             .await
             .context("Failed to execute blkid command")?;
 
@@ -1518,9 +1440,11 @@ impl RemoteFs {
 
     /// Unmount the filesystem from the mount point
     async fn unmount_filesystem(&self) -> Result<()> {
-        let output = Command::new("umount")
-            .arg(&self.mount_point)
-            .output()
+        let output = crate::process_spawn::output({
+            let mut cmd = Command::new("umount");
+            cmd.arg(&self.mount_point);
+            cmd
+        })
             .await
             .context("Failed to execute umount command")?;
 
@@ -1538,9 +1462,11 @@ impl RemoteFs {
 
     /// Cleanup loop device
     async fn cleanup_loop_device(&self, loop_device: &str) -> Result<()> {
-        let output = Command::new("losetup")
-            .args(["-d", loop_device])
-            .output()
+        let output = crate::process_spawn::output({
+            let mut cmd = Command::new("losetup");
+            cmd.args(["-d", loop_device]);
+            cmd
+        })
             .await
             .context("Failed to execute losetup -d command")?;
 

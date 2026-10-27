@@ -2,22 +2,22 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 
+use anyhow::{Result, anyhow};
+use parking_lot::RwLock;
 use std::alloc::{Layout, alloc};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use anyhow::{Result, anyhow};
-use parking_lot::RwLock;
 use tracing::{error, info, warn};
 
 use crate::hardware::mpi;
 
 // Re-export required types and constants from mpi module
 pub use crate::hardware::mpi::{
-    COMPRESS_MODE_NONE, H264E_PROFILE_HIGH, MB_BLK,
-    MIRROR_NONE, RK_ERR_VENC_BUF_EMPTY, RK_ERR_VENC_TIME_OUT, RK_FMT_YUV422_YUYV, RK_SUCCESS,
-    RK_VIDEO_ID_AVC, VENC_CHANNEL, VENC_CHN_ATTR_S, VENC_PACK_S, VENC_RC_MODE_H264VBR,
-    VENC_RECV_PIC_PARAM_S, VENC_STREAM_S, VIDEO_FRAME_INFO_S,
+    COMPRESS_MODE_NONE, H264E_PROFILE_HIGH, MB_BLK, MIRROR_NONE, RK_ERR_VENC_BUF_EMPTY,
+    RK_ERR_VENC_TIME_OUT, RK_FMT_YUV422_YUYV, RK_SUCCESS, RK_VIDEO_ID_AVC, VENC_CHANNEL,
+    VENC_CHN_ATTR_S, VENC_PACK_S, VENC_RC_MODE_H264VBR, VENC_RECV_PIC_PARAM_S, VENC_STREAM_S,
+    VIDEO_FRAME_INFO_S,
 };
 // Rockchip MPP VENC error code definitions (from rk_mpi_venc.h)
 // Note: Error code format is RK_DEF_ERR(RK_ID_VENC, RK_ERR_LEVEL_ERROR, RK_ERR_XXX)
@@ -61,7 +61,7 @@ fn populate_venc_attr(
     max_bitrate: u32,
     width: u32,
     height: u32,
-    fps: f64
+    fps: f64,
 ) {
     attr.stRcAttr.enRcMode = VENC_RC_MODE_H264VBR;
     // Note: u32BitRate and u32MaxBitRate units are kbps (Rockchip MPP API)
@@ -195,7 +195,8 @@ fn venc_read_stream(venc_running: Arc<AtomicBool>, fps: f64) {
     }
 
     info!("Start encoder read stream with pts: {}", pts);
-    let mut frame = VENC_STREAM_S { pstPack: pack_ptr, u32PackCount: 1, ..unsafe { std::mem::zeroed() } };
+    let mut frame =
+        VENC_STREAM_S { pstPack: pack_ptr, u32PackCount: 1, ..unsafe { std::mem::zeroed() } };
     while venc_running.load(Ordering::Acquire) {
         let ret = mpi::venc_get_stream(VENC_CHANNEL, &mut frame, pts);
         if ret == RK_SUCCESS {
@@ -232,15 +233,25 @@ fn venc_read_stream(venc_running: Arc<AtomicBool>, fps: f64) {
             // Pass H.264 frame through FFI callback
             // Note: data pointer is valid before ReleaseStream
             let slice = unsafe { std::slice::from_raw_parts(data, pack.u32Len as usize) };
+            let is_keyframe = unsafe {
+                pack.DataType.enH264EType
+                    == rockchip_mpi_sys::rkH264E_NALU_TYPE_E_H264E_NALU_IDRSLICE
+                    || pack.DataType.enH264EType
+                        == rockchip_mpi_sys::rkH264E_NALU_TYPE_E_H264E_NALU_ISLICE
+            };
             // Note: Must copy because C pointer memory will be released after venc_release_stream
-            crate::video::on_frame_received(slice, pack.u64PTS, fps);
+            crate::video::on_frame_received(slice, pack.u64PTS, fps, is_keyframe);
 
             let ret = mpi::venc_release_stream(VENC_CHANNEL, &mut frame);
             if ret != RK_SUCCESS {
                 warn!("Failed to release stream: 0x{:x}", ret);
             }
         } else if ret != RK_ERR_VENC_BUF_EMPTY && ret != RK_ERR_VENC_TIME_OUT {
-            warn!("Failed to get stream (encoder running): 0x{:x} - {} (may be temporary)", ret, venc_error_description(ret));
+            warn!(
+                "Failed to get stream (encoder running): 0x{:x} - {} (may be temporary)",
+                ret,
+                venc_error_description(ret)
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }

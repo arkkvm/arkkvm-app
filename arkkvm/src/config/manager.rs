@@ -101,44 +101,102 @@ impl ConfigManager {
         .await
     }
 
-    /// Set authentication token. When setting Some(token), also generates and stores a CSRF token
+    /// Set authentication token for the user role (backward-compatible wrapper).
+    /// When setting Some(token), also generates and stores a CSRF token
     /// and sets expiry (same as cookie, 7 days). Returns the new CSRF token for the response.
-    /// When setting None, clears auth, CSRF token and expiry.
+    /// When setting None, clears user auth, CSRF token and expiry.
     pub async fn set_auth_token(&self, token: Option<String>) -> Result<Option<String>> {
+        self.set_auth_token_for_role(crate::session::SessionRole::User, token)
+            .await
+    }
+
+    /// Set authentication token for a specific role slot.
+    pub async fn set_auth_token_for_role(
+        &self,
+        role: crate::session::SessionRole,
+        token: Option<String>,
+    ) -> Result<Option<String>> {
         let (csrf, expires_at) = if token.is_some() {
             let exp = Utc::now().timestamp() + AUTH_TOKEN_VALIDITY_SECS;
             (Some(Uuid::new_v4().to_string()), Some(exp))
         } else {
             (None, None)
         };
-        self.update(|config| {
-            config.local_auth_token = token;
-            config.local_csrf_token = csrf.clone();
-            config.local_auth_token_expires_at = expires_at;
+        self.update(|config| match role {
+            crate::session::SessionRole::User => {
+                config.local_auth_token = token;
+                config.local_csrf_token = csrf.clone();
+                config.local_auth_token_expires_at = expires_at;
+            }
+            crate::session::SessionRole::Agent => {
+                config.local_agent_auth_token = token;
+                config.local_agent_csrf_token = csrf.clone();
+                config.local_agent_auth_token_expires_at = expires_at;
+            }
         })
         .await?;
         Ok(csrf)
     }
 
-    /// Get current CSRF token (for the active session). None if no password mode or not set.
+    /// Clear both user and agent auth/CSRF slots (password disable / noPassword setup).
+    pub async fn clear_all_auth_tokens(&self) -> Result<()> {
+        self.update(|config| {
+            config.local_auth_token = None;
+            config.local_csrf_token = None;
+            config.local_auth_token_expires_at = None;
+            config.local_agent_auth_token = None;
+            config.local_agent_csrf_token = None;
+            config.local_agent_auth_token_expires_at = None;
+        })
+        .await
+    }
+
+    /// Get current CSRF token for the user role. None if no password mode or not set.
     pub async fn get_csrf_token(&self) -> Option<String> {
         let config = self.get().await;
         config.local_csrf_token.clone()
     }
 
-    /// Validate CSRF token: must match stored token and not be expired (same expiry as auth token).
+    /// Get CSRF token for a role slot.
+    pub async fn get_csrf_token_for_role(
+        &self,
+        role: crate::session::SessionRole,
+    ) -> Option<String> {
+        let config = self.get().await;
+        match role {
+            crate::session::SessionRole::User => config.local_csrf_token.clone(),
+            crate::session::SessionRole::Agent => config.local_agent_csrf_token.clone(),
+        }
+    }
+
+    /// Validate CSRF token against the user slot (backward-compatible).
     pub async fn validate_csrf_token(&self, token: &str) -> bool {
+        self.validate_csrf_token_for_role(crate::session::SessionRole::User, token)
+            .await
+    }
+
+    /// Validate CSRF token for a specific role slot.
+    pub async fn validate_csrf_token_for_role(
+        &self,
+        role: crate::session::SessionRole,
+        token: &str,
+    ) -> bool {
         let config = self.get().await;
         if config.local_auth_mode.is_empty() || config.local_auth_mode == "noPassword" {
             return true;
         }
         let now = Utc::now().timestamp();
-        let not_expired = config
-            .local_auth_token_expires_at
-            .map(|exp| exp > now)
-            .unwrap_or(false);
-        let token_ok = config
-            .local_csrf_token
+        let (stored, expires_at) = match role {
+            crate::session::SessionRole::User => {
+                (&config.local_csrf_token, config.local_auth_token_expires_at)
+            }
+            crate::session::SessionRole::Agent => (
+                &config.local_agent_csrf_token,
+                config.local_agent_auth_token_expires_at,
+            ),
+        };
+        let not_expired = expires_at.map(|exp| exp > now).unwrap_or(false);
+        let token_ok = stored
             .as_ref()
             .map(|t| !token.is_empty() && t == token)
             .unwrap_or(false);
@@ -304,6 +362,7 @@ impl ConfigManager {
             config.usb_devices.absolute_mouse = state.absolute_mouse;
             config.usb_devices.mass_storage_vm = state.mass_storage;
             config.usb_devices.microphone = state.microphone;
+            config.usb_devices.network_adapter = state.network_adapter.clone();
         })
         .await
     }
@@ -335,6 +394,7 @@ impl ConfigManager {
             config.usb_devices.mass_storage_ft = devices.mass_storage_ft;
             config.usb_devices.microphone = devices.microphone;
             config.usb_devices.camera = devices.camera;
+            config.usb_devices.network_adapter = devices.network_adapter.clone();
         })
         .await
     }
@@ -342,6 +402,28 @@ impl ConfigManager {
     pub async fn get_usb_devices(&self) -> UsbDevices {
         let config = self.get().await;
         config.usb_devices.clone()
+    }
+
+    pub async fn get_mcp_enabled(&self) -> bool {
+        self.get().await.mcp_enabled
+    }
+
+    pub async fn set_mcp_enabled(&self, enabled: bool) -> Result<()> {
+        self.update(|config| {
+            config.mcp_enabled = enabled;
+        })
+        .await
+    }
+
+    pub async fn get_ssh_forwarding_enabled(&self) -> bool {
+        self.get().await.ssh_forwarding_enabled
+    }
+
+    pub async fn set_ssh_forwarding_enabled(&self, enabled: bool) -> Result<()> {
+        self.update(|config| {
+            config.ssh_forwarding_enabled = enabled;
+        })
+        .await
     }
 
     pub async fn get_auto_update(&self) -> bool {
@@ -356,6 +438,7 @@ impl ConfigManager {
             relative_mouse: config.usb_devices.relative_mouse,
             mass_storage: config.usb_devices.mass_storage_vm,
             microphone: config.usb_devices.microphone,
+            network_adapter: config.usb_devices.network_adapter.clone(),
         }
     }
 
@@ -453,8 +536,18 @@ impl ConfigManager {
         !config.is_setup_required()
     }
 
-    /// Validate authentication token: must match stored token and not be expired (7 days from issue).
+    /// Validate authentication token against the user slot (backward-compatible).
     pub async fn validate_auth_token(&self, token: &str) -> bool {
+        self.validate_auth_token_for_role(crate::session::SessionRole::User, token)
+            .await
+    }
+
+    /// Validate authentication token for a specific role slot.
+    pub async fn validate_auth_token_for_role(
+        &self,
+        role: crate::session::SessionRole,
+        token: &str,
+    ) -> bool {
         let config = self.get().await;
 
         if config.local_auth_mode.is_empty() || config.local_auth_mode == "noPassword" {
@@ -462,12 +555,17 @@ impl ConfigManager {
         }
 
         let now = Utc::now().timestamp();
-        let not_expired = config
-            .local_auth_token_expires_at
-            .map(|exp| exp > now)
-            .unwrap_or(false);
-        let token_ok = config
-            .local_auth_token
+        let (stored, expires_at) = match role {
+            crate::session::SessionRole::User => {
+                (&config.local_auth_token, config.local_auth_token_expires_at)
+            }
+            crate::session::SessionRole::Agent => (
+                &config.local_agent_auth_token,
+                config.local_agent_auth_token_expires_at,
+            ),
+        };
+        let not_expired = expires_at.map(|exp| exp > now).unwrap_or(false);
+        let token_ok = stored
             .as_ref()
             .map(|t| !token.is_empty() && token == t)
             .unwrap_or(false);
@@ -689,6 +787,8 @@ mod tests {
         let device = WakeOnLanDevice {
             name: "Test Device".to_string(),
             mac_address: "00:11:22:33:44:55".to_string(),
+            broadcast_address: "192.168.4.255".to_string(),
+            port: 9,
         };
 
         // Add device
@@ -698,6 +798,11 @@ mod tests {
         let config = manager.get().await;
         assert_eq!(config.wake_on_lan_devices.len(), 1);
         assert_eq!(config.wake_on_lan_devices[0].name, "Test Device");
+        assert_eq!(
+            config.wake_on_lan_devices[0].broadcast_address,
+            "192.168.4.255"
+        );
+        assert_eq!(config.wake_on_lan_devices[0].port, 9);
 
         // Remove device
         manager.remove_wake_on_lan_device("Test Device").await.unwrap();
@@ -705,6 +810,71 @@ mod tests {
         // Verify device was removed
         let config = manager.get().await;
         assert_eq!(config.wake_on_lan_devices.len(), 0);
+    }
+
+    /// Simulate frontend settings flow: save custom broadcast/port via settings,
+    /// then wake with only macAddress (current WakeOnLAN.tsx send shape).
+    #[tokio::test]
+    async fn test_wol_settings_param_update_then_resolve_like_frontend() {
+        use crate::wol::{resolve_wol_send_target, send_magic_packet, build_magic_packet};
+        use tokio::net::UdpSocket;
+
+        let temp_dir = tempdir().unwrap();
+        let config_path = temp_dir.path().join("test_config.json");
+        let persistence = ConfigPersistence::with_path(&config_path);
+        let manager = ConfigManager::with_persistence(persistence);
+
+        // 1) Frontend setWakeOnLanDevices with new settings fields
+        let device = WakeOnLanDevice {
+            name: "Office PC".to_string(),
+            mac_address: "AA:BB:CC:DD:EE:FF".to_string(),
+            broadcast_address: "127.0.0.1".to_string(),
+            port: 0, // filled after bind
+        };
+
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let device = WakeOnLanDevice {
+            port,
+            ..device
+        };
+        manager.set_wake_on_lan_device(device.clone()).await.unwrap();
+
+        // 2) Frontend getWakeOnLanDevices — params persisted
+        let cfg = manager.get().await;
+        let stored = cfg
+            .wake_on_lan_devices
+            .iter()
+            .find(|d| d.mac_address.eq_ignore_ascii_case("AA:BB:CC:DD:EE:FF"))
+            .expect("device saved");
+        assert_eq!(stored.broadcast_address, "127.0.0.1");
+        assert_eq!(stored.port, port);
+
+        // 3) Frontend sendWOLMagicPacket({ macAddress }) only — resolve from settings
+        let (addr, resolve_port) = resolve_wol_send_target(
+            None,
+            None,
+            Some(stored.broadcast_address.as_str()),
+            Some(stored.port),
+        );
+        assert_eq!(addr, "127.0.0.1");
+        assert_eq!(resolve_port, port);
+
+        // 4) Local send success + param correctness (packet bytes)
+        let expected = build_magic_packet(&stored.mac_address).unwrap();
+        let recv = tokio::spawn(async move {
+            let mut buf = vec![0u8; 256];
+            let (n, _) = listener.recv_from(&mut buf).await.unwrap();
+            buf[..n].to_vec()
+        });
+        send_magic_packet(&stored.mac_address, &addr, resolve_port)
+            .await
+            .unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), recv)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, expected);
     }
 
     #[tokio::test]

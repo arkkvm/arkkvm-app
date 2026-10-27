@@ -29,4 +29,7 @@ pub enum UsbError {
 
     #[error("IO Error: {0}")]
     IoError(String),
+
+    #[error("USB endpoint budget exceeded: {0}")]
+    EndpointBudgetExceeded(String),
 }

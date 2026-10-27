@@ -1276,6 +1276,9 @@ struct PendingUpload {
     already_uploaded_bytes: i64,
     upload_path: PathBuf,
     final_path: PathBuf,
+    /// Set when a DataChannel poll task owns this session. Cleared when the
+    /// entry leaves the active pool.
+    channel_open: bool,
 }
 
 struct FtPendingUpload {
@@ -1284,6 +1287,9 @@ struct FtPendingUpload {
     already_uploaded_bytes: i64,
     upload_path: String,
     final_path: String,
+    /// Set when a DataChannel poll task owns this session. Cleared when the
+    /// entry leaves the active pool.
+    channel_open: bool,
 }
 
 static PENDING_UPLOADS: Lazy<AsyncMutex<HashMap<String, PendingUpload>>> =
@@ -1311,24 +1317,8 @@ pub async fn start_storage_file_upload(filename: &str, size: i64) -> Result<Stor
         return Err(anyhow!("file already exists: {}", filename));
     }
 
-    {
-        let map = PENDING_UPLOADS.lock().await;
-        if let Some((upload_id, entry)) =
-            map.iter().find(|(_, entry)| entry.upload_path == upload_path && entry.size == size)
-        {
-            info!(
-                "Reusing active VM upload session {} for {} ({}/{})",
-                upload_id,
-                upload_path.display(),
-                entry.already_uploaded_bytes,
-                size
-            );
-            return Ok(StorageFileUpload {
-                already_uploaded_bytes: entry.already_uploaded_bytes,
-                data_channel: upload_id.clone(),
-            });
-        }
-    }
+    let mut pending = PENDING_UPLOADS.lock().await;
+    let mut closed = PENDING_UPLOADS_CLOSED.lock().await;
 
     let disk_size = if upload_path.exists() {
         fs::metadata(&upload_path).await?.len() as i64
@@ -1336,48 +1326,130 @@ pub async fn start_storage_file_upload(filename: &str, size: i64) -> Result<Stor
         0
     };
 
-    if upload_path.exists() {
-        let mut closed = PENDING_UPLOADS_CLOSED.lock().await;
-        let matched_id = closed.iter().find_map(|(upload_id, item)| {
-            if item.final_path == final_path
-                && item.upload_path == upload_path
-                && item.already_uploaded_bytes == disk_size
-            {
-                Some(upload_id.clone())
-            } else {
-                None
-            }
+    // Active session for this path: reuse after aligning the offset to durable
+    // on-disk length (never trust a memory counter that raced ahead of fsync).
+    if let Some(upload_id) = pending.iter().find_map(|(id, entry)| {
+        (entry.upload_path == upload_path && entry.size == size).then(|| id.clone())
+    }) {
+        let entry = pending.get_mut(&upload_id).expect("checked above");
+        if entry.channel_open {
+            return Err(anyhow!("upload already in progress"));
+        }
+        if disk_size > size {
+            return Err(anyhow!(
+                "incomplete upload larger than expected size: {} > {}",
+                disk_size,
+                size
+            ));
+        }
+        entry.already_uploaded_bytes = disk_size;
+        info!(
+            "Reusing active VM upload session {} for {} ({}/{})",
+            upload_id,
+            upload_path.display(),
+            disk_size,
+            size
+        );
+        return Ok(StorageFileUpload {
+            already_uploaded_bytes: disk_size,
+            data_channel: upload_id,
         });
+    }
 
-        if let Some(upload_id) = matched_id {
-            let mut entry = closed.remove(&upload_id).expect("checked above");
-            if entry.already_uploaded_bytes != disk_size {
-                entry.already_uploaded_bytes = disk_size;
+    if upload_path.exists() {
+        if disk_size > size {
+            // Overshot incomplete: discard and start fresh.
+            let active_ids: Vec<String> = pending
+                .iter()
+                .filter(|(_, entry)| entry.upload_path == upload_path && !entry.channel_open)
+                .map(|(id, _)| id.clone())
+                .collect();
+            if pending.values().any(|entry| entry.upload_path == upload_path && entry.channel_open) {
+                return Err(anyhow!("upload already in progress"));
             }
-            let file = OpenOptions::new().append(true).open(&upload_path).await.with_context(
-                || format!("failed to reopen partial upload: {}", upload_path.display()),
-            )?;
+            for id in active_ids {
+                pending.remove(&id);
+            }
+            let closed_ids: Vec<String> = closed
+                .iter()
+                .filter(|(_, item)| item.upload_path == upload_path)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in closed_ids {
+                closed.remove(&id);
+            }
+            fs::remove_file(&upload_path).await.with_context(|| {
+                format!("failed to remove overshot upload: {}", upload_path.display())
+            })?;
+            warn!(
+                "discarded overshot VM upload {} ({} > {})",
+                upload_path.display(),
+                disk_size,
+                size
+            );
+        } else {
+            // Resumable incomplete: prefer a closed session for this path, else
+            // create a new session id on the existing file. Always use disk_size.
+            let matched_id = closed.iter().find_map(|(upload_id, item)| {
+                (item.final_path == final_path
+                    && item.upload_path == upload_path
+                    && item.size == size)
+                    .then(|| upload_id.clone())
+            });
+            let from_closed = matched_id.is_some();
+            let upload_id = matched_id.unwrap_or_else(|| format!("upload_{}", Uuid::new_v4()));
+            let mut entry = if let Some(mut entry) = closed.remove(&upload_id) {
+                entry.channel_open = false;
+                entry.size = size;
+                entry
+            } else {
+                // Drop any stale closed entries for this path (different size/id).
+                let stale: Vec<String> = closed
+                    .iter()
+                    .filter(|(_, item)| item.upload_path == upload_path)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in stale {
+                    closed.remove(&id);
+                }
+                PendingUpload {
+                    file: None,
+                    size,
+                    already_uploaded_bytes: disk_size,
+                    upload_path: upload_path.clone(),
+                    final_path: final_path.clone(),
+                    channel_open: false,
+                }
+            };
+            entry.already_uploaded_bytes = disk_size;
+            let file = match OpenOptions::new().append(true).open(&upload_path).await {
+                Ok(file) => file,
+                Err(e) => {
+                    if from_closed {
+                        closed.insert(upload_id.clone(), entry);
+                    }
+                    return Err(e).with_context(|| {
+                        format!("failed to reopen partial upload: {}", upload_path.display())
+                    });
+                }
+            };
             entry.file = Some(file);
-            let resumed_bytes = entry.already_uploaded_bytes;
-            PENDING_UPLOADS.lock().await.insert(upload_id.clone(), entry);
+            pending.insert(upload_id.clone(), entry);
             info!(
                 "Resumed VM upload session {} for {} ({}/{})",
                 upload_id,
                 upload_path.display(),
-                resumed_bytes,
+                disk_size,
                 size
             );
             return Ok(StorageFileUpload {
-                already_uploaded_bytes: resumed_bytes,
+                already_uploaded_bytes: disk_size,
                 data_channel: upload_id,
             });
         }
-        drop(closed);
-
-        fs::remove_file(&upload_path)
-            .await
-            .with_context(|| format!("failed to remove orphan upload: {}", upload_path.display()))?;
     }
+
+    drop(closed);
 
     let file =
         OpenOptions::new().append(true).create(true).open(&upload_path).await.with_context(
@@ -1385,80 +1457,151 @@ pub async fn start_storage_file_upload(filename: &str, size: i64) -> Result<Stor
         )?;
 
     let upload_id = format!("upload_{}", Uuid::new_v4());
-    {
-        let mut map = PENDING_UPLOADS.lock().await;
-        map.insert(
-            upload_id.clone(),
-            PendingUpload {
-                file: Some(file),
-                size,
-                already_uploaded_bytes: 0,
-                upload_path,
-                final_path,
-            },
-        );
-    }
+    pending.insert(
+        upload_id.clone(),
+        PendingUpload {
+            file: Some(file),
+            size,
+            already_uploaded_bytes: 0,
+            upload_path,
+            final_path,
+            channel_open: false,
+        },
+    );
 
     Ok(StorageFileUpload { already_uploaded_bytes: 0, data_channel: upload_id })
 }
 
-pub async fn append_upload_data(upload_id: &str, data: &[u8]) -> Result<i64> {
-    let mut entry = {
-        let mut map = PENDING_UPLOADS.lock().await;
-        map.remove(upload_id)
-    };
-    let Some(mut entry) = entry.take() else {
-        return Err(anyhow!("upload not found"));
-    };
-    let Some(file) = entry.file.as_mut() else {
-        let mut map = PENDING_UPLOADS.lock().await;
-        map.insert(upload_id.to_owned(), entry);
-        return Err(anyhow!("upload file handle not open"));
-    };
-    let write_res = file
-        .write_all(data)
-        .await
-        .with_context(|| format!("failed to write upload: {}", upload_id));
-    if let Err(e) = write_res {
-        let mut map = PENDING_UPLOADS.lock().await;
-        map.insert(upload_id.to_owned(), entry);
-        return Err(e);
-    }
-    entry.already_uploaded_bytes += data.len() as i64;
-    let current = entry.already_uploaded_bytes;
+/// Mark the active session as owned by one DataChannel. A second channel is rejected.
+pub async fn claim_upload_channel(upload_id: &str) -> Result<()> {
     let mut map = PENDING_UPLOADS.lock().await;
-    map.insert(upload_id.to_owned(), entry);
-    Ok(current)
+    let entry = map.get_mut(upload_id).ok_or_else(|| anyhow!("upload not found"))?;
+    if entry.channel_open {
+        return Err(anyhow!("upload already in progress"));
+    }
+    entry.channel_open = true;
+    Ok(())
 }
 
-pub async fn complete_upload(upload_id: &str) -> Result<()> {
-    let entry = {
-        let mut map = PENDING_UPLOADS.lock().await;
-        map.remove(upload_id)
-    };
-    let Some(mut entry) = entry else {
+pub async fn append_upload_data(upload_id: &str, data: &[u8]) -> Result<(i64, i64)> {
+    let mut map = PENDING_UPLOADS.lock().await;
+    let entry = map.get_mut(upload_id).ok_or_else(|| anyhow!("upload not found"))?;
+    let in_len = data.len();
+    let already_before = entry.already_uploaded_bytes;
+    let size = entry.size;
+    let data = bytes_within_size(already_before, size, data);
+    if in_len > 0 && data.is_empty() {
+        warn!(
+            "upload append {}: input truncated to empty (already={} size={} in_len={})",
+            upload_id, already_before, size, in_len
+        );
+    }
+    if !data.is_empty() {
+        let Some(file) = entry.file.as_mut() else {
+            return Err(anyhow!("upload file handle not open"));
+        };
+        let wrote = data.len();
+        file.write_all(data)
+            .await
+            .with_context(|| format!("failed to write upload: {}", upload_id))?;
+        entry.already_uploaded_bytes += wrote as i64;
+        debug!(
+            "upload append {}: wrote={} already_after={}",
+            upload_id, wrote, entry.already_uploaded_bytes
+        );
+    }
+    Ok((entry.size, entry.already_uploaded_bytes))
+}
+
+/// Finalize the active upload session. On success returns the durable on-disk
+/// byte count after fsync (0 if the incomplete file was discarded as overshot).
+pub async fn complete_upload(upload_id: &str) -> Result<i64> {
+    let mut pending = PENDING_UPLOADS.lock().await;
+    let Some(entry) = pending.get_mut(upload_id) else {
         return Err(anyhow!("upload not found"));
     };
-    if let Some(mut file) = entry.file.take() {
-        file.flush().await.ok();
-        file.sync_data().await.ok();
-        drop(file);
+    let upload_path = entry.upload_path.clone();
+    let final_path = entry.final_path.clone();
+    let size = entry.size;
+    let memory_already = entry.already_uploaded_bytes;
+
+    let fstat_before = if upload_path.exists() {
+        fs::metadata(&upload_path).await?.len() as i64
+    } else {
+        0
+    };
+    info!(
+        "upload complete {}: before flush/sync memory_already={} fstat_len={} size={}",
+        upload_id, memory_already, fstat_before, size
+    );
+
+    if let Some(file) = entry.file.as_mut() {
+        file.flush().await.with_context(|| format!("failed to flush upload: {}", upload_id))?;
+        file.sync_data()
+            .await
+            .with_context(|| format!("failed to sync upload: {}", upload_id))?;
     }
 
-    let finish = entry.already_uploaded_bytes == entry.size;
-    if finish {
-        fs::rename(&entry.upload_path, &entry.final_path).await.with_context(|| {
-            format!(
-                "failed to rename uploaded file: {} -> {}",
-                entry.upload_path.display(),
-                entry.final_path.display()
-            )
-        })?;
+    // Durable offset is the on-disk length after a successful sync — never a
+    // memory counter that may have raced ahead of a failed (or skipped) fsync.
+    let already = if upload_path.exists() {
+        fs::metadata(&upload_path).await?.len() as i64
     } else {
-        let mut closed = PENDING_UPLOADS_CLOSED.lock().await;
-        closed.insert(upload_id.to_owned(), entry);
+        0
+    };
+    if already != memory_already {
+        warn!(
+            "upload complete {}: fstat_len={} != memory_already={} (fstat_before={})",
+            upload_id, already, memory_already, fstat_before
+        );
+    } else {
+        info!(
+            "upload complete {}: after sync durable={} size={}",
+            upload_id, already, size
+        );
     }
-    Ok(())
+    entry.already_uploaded_bytes = already;
+
+    if already == size {
+        entry.file.take();
+        if let Err(e) = fs::rename(&upload_path, &final_path).await {
+            if let Ok(file) = OpenOptions::new().append(true).open(&upload_path).await {
+                if let Some(entry) = pending.get_mut(upload_id) {
+                    entry.file = Some(file);
+                    entry.channel_open = false;
+                }
+            }
+            return Err(e).with_context(|| {
+                format!(
+                    "failed to rename uploaded file: {} -> {}",
+                    upload_path.display(),
+                    final_path.display()
+                )
+            });
+        }
+        pending.remove(upload_id);
+        return Ok(already);
+    }
+
+    if already > size {
+        entry.file.take();
+        if let Err(e) = fs::remove_file(&upload_path).await {
+            warn!("failed to delete overshot upload {}: {}", upload_path.display(), e);
+        }
+        pending.remove(upload_id);
+        warn!("discarded overshot VM upload {} ({}/{})", upload_id, already, size);
+        return Ok(0);
+    }
+
+    let mut closed = PENDING_UPLOADS_CLOSED.lock().await;
+    let Some(mut entry) = pending.remove(upload_id) else {
+        return Err(anyhow!("upload not found"));
+    };
+    entry.channel_open = false;
+    entry.already_uploaded_bytes = already;
+    entry.file.take();
+    closed.insert(upload_id.to_owned(), entry);
+    Ok(already)
 }
 
 pub async fn get_upload_progress(upload_id: &str) -> Result<(i64, i64)> {
@@ -1467,177 +1610,336 @@ pub async fn get_upload_progress(upload_id: &str) -> Result<(i64, i64)> {
     Ok((entry.size, entry.already_uploaded_bytes))
 }
 
+fn bytes_within_size(already: i64, size: i64, data: &[u8]) -> &[u8] {
+    if already >= size {
+        return &[];
+    }
+    // Keep the remaining length in i64. On 32-bit (armv7) targets, casting a
+    // remaining value of exactly 2^32 (or any value > usize::MAX) to usize wraps
+    // to 0 and silently drops every incoming byte — which is how ISO HTTP upload
+    // stuck at already=4248641536 with size=8543608832 (room=2^32).
+    let room = size - already;
+    let in_len = data.len() as i64;
+    if room >= in_len {
+        data
+    } else {
+        &data[..room as usize]
+    }
+}
+
 pub async fn start_ft_file_upload(
     path: String,
     name: String,
     size: i64,
 ) -> Result<StorageFileUpload> {
-    let remote_fs = REMOTE_FS.read().await;
-
     let file_path = format!("{}/{}", &path, &name).replace("//", "/");
     let file_cache_path = format!("{}/{}.ftcache", &path, &name).replace("//", "/");
 
-    if remote_fs.exists(file_path.as_str()).await? {
-        return Err(anyhow!("File already exists"));
-    }
+    let cache_size = {
+        let remote_fs = REMOTE_FS.read().await;
+        if remote_fs.exists(file_path.as_str()).await? {
+            return Err(anyhow!("File already exists"));
+        }
+        if remote_fs.exists(file_cache_path.as_str()).await? {
+            remote_fs.file_size(file_cache_path.as_str()).await? as i64
+        } else {
+            -1
+        }
+    };
 
     {
-        let map = FT_PENDING_UPLOADS.lock().await;
+        let pending = FT_PENDING_UPLOADS.lock().await;
         if let Some((upload_id, entry)) =
-            map.iter().find(|(_, entry)| entry.final_path == file_path && entry.size == size)
+            pending.iter().find(|(_, entry)| entry.final_path == file_path && entry.size == size)
         {
-            info!(
-                "Reusing active FT upload session {} for {} ({}/{})",
-                upload_id, &file_path, entry.already_uploaded_bytes, size
+            if entry.channel_open {
+                return Err(anyhow!("upload already in progress"));
+            }
+            if entry.already_uploaded_bytes <= size {
+                info!(
+                    "Reusing active FT upload session {} for {} ({}/{})",
+                    upload_id, &file_path, entry.already_uploaded_bytes, size
+                );
+                return Ok(StorageFileUpload {
+                    already_uploaded_bytes: entry.already_uploaded_bytes,
+                    data_channel: upload_id.clone(),
+                });
+            }
+        }
+    }
+
+    if cache_size >= 0 && (cache_size > size || !ft_closed_matches(&file_path, &file_cache_path, cache_size).await) {
+        discard_ft_cache(&file_path, &file_cache_path).await?;
+        if cache_size > size {
+            warn!(
+                "discarded overshot FT upload {} ({} > {})",
+                file_cache_path, cache_size, size
             );
+        }
+    } else if cache_size >= 0 {
+        let remote_fs = REMOTE_FS.read().await;
+        let writer = remote_fs
+            .create_async_writer(file_cache_path.as_str(), 1024 * 4, cache_size as u64)
+            .await?;
+        drop(remote_fs);
+
+        let mut pending = FT_PENDING_UPLOADS.lock().await;
+        let mut closed = FT_PENDING_UPLOADS_CLOSED.lock().await;
+        if let Some((upload_id, entry)) =
+            pending.iter().find(|(_, entry)| entry.final_path == file_path && entry.size == size)
+        {
+            if entry.channel_open {
+                return Err(anyhow!("upload already in progress"));
+            }
             return Ok(StorageFileUpload {
                 already_uploaded_bytes: entry.already_uploaded_bytes,
                 data_channel: upload_id.clone(),
             });
         }
-    }
-
-    let task = if remote_fs.exists(file_cache_path.as_str()).await? {
-        let cache_size = remote_fs.file_size(file_cache_path.as_str()).await?;
-        let mut should_delete_cache = false;
-        let mut map = FT_PENDING_UPLOADS_CLOSED.lock().await;
-        let mut old_upload_id = map.iter().find_map(|(upload_id, item)| {
+        let matched_id = closed.iter().find_map(|(upload_id, item)| {
             if item.final_path == file_path
                 && item.upload_path == file_cache_path
-                && item.already_uploaded_bytes == cache_size as i64
+                && item.already_uploaded_bytes == cache_size
             {
                 Some(upload_id.clone())
             } else {
                 None
             }
         });
-
-        let task = if let Some(upload_id) = old_upload_id.take() {
-            let entry = map.remove(&upload_id);
-            (Some(upload_id.clone()), entry)
-        } else {
-            should_delete_cache = true;
-            (None, None)
-        };
-        drop(map);
-        if should_delete_cache {
-            remote_fs.delete_file(file_cache_path.as_str()).await?;
+        if let Some(upload_id) = matched_id {
+            let mut entry = closed.remove(&upload_id).expect("checked above");
+            entry.channel_open = false;
+            entry.already_uploaded_bytes = cache_size;
+            entry.writer = Some(writer);
+            let already = entry.already_uploaded_bytes;
+            pending.insert(upload_id.clone(), entry);
+            info!(
+                "Resumed FT upload session {} for {} ({}/{})",
+                upload_id, &file_path, already, size
+            );
+            return Ok(StorageFileUpload {
+                already_uploaded_bytes: already,
+                data_channel: upload_id,
+            });
         }
-        task
-    } else {
-        (None, None)
-    };
-
-    let (upload_id, entry) = if task.0.is_some() && task.1.is_some() {
-        let mut pending_upload = task.1.unwrap();
-        pending_upload.writer = Some(
-            remote_fs
-                .create_async_writer(
-                    pending_upload.upload_path.as_str(),
-                    1024 * 4,
-                    pending_upload.already_uploaded_bytes as u64,
-                )
-                .await?,
-        );
-
-        (task.0.unwrap(), pending_upload)
-    } else {
-        remote_fs.create_empty_file(file_cache_path.as_str()).await?;
-        (
-            format!("ft_upload_{}", Uuid::new_v4()),
-            FtPendingUpload {
-                writer: Some(
-                    remote_fs.create_async_writer(file_cache_path.as_str(), 1024 * 4, 0).await?,
-                ),
-                size,
-                already_uploaded_bytes: 0,
-                upload_path: file_cache_path.clone(),
-                final_path: file_path.clone(),
-            },
-        )
-    };
-
-    let already_uploaded_bytes = entry.already_uploaded_bytes;
-
-    {
-        let mut map = FT_PENDING_UPLOADS.lock().await;
-        map.insert(upload_id.clone(), entry);
     }
 
+    let remote_fs = REMOTE_FS.read().await;
+    remote_fs.create_empty_file(file_cache_path.as_str()).await?;
+    let writer = remote_fs.create_async_writer(file_cache_path.as_str(), 1024 * 4, 0).await?;
+    drop(remote_fs);
+
+    let mut pending = FT_PENDING_UPLOADS.lock().await;
+    if let Some((upload_id, entry)) =
+        pending.iter().find(|(_, entry)| entry.final_path == file_path && entry.size == size)
+    {
+        if entry.channel_open {
+            return Err(anyhow!("upload already in progress"));
+        }
+        if entry.already_uploaded_bytes <= size {
+            return Ok(StorageFileUpload {
+                already_uploaded_bytes: entry.already_uploaded_bytes,
+                data_channel: upload_id.clone(),
+            });
+        }
+    }
+    let upload_id = format!("ft_upload_{}", Uuid::new_v4());
+    pending.insert(
+        upload_id.clone(),
+        FtPendingUpload {
+            writer: Some(writer),
+            size,
+            already_uploaded_bytes: 0,
+            upload_path: file_cache_path.clone(),
+            final_path: file_path.clone(),
+            channel_open: false,
+        },
+    );
     info!(
         "Starting upload of {} bytes to {}, cache_path: {}, channel: {}, already_uploaded_bytes: {}",
-        size, &file_path, &file_cache_path, &upload_id, already_uploaded_bytes
+        size, &file_path, &file_cache_path, &upload_id, 0
     );
+    Ok(StorageFileUpload { already_uploaded_bytes: 0, data_channel: upload_id })
+}
 
-    Ok(StorageFileUpload {
-        already_uploaded_bytes: already_uploaded_bytes,
-        data_channel: upload_id,
+async fn ft_closed_matches(file_path: &str, file_cache_path: &str, cache_size: i64) -> bool {
+    let closed = FT_PENDING_UPLOADS_CLOSED.lock().await;
+    closed.values().any(|item| {
+        item.final_path == file_path
+            && item.upload_path == file_cache_path
+            && item.already_uploaded_bytes == cache_size
     })
 }
 
-pub async fn append_ft_upload_data(upload_id: &str, data: &[u8]) -> Result<i64> {
-    let mut entry = {
-        let mut map = FT_PENDING_UPLOADS.lock().await;
-        map.remove(upload_id)
-    };
-    let Some(mut entry) = entry.take() else {
-        return Err(anyhow!("upload not found"));
-    };
-
-    let Some(writer) = entry.writer.as_mut() else {
-        let mut map = FT_PENDING_UPLOADS.lock().await;
-        map.insert(upload_id.to_owned(), entry);
-        return Err(anyhow!("writer not found"));
-    };
-
-    let size = match writer.write_chunk(data).await {
-        Ok(n) => n,
-        Err(e) => {
-            let mut map = FT_PENDING_UPLOADS.lock().await;
-            map.insert(upload_id.to_owned(), entry);
-            return Err(e);
+async fn discard_ft_cache(file_path: &str, file_cache_path: &str) -> Result<()> {
+    let mut writers = Vec::new();
+    let mut removed_pending = Vec::new();
+    let mut removed_closed = Vec::new();
+    {
+        let mut pending = FT_PENDING_UPLOADS.lock().await;
+        let mut closed = FT_PENDING_UPLOADS_CLOSED.lock().await;
+        if pending.values().any(|entry| {
+            entry.channel_open
+                && (entry.final_path == file_path || entry.upload_path == file_cache_path)
+        }) {
+            return Err(anyhow!("upload already in progress"));
         }
-    };
-    if size != data.len() {
-        let mut map = FT_PENDING_UPLOADS.lock().await;
-        map.insert(upload_id.to_owned(), entry);
-        return Err(anyhow!("Failed to write all data in file"));
+        let active_ids: Vec<String> = pending
+            .iter()
+            .filter(|(_, entry)| {
+                entry.final_path == file_path || entry.upload_path == file_cache_path
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in active_ids {
+            if let Some(mut entry) = pending.remove(&id) {
+                if let Some(writer) = entry.writer.take() {
+                    writers.push(writer);
+                }
+                removed_pending.push((id, entry));
+            }
+        }
+        let closed_ids: Vec<String> = closed
+            .iter()
+            .filter(|(_, entry)| {
+                entry.final_path == file_path || entry.upload_path == file_cache_path
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in closed_ids {
+            if let Some(mut entry) = closed.remove(&id) {
+                if let Some(writer) = entry.writer.take() {
+                    writers.push(writer);
+                }
+                removed_closed.push((id, entry));
+            }
+        }
     }
-    entry.already_uploaded_bytes += data.len() as i64;
-    let current = entry.already_uploaded_bytes;
+    for writer in &mut writers {
+        if let Err(e) = writer.shutdown().await {
+            warn!("error shutting down discarded FT writer: {:?}", e);
+        }
+    }
+    let delete_result: Result<()> = async {
+        let remote_fs = REMOTE_FS.read().await;
+        if remote_fs.exists(file_cache_path).await? {
+            remote_fs.delete_file(file_cache_path).await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = delete_result {
+        let mut pending = FT_PENDING_UPLOADS.lock().await;
+        let mut closed = FT_PENDING_UPLOADS_CLOSED.lock().await;
+        for (id, entry) in removed_pending {
+            pending.insert(id, entry);
+        }
+        for (id, entry) in removed_closed {
+            closed.insert(id, entry);
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Mark the active FT session as owned by one DataChannel. A second channel is rejected.
+pub async fn claim_ft_upload_channel(upload_id: &str) -> Result<()> {
     let mut map = FT_PENDING_UPLOADS.lock().await;
-    map.insert(upload_id.to_owned(), entry);
-    Ok(current)
+    let entry = map.get_mut(upload_id).ok_or_else(|| anyhow!("upload not found"))?;
+    if entry.channel_open {
+        return Err(anyhow!("upload already in progress"));
+    }
+    entry.channel_open = true;
+    Ok(())
+}
+
+pub async fn append_ft_upload_data(upload_id: &str, data: &[u8]) -> Result<(i64, i64)> {
+    let mut map = FT_PENDING_UPLOADS.lock().await;
+    let entry = map.get_mut(upload_id).ok_or_else(|| anyhow!("upload not found"))?;
+    let data = bytes_within_size(entry.already_uploaded_bytes, entry.size, data);
+    if !data.is_empty() {
+        let Some(writer) = entry.writer.as_mut() else {
+            return Err(anyhow!("writer not found"));
+        };
+        let written = writer.write_chunk(data).await?;
+        if written != data.len() {
+            return Err(anyhow!("Failed to write all data in file"));
+        }
+        entry.already_uploaded_bytes += data.len() as i64;
+    }
+    Ok((entry.size, entry.already_uploaded_bytes))
 }
 
 pub async fn complete_ft_upload(upload_id: &str) -> Result<()> {
-    let entry = {
-        let mut map = FT_PENDING_UPLOADS.lock().await;
-        map.remove(upload_id)
+    let (already, size, upload_path, final_path) = {
+        let mut pending = FT_PENDING_UPLOADS.lock().await;
+        let Some(entry) = pending.get_mut(upload_id) else {
+            return Err(anyhow!("upload not found"));
+        };
+        if let Some(writer) = entry.writer.as_mut() {
+            if let Err(e) = writer.flush().await {
+                entry.channel_open = false;
+                return Err(e);
+            }
+            if let Err(e) = writer.shutdown().await {
+                warn!("error shutting down writer: {:?}", e);
+            }
+        }
+        entry.writer = None;
+        (
+            entry.already_uploaded_bytes,
+            entry.size,
+            entry.upload_path.clone(),
+            entry.final_path.clone(),
+        )
     };
-    let Some(mut entry) = entry else {
+
+    if already == size {
+        let renamed = {
+            let remote_fs = REMOTE_FS.read().await;
+            remote_fs.rename(upload_path.as_str(), final_path.as_str()).await
+        };
+        let mut pending = FT_PENDING_UPLOADS.lock().await;
+        if renamed.is_ok() {
+            pending.remove(upload_id);
+            return Ok(());
+        }
+        if let Some(entry) = pending.get_mut(upload_id) {
+            entry.channel_open = false;
+        }
+        let mut closed = FT_PENDING_UPLOADS_CLOSED.lock().await;
+        if let Some(mut entry) = pending.remove(upload_id) {
+            entry.channel_open = false;
+            closed.insert(upload_id.to_owned(), entry);
+        }
+        return renamed.map(|_| ()).with_context(|| {
+            format!("failed to rename uploaded file: {} -> {}", upload_path, final_path)
+        });
+    }
+
+    if already > size {
+        {
+            let remote_fs = REMOTE_FS.read().await;
+            if remote_fs.exists(upload_path.as_str()).await.unwrap_or(false) {
+                if let Err(e) = remote_fs.delete_file(upload_path.as_str()).await {
+                    warn!("failed to delete overshot FT upload {}: {}", upload_path, e);
+                }
+            }
+        }
+        let mut pending = FT_PENDING_UPLOADS.lock().await;
+        pending.remove(upload_id);
+        warn!("discarded overshot FT upload {} ({}/{})", upload_id, already, size);
+        return Ok(());
+    }
+
+    let mut pending = FT_PENDING_UPLOADS.lock().await;
+    let mut closed = FT_PENDING_UPLOADS_CLOSED.lock().await;
+    let Some(mut entry) = pending.remove(upload_id) else {
         return Err(anyhow!("upload not found"));
     };
-
-    if let Some(writer) = entry.writer.as_mut() {
-        writer.flush().await?;
-        if let Err(e) = writer.shutdown().await {
-            warn!("error shutting down writer: {:?}", e);
-        }
-    }
+    entry.channel_open = false;
     entry.writer = None;
-
-    let upload_path = entry.upload_path.clone();
-    let final_path = entry.final_path.clone();
-    let finish = entry.already_uploaded_bytes == entry.size;
-
-    if finish {
-        let remote_fs = REMOTE_FS.read().await;
-        remote_fs.rename(upload_path.as_str(), final_path.as_str()).await?;
-    } else {
-        let mut map = FT_PENDING_UPLOADS_CLOSED.lock().await;
-        map.insert(upload_id.to_owned(), entry);
-    }
+    closed.insert(upload_id.to_owned(), entry);
     Ok(())
 }
 
@@ -1723,26 +2025,289 @@ pub struct StorageSpace {
 }
 
 pub async fn get_storage_space() -> Result<StorageSpace> {
-    // Get IMG_FILE_NAME file size to subtract from storage space
-    let (img_file_size, img_file_used) = get_img_file_size().await.unwrap_or((0, 0));
+    // Occupied space uses statfs actual usage. Subtract ft_disk.img *allocated*
+    // blocks (not logical 16GB) so USB-drive backing store is not billed as
+    // ArkKVM Storage / System Data.
+    let (_, img_actual) = get_img_file_size().await.unwrap_or((0, 0));
     tokio::task::spawn_blocking(move || {
         let path = Path::new(IMAGES_FOLDER);
         let st = rustix::fs::statfs(path).context("failed to statfs images folder")?;
         let total = st.f_blocks * st.f_bsize as u64;
         let used = (st.f_blocks - st.f_bfree) * st.f_bsize as u64;
-        // let free = (st.f_bfree as u128 * st.f_bsize as u128) as i64;
-        // let used = total.saturating_sub(free);
-
-        // Subtract IMG_FILE_NAME file size from total
-        // This prevents users from being misled by the space occupied by the fs functionality
-        let adjusted_total = (total as i64).saturating_sub(img_file_size as i64).max(0);
-        let adjusted_used = (used as i64).saturating_sub(img_file_used as i64).max(0);
+        let adjusted_total = (total as i64).saturating_sub(img_actual as i64).max(0);
+        let adjusted_used = (used as i64).saturating_sub(img_actual as i64).max(0);
         let adjusted_free = adjusted_total.saturating_sub(adjusted_used);
-
         Ok(StorageSpace { bytes_used: adjusted_used, bytes_free: adjusted_free })
     })
     .await
     .context("spawn_blocking failed")?
+}
+
+const LOGS_DIR: &str = "/userdata/arkkvm/logs";
+const LOG_DIR: &str = "/userdata/arkkvm/log";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageCategory {
+    /// Stable id for UI: `system` | `logs` | `images` | `files`
+    pub id: String,
+    pub label: String,
+    #[serde(rename = "bytesUsed")]
+    pub bytes_used: i64,
+    /// When false, UI shows "Required" and must not offer clear.
+    pub clearable: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageDetails {
+    #[serde(rename = "bytesTotal")]
+    pub bytes_total: i64,
+    #[serde(rename = "bytesUsed")]
+    pub bytes_used: i64,
+    #[serde(rename = "bytesFree")]
+    pub bytes_free: i64,
+    pub categories: Vec<StorageCategory>,
+}
+
+/// On-disk occupancy: allocated blocks (512-byte units), not sparse logical size.
+fn file_allocated_bytes(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
+}
+
+fn path_tree_bytes_sync(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    if meta.is_file() {
+        return file_allocated_bytes(&meta);
+    }
+    if !meta.is_dir() {
+        return 0;
+    }
+    let mut total = 0u64;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        total = total.saturating_add(path_tree_bytes_sync(&entry.path()));
+    }
+    total
+}
+
+async fn path_tree_bytes(path: &Path) -> u64 {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || path_tree_bytes_sync(&path))
+        .await
+        .unwrap_or(0)
+}
+
+/// ArkKVM Storage (Virtual Media) breakdown for Storage Details modal.
+pub async fn get_storage_details() -> Result<StorageDetails> {
+    let _ = ensure_images_folder().await;
+    let space = get_storage_space().await?;
+    let bytes_total = space.bytes_used.saturating_add(space.bytes_free);
+    let logs_bytes = path_tree_bytes(Path::new(LOGS_DIR)).await
+        + path_tree_bytes(Path::new(LOG_DIR)).await;
+    let images_bytes = path_tree_bytes(Path::new(IMAGES_FOLDER)).await;
+    let accounted = (logs_bytes as i64).saturating_add(images_bytes as i64);
+    let system_bytes = space.bytes_used.saturating_sub(accounted).max(0);
+
+    Ok(StorageDetails {
+        bytes_total,
+        bytes_used: space.bytes_used,
+        bytes_free: space.bytes_free,
+        categories: vec![
+            StorageCategory {
+                id: "system".into(),
+                label: "System Data".into(),
+                bytes_used: system_bytes,
+                clearable: false,
+            },
+            StorageCategory {
+                id: "logs".into(),
+                label: "Logs".into(),
+                bytes_used: logs_bytes as i64,
+                clearable: true,
+            },
+            StorageCategory {
+                id: "images".into(),
+                label: "Images".into(),
+                bytes_used: images_bytes as i64,
+                clearable: true,
+            },
+        ],
+    })
+}
+
+async fn clear_dir_contents(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(dir)
+        .await
+        .with_context(|| format!("failed to read dir {}", dir.display()))?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let meta = entry.metadata().await?;
+        if meta.is_dir() {
+            fs::remove_dir_all(&path)
+                .await
+                .with_context(|| format!("failed to remove dir {}", path.display()))?;
+        } else {
+            fs::remove_file(&path)
+                .await
+                .with_context(|| format!("failed to remove file {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Truncate files in place so open log FDs keep the same inode. Unlink would
+/// leave deleted files occupying space that then shows up as System Data.
+async fn truncate_dir_files(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(dir)
+        .await
+        .with_context(|| format!("failed to read dir {}", dir.display()))?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let meta = entry.metadata().await?;
+        if meta.is_dir() {
+            fs::remove_dir_all(&path)
+                .await
+                .with_context(|| format!("failed to remove dir {}", path.display()))?;
+        } else {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .await
+                .with_context(|| format!("failed to open {}", path.display()))?;
+            file.set_len(0)
+                .await
+                .with_context(|| format!("failed to truncate {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Delete all application/startup logs under `/userdata/arkkvm/logs` and `/userdata/arkkvm/log`.
+pub async fn clear_storage_logs() -> Result<()> {
+    info!("clear_storage_logs: truncating {} and {}", LOGS_DIR, LOG_DIR);
+    truncate_dir_files(Path::new(LOGS_DIR)).await?;
+    truncate_dir_files(Path::new(LOG_DIR)).await?;
+    let _ = fs::create_dir_all(LOGS_DIR).await;
+    let _ = fs::create_dir_all(LOG_DIR).await;
+    Ok(())
+}
+
+/// Delete all Virtual Media images under `/userdata/arkkvm/images` (unmounts if needed).
+pub async fn clear_storage_images() -> Result<()> {
+    info!("clear_storage_images: clearing {}", IMAGES_FOLDER);
+    if let Some(state) = get_virtual_media_state() {
+        if state.source == VirtualMediaSource::Storage {
+            if let Err(e) = unmount_image().await {
+                warn!("clear_storage_images: unmount before clear failed: {:?}", e);
+            }
+        }
+    }
+
+    // Cancel any in-flight uploads by wiping incomplete + finals.
+    let list = list_storage_files().await?;
+    for entry in &list.files {
+        let _ = cancel_vm_upload(&entry.filename).await;
+    }
+
+    clear_dir_contents(Path::new(IMAGES_FOLDER)).await?;
+    ensure_images_folder().await?;
+    Ok(())
+}
+
+/// Virtual USB Drive (File Transfer) breakdown for Storage Details modal.
+pub async fn get_ft_storage_details() -> Result<StorageDetails> {
+    let info = fs_info_with_file_img().await?;
+    let bytes_total = info.total_space as i64;
+    let bytes_used = info.used_space as i64;
+    let bytes_free = info.free_space as i64;
+
+    // Details UI only lists user-visible files. Bar used/free still come from df
+    // (includes FAT metadata / target-OS hidden dirs explained in the footer note).
+    let user_files = sum_ft_user_files("/").await?;
+
+    Ok(StorageDetails {
+        bytes_total,
+        bytes_used,
+        bytes_free,
+        categories: vec![StorageCategory {
+            id: "files".into(),
+            label: "Files".into(),
+            bytes_used: user_files,
+            clearable: true,
+        }],
+    })
+}
+
+async fn sum_ft_user_files(path: &str) -> Result<i64> {
+    sum_ft_user_files_inner(path).await
+}
+
+fn sum_ft_user_files_inner<'a>(
+    path: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64>> + Send + 'a>> {
+    Box::pin(async move {
+        let entries = list_with_file_img(path.to_string()).await?;
+        let mut total = 0i64;
+        for e in entries {
+            if e.is_dir {
+                let child = if path == "/" {
+                    format!("/{}", e.name)
+                } else {
+                    format!("{}/{}", path.trim_end_matches('/'), e.name)
+                };
+                total = total.saturating_add(sum_ft_user_files_inner(&child).await?);
+            } else {
+                total = total.saturating_add(e.size as i64);
+            }
+        }
+        Ok(total)
+    })
+}
+
+/// Delete all user-visible files/dirs on the FT virtual disk (keeps System Volume Information).
+pub async fn clear_ft_user_files() -> Result<()> {
+    info!("clear_ft_user_files: deleting all user files on FT disk");
+    // Drain pending FT uploads first.
+    {
+        let mut process = FT_PENDING_UPLOADS.lock().await;
+        for (_, mut item) in process.drain() {
+            if let Some(writer) = item.writer.as_mut() {
+                let _ = writer.shutdown().await;
+            }
+        }
+    }
+    {
+        let mut closed = FT_PENDING_UPLOADS_CLOSED.lock().await;
+        closed.clear();
+    }
+
+    let entries = list_with_file_img("/".to_string()).await?;
+    for e in entries {
+        let path = format!("/{}", e.name);
+        if e.is_dir {
+            fs_del_dir_with_file_img(path).await?;
+        } else {
+            fs_del_file_with_file_img(path).await?;
+        }
+    }
+    Ok(())
 }
 
 pub async fn delete_storage_file(file_name: &str) -> Result<()> {

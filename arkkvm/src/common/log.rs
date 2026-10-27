@@ -12,6 +12,7 @@ const COLLECT_EVIDENCE_SCRIPT: &str = "/oem/usr/bin/collect_evidence.sh";
 
 pub fn init_log() -> Result<(Option<WorkerGuard>, Handle<EnvFilter, Registry>)> {
     LogBuilder::default()
+        .set_output_console(false)
         .set_output_file(true)
         .set_file_name(LOG_FILE_NAME)
         .build()
@@ -49,8 +50,8 @@ pub async fn collect_evidence() -> Result<String> {
     }
 
     info!("Running collect evidence script: {COLLECT_EVIDENCE_SCRIPT}");
-    let output = Command::new(COLLECT_EVIDENCE_SCRIPT)
-        .output()
+    let mut cmd = Command::new(COLLECT_EVIDENCE_SCRIPT);
+    let output = crate::process_spawn::output(cmd)
         .await
         .with_context(|| format!("failed to execute {COLLECT_EVIDENCE_SCRIPT}"))?;
 

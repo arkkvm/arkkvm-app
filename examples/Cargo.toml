@@ -25,7 +25,7 @@ base64 = "0.22.1"
 arkkvm = { path = "../arkkvm" }
 tokio-util = { version = "0.7.16", default-features = false }
 uuid = { version = "1.0", features = ["v4"] }
-webrtc = { version = "0.13.0", features = [] }
+webrtc = { version = "0.20.5" }
 
 [[example]]
 name = "webrtc"

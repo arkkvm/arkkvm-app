@@ -163,8 +163,8 @@ pub enum IPv6AddressType {
 /// Determine if a ULA address is stable
 /// 
 /// Criteria for stable addresses (in priority order):
-/// 1. IFA_F_TEMPORARY flag (0x80) indicates temporary address, definitely not stable
-/// 2. IFA_F_PERMANENT flag (0x02) indicates permanent address, definitely stable
+/// 1. IFA_F_TEMPORARY flag (0x01, aka IFA_F_SECONDARY) indicates temporary address, definitely not stable
+/// 2. IFA_F_PERMANENT flag (0x80) indicates permanent address, definitely stable
 /// 3. flags == 0 usually indicates default generated stable address (no special flags)
 /// 4. Long lifetime (valid_lifetime > 7 days) usually indicates stable address
 /// 5. Address format: simplified addresses (e.g., ::581) are usually primary addresses, more stable
@@ -174,8 +174,8 @@ pub fn is_stable_ula_address(
     valid_lifetime: Option<DateTime<Utc>>,
 ) -> bool {
     // Linux kernel flag definitions
-    const IFA_F_PERMANENT: u8 = 0x02;  // Permanent address
-    const IFA_F_TEMPORARY: u8 = 0x80;  // Temporary address (privacy address)
+    const IFA_F_PERMANENT: u8 = 0x80;  // Permanent address
+    const IFA_F_TEMPORARY: u8 = 0x01;  // Temporary address (privacy address, IFA_F_SECONDARY)
     
     // First check flags (most reliable method)
     if let Some(flags_val) = flags {
@@ -981,9 +981,11 @@ async fn get_ipv4_addresses_via_ip(interface_name: &str) -> Vec<String> {
 }
 
 async fn get_ipv4_entries_via_ip(interface_name: &str) -> Vec<Ipv4IfaceEntry> {
-    let output = match Command::new("ip")
-        .args(["-4", "-o", "addr", "show", "dev", interface_name])
-        .output()
+    let output = match crate::process_spawn::output({
+        let mut cmd = Command::new("ip");
+        cmd.args(["-4", "-o", "addr", "show", "dev", interface_name]);
+        cmd
+    })
         .await
     {
         Ok(output) if output.status.success() => output,
@@ -1015,9 +1017,11 @@ async fn get_ipv4_entries_via_ip(interface_name: &str) -> Vec<Ipv4IfaceEntry> {
 }
 
 async fn get_gateway_for_interface(interface_name: &str, src_ip: &str) -> Option<String> {
-    if let Ok(output) = Command::new("ip")
-        .args(["route", "show", "default", "dev", interface_name])
-        .output()
+    if let Ok(output) = crate::process_spawn::output({
+        let mut cmd = Command::new("ip");
+        cmd.args(["route", "show", "default", "dev", interface_name]);
+        cmd
+    })
         .await
     {
         if output.status.success() {
@@ -1029,9 +1033,11 @@ async fn get_gateway_for_interface(interface_name: &str, src_ip: &str) -> Option
         }
     }
 
-    if let Ok(output) = Command::new("ip")
-        .args(["route", "get", "1.0.0.1", "from", src_ip, "iif", interface_name])
-        .output()
+    if let Ok(output) = crate::process_spawn::output({
+        let mut cmd = Command::new("ip");
+        cmd.args(["route", "get", "1.0.0.1", "from", src_ip, "iif", interface_name]);
+        cmd
+    })
         .await
     {
         if output.status.success() {
@@ -1042,9 +1048,11 @@ async fn get_gateway_for_interface(interface_name: &str, src_ip: &str) -> Option
         }
     }
 
-    if let Ok(output) = Command::new("ip")
-        .args(["route", "show", "default"])
-        .output()
+    if let Ok(output) = crate::process_spawn::output({
+        let mut cmd = Command::new("ip");
+        cmd.args(["route", "show", "default"]);
+        cmd
+    })
         .await
     {
         if output.status.success() {
@@ -1338,8 +1346,10 @@ async fn query_ipv6_rtnetlink(interface: &str) -> Result<
                                         x if x == (libc::IFA_CACHEINFO as i32) => {
                                             if payload_len >= size_of::<ifa_cacheinfo>() {
                                                 let ci: ifa_cacheinfo = unsafe { std::ptr::read_unaligned(payload_ptr as *const ifa_cacheinfo) };
-                                                if ci.ifa_prefered != u32::MAX { preferred = Some(ci.ifa_prefered); }
-                                                if ci.ifa_valid != u32::MAX { valid = Some(ci.ifa_valid); }
+                                                // u32::MAX means forever (permanent/static address): keep it so
+                                                // ipv6_address_state() yields Preferred and the UI can display it.
+                                                preferred = Some(ci.ifa_prefered);
+                                                valid = Some(ci.ifa_valid);
                                             }
                                         }
                                         x if x == (libc::IFA_ADDRESS as i32) => {

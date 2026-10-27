@@ -120,12 +120,12 @@ pub async fn update_edid(edid_str: Option<&str>) -> Result<()> {
 /// 
 /// Returns the EDID data as a vector of bytes (128 or 256 bytes)
 async fn get_edid() -> Result<Vec<u8>> {
-    let output = Command::new("v4l2-ctl")
-        .arg("--device")
+    let mut cmd = Command::new("v4l2-ctl");
+    cmd.arg("--device")
         .arg(SUB_DEV)
         .arg("--get-edid")
-        .arg("pad=0,format=raw")
-        .output()
+        .arg("pad=0,format=raw");
+    let output = crate::process_spawn::output(cmd)
         .await
         .context("Failed to execute v4l2-ctl command")?;
     
@@ -158,14 +158,16 @@ async fn flush_edid_to_device() -> Result<()> {
     
     info!("Setting EDID from file: {}", file_path.display());
     
-    let output = Command::new("v4l2-ctl")
-        .arg("--device")
-        .arg(SUB_DEV)
-        .arg("--set-edid")
-        .arg(format!("pad=0,file={},format=raw", file_path.display()))
-        .output()
-        .await
-        .context("Failed to execute v4l2-ctl command")?;
+    let output = crate::process_spawn::output({
+        let mut cmd = Command::new("v4l2-ctl");
+        cmd.arg("--device")
+            .arg(SUB_DEV)
+            .arg("--set-edid")
+            .arg(format!("pad=0,file={},format=raw", file_path.display()));
+        cmd
+    })
+    .await
+    .context("Failed to execute v4l2-ctl command")?;
     
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -222,14 +224,16 @@ async fn save_edid_to_file(edid_data: &[u8]) -> Result<()> {
 async fn restore_default_edid() -> Result<()> {
     info!("Restoring default EDID");
     
-    let output = Command::new("v4l2-ctl")
-        .arg("--device")
-        .arg(SUB_DEV)
-        .arg("--set-edid")
-        .arg("pad=0,type=hdmi")
-        .output()
-        .await
-        .context("Failed to execute v4l2-ctl command")?;
+    let output = crate::process_spawn::output({
+        let mut cmd = Command::new("v4l2-ctl");
+        cmd.arg("--device")
+            .arg(SUB_DEV)
+            .arg("--set-edid")
+            .arg("pad=0,type=hdmi");
+        cmd
+    })
+    .await
+    .context("Failed to execute v4l2-ctl command")?;
     
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

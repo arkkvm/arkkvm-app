@@ -14,12 +14,13 @@ name = "arkkvm_app"
 path = "src/main.rs"
 
 [features]
-env_dev = []
+env_dev = ["dep:rmesg"]
 env_unsafe = []
 
 [dependencies]
 common = { workspace = true }
 rockchip_mpi_sys = { workspace = true }
+rmesg = { version = "1.0.24", optional = true }
 
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -80,11 +81,10 @@ salvo = { version = "0.84.0", features = [
 ] }
 time = { version = "0.3.41", default-features = false, features = ["macros"] }
 uuid = { version = "1.17.0", default-features = false, features = ["v4"] }
-webrtc = { version = "0.17.1", features = [] }
+webrtc = { version = "0.20.5" }
+rtc = { version = "0.20.5" }
+async-trait = "0.1"
 
-id_token_verifier = { git = "https://github.com/foxxcn/id_token_verifier.git", tag = "rekvm", features = [
-  "tracing",
-] }
 fatfs = "0.3.6"
 zenoh = { version = "1.5.1", default-features = false, features = [
   "transport_unixsock-stream",

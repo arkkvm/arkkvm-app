@@ -8,6 +8,7 @@ const LOG_FILE_NAME: &str = "arkkvm_usb.log";
 
 pub fn init_log() -> Result<(Option<WorkerGuard>, Handle<EnvFilter, Registry>)> {
     LogBuilder::default()
+        .set_output_console(false)
         .set_output_file(true)
         .set_file_name(LOG_FILE_NAME)
         .set_log_level("info")

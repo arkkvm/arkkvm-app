@@ -9,14 +9,11 @@ use anyhow::{Context as AnyhowContext, Result, anyhow, bail};
 use serde::Serialize;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::Notify;
-use webrtc::data_channel::RTCDataChannel;
+use webrtc::data_channel::DataChannel;
 
 use crate::config::CONFIG_DIR;
 
 pub const LOCAL_FILE_CHUNK_SIZE: usize = 4096;
-pub const DC_BUFFER_LOW_WATER: usize = 64 * 1024;
-pub const DC_BUFFER_HIGH_WATER: usize = 256 * 1024;
 
 /// Inclusive byte range `[start, end]` within `[0, file_size - 1]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,21 +23,13 @@ pub struct ByteRange {
 }
 
 impl ByteRange {
-  pub fn len(&self) -> u64 {
-        if self.end < self.start {
-            0
-        } else {
-            self.end - self.start + 1
-        }
+    pub fn len(&self) -> u64 {
+        if self.end < self.start { 0 } else { self.end - self.start + 1 }
     }
 
     /// Bytes to transfer for a file of `file_size` (handles empty files).
     pub fn content_len(&self, file_size: u64) -> u64 {
-        if file_size == 0 {
-            0
-        } else {
-            self.len()
-        }
+        if file_size == 0 { 0 } else { self.len() }
     }
 
     pub fn full_file(file_size: u64) -> Self {
@@ -120,16 +109,13 @@ pub async fn resolve_local_file_path(user_path: &str) -> Result<PathBuf> {
     let base = base_canonical().await?;
     let candidate = base.join(&relative);
 
-    let metadata = fs::metadata(&candidate)
-        .await
-        .with_context(|| "file not found")?;
+    let metadata = fs::metadata(&candidate).await.with_context(|| "file not found")?;
     if !metadata.is_file() {
         bail!("not a regular file");
     }
 
-    let resolved = fs::canonicalize(&candidate)
-        .await
-        .with_context(|| "failed to resolve file path")?;
+    let resolved =
+        fs::canonicalize(&candidate).await.with_context(|| "failed to resolve file path")?;
     if !resolved.starts_with(&base) {
         bail!("path outside allowed directory");
     }
@@ -161,9 +147,7 @@ pub async fn delete_collected_evidence_file(user_path: &str) -> Result<()> {
     }
 
     let resolved = resolve_local_file_path(user_path).await?;
-    fs::remove_file(&resolved)
-        .await
-        .context("failed to delete evidence file")?;
+    fs::remove_file(&resolved).await.context("failed to delete evidence file")?;
     Ok(())
 }
 
@@ -171,17 +155,9 @@ pub async fn get_local_file_info(user_path: &str) -> Result<LocalFileInfo> {
     let relative = user_path_to_relative(user_path)?;
     let resolved = resolve_local_file_path(user_path).await?;
     let metadata = fs::metadata(&resolved).await?;
-    let name = resolved
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default()
-        .to_string();
+    let name = resolved.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
 
-    Ok(LocalFileInfo {
-        name,
-        size: metadata.len(),
-        path: relative,
-    })
+    Ok(LocalFileInfo { name, size: metadata.len(), path: relative })
 }
 
 /// Parse RFC 7233 `Range: bytes=...` (single range only).
@@ -256,11 +232,7 @@ impl LocalFileReader {
     }
 
     pub fn range_len(&self) -> u64 {
-        if self.file_size == 0 {
-            0
-        } else {
-            self.end_position.saturating_sub(self.range_start) + 1
-        }
+        if self.file_size == 0 { 0 } else { self.end_position.saturating_sub(self.range_start) + 1 }
     }
 
     pub fn position(&self) -> u64 {
@@ -312,31 +284,21 @@ pub async fn open_local_file_reader(
         .await
         .with_context(|| format!("failed to open {:?}", resolved))?;
 
-    let file_size = file
-        .metadata()
-        .await
-        .with_context(|| "failed to stat file")?
-        .len();
+    let file_size = file.metadata().await.with_context(|| "failed to stat file")?.len();
 
     let range = range.unwrap_or_else(|| ByteRange::full_file(file_size));
     if file_size > 0 && range.start >= file_size {
         bail!("range start beyond file size");
     }
 
-    let end_position = if file_size == 0 {
-        0
-    } else {
-        std::cmp::min(range.end, file_size - 1)
-    };
+    let end_position = if file_size == 0 { 0 } else { std::cmp::min(range.end, file_size - 1) };
 
     if range.start > end_position && file_size > 0 {
         bail!("invalid byte range");
     }
 
     if range.start > 0 || (file_size > 0 && end_position < file_size - 1) {
-        file.seek(std::io::SeekFrom::Start(range.start))
-            .await
-            .context("failed to seek file")?;
+        file.seek(std::io::SeekFrom::Start(range.start)).await.context("failed to seek file")?;
     }
 
     Ok(LocalFileReader {
@@ -350,40 +312,14 @@ pub async fn open_local_file_reader(
 }
 
 /// Cooperative backpressure on RTCDataChannel SCTP send queue.
-pub struct DataChannelBackpressure {
-    high_threshold: usize,
-    notify: Arc<Notify>,
-}
+pub struct DataChannelBackpressure;
 
 impl DataChannelBackpressure {
-    pub async fn attach(channel: &RTCDataChannel) -> Arc<Self> {
-        channel
-            .set_buffered_amount_low_threshold(DC_BUFFER_LOW_WATER)
-            .await;
-
-        let bp = Arc::new(Self {
-            high_threshold: DC_BUFFER_HIGH_WATER,
-            notify: Arc::new(Notify::new()),
-        });
-
-        let notify = bp.notify.clone();
-        channel.on_buffered_amount_low(Box::new(move || {
-            let notify = notify.clone();
-            Box::pin(async move {
-                notify.notify_waiters();
-            })
-        }));
-
-        bp
+    pub async fn attach(_channel: &Arc<dyn DataChannel>) -> Arc<Self> {
+        Arc::new(Self)
     }
 
-    pub async fn wait_writable(&self, channel: &RTCDataChannel) {
-        loop {
-            let buffered = channel.buffered_amount().await;
-            if buffered <= self.high_threshold {
-                return;
-            }
-            self.notify.notified().await;
-        }
+    pub async fn wait_writable(&self, channel: &Arc<dyn DataChannel>) {
+        let _ = channel.writable().await;
     }
 }

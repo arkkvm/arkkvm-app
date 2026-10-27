@@ -332,11 +332,11 @@ fn runtime_usb_config_to_base_info(
         manufacturer: runtime.manufacturer.clone(),
         product: runtime.product.clone(),
         strict_mode: current.strict_mode,
+        force_full_speed: runtime.force_full_speed,
     })
 }
 
-/// Every apply command runs the full gadget lifecycle and UMS mount sync.
-/// State diffs are logged only; they do not skip execution.
+/// Full gadget lifecycle + UMS sync, except pure network adapter L3 updates (no unbind).
 async fn apply_full_config(
     manager: &mut UsbDeviceManager,
     last_usb_info: &mut Option<UsbDeviceInfo>,
@@ -347,19 +347,44 @@ async fn apply_full_config(
         UsbError::InvalidArgument("missing switches in usb_info".into())
     })?;
 
+    manager
+        .set_network_adapter_l3_config(usb_info.network_adapter_l3.as_ref())
+        .await;
+
     let current = manager.get_switches();
+    let switches_changed = is_switches_change(&current, &switches);
     let paths_changed = last_usb_info
         .as_ref()
         .map(|prev| is_paths_change(prev, &usb_info))
         .unwrap_or(false);
+    let base_changed = manager.get_base_info() != base_info;
+    let network_l3_changed = last_usb_info
+        .as_ref()
+        .map(|prev| is_network_adapter_l3_change(prev, &usb_info))
+        .unwrap_or(usb_info.network_adapter_l3.is_some());
+
     info!(
         current = ?current,
         requested = ?switches,
-        switches_changed = is_switches_change(&current, &switches),
+        switches_changed = switches_changed,
         paths_changed = paths_changed,
-        base_changed = manager.get_base_info() != base_info,
+        base_changed = base_changed,
+        network_l3_changed = network_l3_changed,
         "apply_full_config"
     );
+
+    // Switches / paths / base unchanged: only refresh board L3 (no gadget rebuild).
+    if last_usb_info.is_some()
+        && !switches_changed
+        && !paths_changed
+        && !base_changed
+        && network_l3_changed
+    {
+        info!("apply_full_config: network adapter L3-only update");
+        manager.apply_network_adapter_l3_only().await?;
+        *last_usb_info = Some(usb_info);
+        return Ok(manager.get_switches());
+    }
 
     apply_switches(manager, Some(base_info), &switches).await?;
     apply_ums_mounts(manager, &usb_info, last_usb_info.as_ref()).await?;
@@ -478,12 +503,29 @@ pub fn is_switches_change(a: &DeviceSwitches, b: &DeviceSwitches) -> bool {
         || a.ums_ft_enabled != b.ums_ft_enabled
         || a.uac1_enabled != b.uac1_enabled
         || a.uvc_enabled != b.uvc_enabled
+        || network_adapter_switch_changed(a.network_adapter.as_ref(), b.network_adapter.as_ref())
+}
+
+fn network_adapter_switch_changed(
+    a: Option<&crate::proto::v1::NetworkAdapterSwitch>,
+    b: Option<&crate::proto::v1::NetworkAdapterSwitch>,
+) -> bool {
+    match (a, b) {
+        (None, None) => false,
+        (Some(a), Some(b)) => a.enable != b.enable || a.adapter_type != b.adapter_type,
+        (None, Some(b)) => b.enable,
+        (Some(a), None) => a.enable,
+    }
 }
 
 fn is_paths_change(a: &UsbDeviceInfo, b: &UsbDeviceInfo) -> bool {
     a.ums_vm_path != b.ums_vm_path
         || a.ums_ft_path != b.ums_ft_path
         || a.ums_vm_type != b.ums_vm_type
+}
+
+fn is_network_adapter_l3_change(a: &UsbDeviceInfo, b: &UsbDeviceInfo) -> bool {
+    a.network_adapter_l3 != b.network_adapter_l3
 }
 
 #[cfg(test)]
@@ -499,6 +541,7 @@ mod tests {
             ums_ft_enabled: ums_ft,
             uac1_enabled: false,
             uvc_enabled: false,
+            network_adapter: None,
         }
     }
 
@@ -523,6 +566,7 @@ mod tests {
             ums_vm_path: String::new(),
             ums_ft_path: "/a.img".into(),
             ums_vm_type: UmsVmType::VmCdRom as i32,
+            network_adapter_l3: None,
         };
         let b = UsbDeviceInfo {
             ums_ft_path: "/b.img".into(),

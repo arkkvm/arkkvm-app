@@ -9,13 +9,15 @@ use std::time::Duration;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::config::get_config_manager;
 use crate::config::types::{UsbConfig, UsbDevices};
 use crate::services;
 
+pub mod mcp_ssh;
 pub mod mic;
+pub mod network_adapter;
 pub mod storage;
 
 #[derive(Debug)]
@@ -44,7 +46,7 @@ lazy_static::lazy_static! {
     static ref INPUT_BASE: Instant = Instant::now();
 
     /// Lock for reconciling USB runtime config with the `usb_devices` sidecar.
-    static ref USB_RECONCILE_LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static ref USB_RECONCILE_LOCK: Mutex<()> = Mutex::new(());
 }
 
 /// Seconds (relative to `INPUT_BASE`) of the last real user input; 0 = none yet.
@@ -128,12 +130,22 @@ pub async fn reboot_usb_manager_with_reason(
         config.get_usb_config().await
     };
 
-    let devices =
+    let preference =
         if let Some(devices) = devices.take() { devices } else { config.get_usb_devices().await };
+
+    let ssh = config.get_ssh_forwarding_enabled().await;
+    let apply_devices = mcp_ssh::devices_for_apply(&preference, ssh);
+    let persist_devices = mcp_ssh::devices_for_persist(&preference, ssh);
+
+    let prev_devices = config.get_usb_devices().await;
+    // Compare apply vs previous apply so SSH overlay is visible to early-return logic.
+    let prev_apply = mcp_ssh::devices_for_apply(&prev_devices, ssh);
 
     info!(
         usb_config = ?usb_config,
-        requested_devices = ?devices,
+        preference = ?preference,
+        apply_devices = ?apply_devices,
+        ssh_forwarding = ssh,
         "reboot_usb_manager apply target devices (config saved only on success)"
     );
 
@@ -141,11 +153,47 @@ pub async fn reboot_usb_manager_with_reason(
         warn!("UsbClient not initialized; skipped sidecar apply");
         return Err(anyhow::anyhow!("UsbClient not initialized"));
     }
-    reconcile_usb_runtime(usb_config.clone(), devices.clone(), reason).await?;
+
+    // L3-only: still call sidecar apply (usb_devices applies board L3 without rebuild).
+    let gadget_same = network_adapter::gadget_switches_equal(&prev_apply, &apply_devices);
+    let usb_config_same = config.get_usb_config().await == usb_config;
+    if gadget_same
+        && usb_config_same
+        && !network_adapter::network_adapter_l3_equal(
+            &prev_apply.network_adapter,
+            &apply_devices.network_adapter,
+        )
+    {
+        info!("reboot_usb_manager: network adapter L3-only update via sidecar");
+        reconcile_usb_runtime(usb_config.clone(), apply_devices.clone(), "network_adapter_l3")
+            .await?;
+        config.set_usb_devices(&persist_devices).await?;
+        info!(devices = ?persist_devices, "reboot_usb_manager persisted L3-only config");
+        return Ok(());
+    }
+
+    if gadget_same
+        && usb_config_same
+        && network_adapter::network_adapter_l3_equal(
+            &prev_apply.network_adapter,
+            &apply_devices.network_adapter,
+        )
+    {
+        // Still persist preference if it diverged (e.g. mouse pref while SSH overlay hides it).
+        if prev_devices != persist_devices {
+            config.set_usb_devices(&persist_devices).await?;
+            info!(devices = ?persist_devices, "reboot_usb_manager persisted preference only");
+        } else {
+            info!("reboot_usb_manager: no gadget/L3 change");
+        }
+        return Ok(());
+    }
+
+    reconcile_usb_runtime(usb_config.clone(), apply_devices, reason).await?;
 
     config.set_usb_config(usb_config).await?;
-    config.set_usb_devices(&devices).await?;
-    info!(devices = ?devices, "reboot_usb_manager persisted config after success");
+    config.set_usb_devices(&persist_devices).await?;
+    info!(devices = ?persist_devices, "reboot_usb_manager persisted config after success");
     info!("reboot_usb_manager done");
     Ok(())
 }

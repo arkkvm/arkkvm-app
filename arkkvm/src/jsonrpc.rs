@@ -16,17 +16,17 @@
 //! - Type-safe parameter serialization/deserialization
 
 use std::collections::HashMap;
-use std::{format, panic};
 use std::sync::Arc;
+use std::{format, panic};
 
 use anyhow::{Result, anyhow};
+use bytes::BytesMut;
 use futures::future::BoxFuture;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{error, info, trace, warn};
-use webrtc::data_channel::RTCDataChannel;
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use webrtc::data_channel::{DataChannel, RTCDataChannelMessage};
 
 use crate::cloud::types::{CloudConnectionState, CloudState};
 use crate::config::get_config_manager;
@@ -38,12 +38,16 @@ use crate::hardware::usb::storage::FileTransferTarget;
 use crate::jiggler::JigglerConfig;
 use crate::jsonrpc::handlers::*;
 use crate::module::rtc_request_params::{
-    ATXPowerParams, BacklightSettingsParams, DisplayRotationParams, FilePathParams, FileUploadParams, FtFileDownloadParams, LocalFileDownloadParams, NetworkSettingsParams, PathParams, RemoveVirtualMediaItemParams, RenewVlanDhcpLeaseParams, SettingSwitchParams, SshKeyParam, TailscaleParams, VersionParams, VirtualMediaListParams, VlanSettingsParams,
+    ATXPowerParams, BacklightSettingsParams, DisplayRotationParams, FilePathParams,
+    FileUploadParams, FtFileDownloadParams, LocalFileDownloadParams, NetworkSettingsParams,
+    PathParams, RemoveVirtualMediaItemParams, RenewVlanDhcpLeaseParams, SettingSwitchParams,
+    SshKeyParam, TailscaleParams, VersionParams, VirtualMediaListParams, VlanSettingsParams,
 };
 use crate::module::rtc_response_params::OtaState;
 use crate::services::gui_pipeline;
 use crate::session::Session;
 use crate::web::get_global_app_state;
+use crate::webrtc::{DcCallbacks, spawn_dc_events, wait_dc_open};
 // use crate::webrtc::{get_current_session, get_rpc_channel};
 
 lazy_static::lazy_static! {
@@ -91,6 +95,12 @@ pub struct JsonRpcError {
 
 const JSONRPC_VERSION: &str = "2.0";
 
+fn is_hid_method(method: &str) -> bool {
+    matches!(
+        method,
+        "keyboardReport" | "absMouseReport" | "relMouseReport" | "wheelReport"
+    )
+}
 impl JsonRpcError {
     /// Parse error (-32700)
     pub fn parse_error() -> Self {
@@ -116,6 +126,19 @@ impl JsonRpcError {
     pub fn internal_error(data: Option<String>) -> Self {
         Self { code: -32603, message: "Internal error".to_string(), data: data.map(Value::String) }
     }
+
+    /// Application error (-32001) with structured `data.code` (e.g. controlDenied).
+    pub fn application_error(code: &str, message: String, data: Option<Value>) -> Self {
+        let data = match data {
+            Some(Value::Object(mut map)) => {
+                map.insert("code".into(), Value::String(code.to_string()));
+                Some(Value::Object(map))
+            }
+            Some(other) => Some(serde_json::json!({ "code": code, "detail": other })),
+            None => Some(serde_json::json!({ "code": code })),
+        };
+        Self { code: -32001, message, data }
+    }
 }
 
 /// Build an error response; reduces duplicate Response construction in handle_message
@@ -128,8 +151,12 @@ pub trait RpcHandler: Send + Sync {
     /// Execute RPC method
     fn call(&self, params: Option<Value>) -> Result<Value>;
 
-    /// Execute RPC method asynchronously
-    fn call_async(&self, params: Option<Value>) -> BoxFuture<'_, Result<Value>>;
+    /// Execute RPC method asynchronously; `session_id` is the initiating peer session.
+    fn call_async<'a>(
+        &'a self,
+        params: Option<Value>,
+        session_id: &'a str,
+    ) -> BoxFuture<'a, Result<Value>>;
 }
 
 /// Simple function handler
@@ -154,7 +181,11 @@ where
         (self.func)(params)
     }
 
-    fn call_async(&self, params: Option<Value>) -> BoxFuture<'_, Result<Value>> {
+    fn call_async<'a>(
+        &'a self,
+        params: Option<Value>,
+        _session_id: &'a str,
+    ) -> BoxFuture<'a, Result<Value>> {
         Box::pin(async move { self.call(params) })
     }
 }
@@ -210,7 +241,11 @@ where
         }
     }
 
-    fn call_async(&self, params: Option<Value>) -> BoxFuture<'_, Result<Value>> {
+    fn call_async<'a>(
+        &'a self,
+        params: Option<Value>,
+        _session_id: &'a str,
+    ) -> BoxFuture<'a, Result<Value>> {
         Box::pin(async move { self.call(params) })
     }
 }
@@ -258,7 +293,11 @@ where
         }
     }
 
-    fn call_async(&self, params: Option<Value>) -> BoxFuture<'_, Result<Value>> {
+    fn call_async<'a>(
+        &'a self,
+        params: Option<Value>,
+        _session_id: &'a str,
+    ) -> BoxFuture<'a, Result<Value>> {
         Box::pin(async move { self.call(params) })
     }
 }
@@ -286,8 +325,46 @@ where
         })
     }
 
-    fn call_async(&self, params: Option<Value>) -> BoxFuture<'_, Result<Value>> {
+    fn call_async<'a>(
+        &'a self,
+        params: Option<Value>,
+        _session_id: &'a str,
+    ) -> BoxFuture<'a, Result<Value>> {
         Box::pin(async move { (self.func)(params).await })
+    }
+}
+
+/// Async handler that also receives the initiating session_id.
+pub struct AsyncSessionHandler<F> {
+    func: F,
+}
+
+impl<F> AsyncSessionHandler<F>
+where
+    F: Fn(Option<Value>, String) -> BoxFuture<'static, Result<Value>> + Send + Sync + 'static,
+{
+    pub fn new(func: F) -> Self {
+        Self { func }
+    }
+}
+
+impl<F> RpcHandler for AsyncSessionHandler<F>
+where
+    F: Fn(Option<Value>, String) -> BoxFuture<'static, Result<Value>> + Send + Sync + 'static,
+{
+    fn call(&self, params: Option<Value>) -> Result<Value> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on((self.func)(params, String::new()))
+        })
+    }
+
+    fn call_async<'a>(
+        &'a self,
+        params: Option<Value>,
+        session_id: &'a str,
+    ) -> BoxFuture<'a, Result<Value>> {
+        let session_id = session_id.to_string();
+        Box::pin(async move { (self.func)(params, session_id).await })
     }
 }
 
@@ -521,6 +598,14 @@ impl RpcRegistry {
     {
         self.register(method, AsyncHandler::new(func));
     }
+
+    /// Register asynchronous handler that receives the initiating session_id
+    pub fn register_async_with_session<F>(&mut self, method: &str, func: F)
+    where
+        F: Fn(Option<Value>, String) -> BoxFuture<'static, Result<Value>> + Send + Sync + 'static,
+    {
+        self.register(method, AsyncSessionHandler::new(func));
+    }
 }
 
 impl Default for RpcRegistry {
@@ -541,7 +626,12 @@ impl JsonRpcProcessor {
     }
 
     /// Handle JSON-RPC message
-    pub async fn handle_message(&self, message: DataChannelMessage, channel: Arc<RTCDataChannel>) {
+    pub async fn handle_message(
+        &self,
+        message: RTCDataChannelMessage,
+        channel: Arc<dyn DataChannel>,
+        session_id: String,
+    ) {
         let request: JsonRpcRequest = match serde_json::from_slice(message.data.as_ref()) {
             Ok(req) => req,
             Err(e) => {
@@ -556,6 +646,24 @@ impl JsonRpcProcessor {
             }
         };
         info!("RPC handle_message request: {:?}", request);
+
+        if is_hid_method(&request.method)
+            && !crate::control_lease::allows_hid(&session_id).await
+        {
+            crate::control_lease::note_hid_denied();
+            if request.id.is_some() {
+                let err = JsonRpcError::application_error(
+                    crate::control_lease::CONTROL_DENIED,
+                    "HID blocked: session does not hold control".into(),
+                    None,
+                );
+                if let Err(e) = self.send_response(&error_response(err, request.id), &channel).await {
+                    error!("Failed to send controlDenied response: {}", e);
+                }
+            }
+            return;
+        }
+
         let handler = match self.registry.get_handler(&request.method) {
             Some(h) => h,
             None => {
@@ -573,7 +681,9 @@ impl JsonRpcProcessor {
             }
         };
 
-        match handler.call_async(request.params).await {
+        let result = handler.call_async(request.params, session_id.as_str()).await;
+
+        match result {
             Ok(result) => {
                 // JSON-RPC 2.0: notification (no id) must not get a response — saves ~60 serializations+sends/sec for input_unstable
                 if request.id.is_some() {
@@ -591,15 +701,17 @@ impl JsonRpcProcessor {
             Err(e) => {
                 error!("RPC handler requested method '{}' error: {}", request.method, e);
                 if request.id.is_some() {
-                    if let Err(e) = self
-                        .send_response(
-                            &error_response(
-                                JsonRpcError::internal_error(Some(e.to_string())),
-                                request.id,
-                            ),
-                            &channel,
-                        )
-                        .await
+                    let rpc_err = if let Some(data) = crate::control_lease::control_error_data(&e) {
+                        let code = data
+                            .get("code")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("controlError")
+                            .to_string();
+                        JsonRpcError::application_error(&code, e.to_string(), Some(data))
+                    } else {
+                        JsonRpcError::internal_error(Some(e.to_string()))
+                    };
+                    if let Err(e) = self.send_response(&error_response(rpc_err, request.id), &channel).await
                     {
                         error!("Failed to send error response: {}", e);
                     }
@@ -609,7 +721,7 @@ impl JsonRpcProcessor {
     }
 
     /// Handle JSON-RPC message
-    pub async fn handle_input_message(&self, message: DataChannelMessage) {
+    pub async fn handle_input_message(&self, message: RTCDataChannelMessage, session_id: String) {
         let request: JsonRpcRequest = match serde_json::from_slice(message.data.as_ref()) {
             Ok(req) => req,
             Err(e) => {
@@ -617,6 +729,13 @@ impl JsonRpcProcessor {
                 return;
             }
         };
+
+        if is_hid_method(&request.method)
+            && !crate::control_lease::allows_hid(&session_id).await
+        {
+            crate::control_lease::note_hid_denied();
+            return;
+        }
 
         let handler = match self.registry.get_handler(&request.method) {
             Some(h) => h,
@@ -626,7 +745,7 @@ impl JsonRpcProcessor {
             }
         };
 
-        if let Err(e) = handler.call_async(request.params).await {
+        if let Err(e) = handler.call_async(request.params, session_id.as_str()).await {
             error!("RPC input handler requested method '{}' error: {}", request.method, e);
         }
     }
@@ -635,12 +754,12 @@ impl JsonRpcProcessor {
     async fn send_response(
         &self,
         response: &JsonRpcResponse,
-        channel: &Arc<RTCDataChannel>,
+        channel: &Arc<dyn DataChannel>,
     ) -> Result<()> {
         let message_bytes = serde_json::to_vec(response)?;
         trace!("Sending JSON-RPC response: {} bytes", message_bytes.len());
 
-        if let Err(e) = channel.send(&message_bytes.into()).await {
+        if let Err(e) = channel.send(BytesMut::from(message_bytes.as_slice())).await {
             return Err(anyhow!("Failed to send RPC response: {}", e));
         }
         // } else {
@@ -669,7 +788,7 @@ impl JsonRpcProcessor {
         // before awaiting send(), avoiding lock-holding across await.
         let rpc_channel = session.rpc_channel.read().await.clone();
         if let Some(rpc_channel) = rpc_channel {
-            if let Err(e) = rpc_channel.send(&message_bytes.into()).await {
+            if let Err(e) = rpc_channel.send(BytesMut::from(message_bytes.as_slice())).await {
                 return Err(anyhow!("Failed to send RPC event: {}", e));
             }
         } else {
@@ -689,7 +808,7 @@ pub mod handlers {
     use serde_json::json;
     use tokio::time::Duration;
     use uuid::Uuid;
-    use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+    use webrtc::data_channel::RTCDataChannelInit;
 
     use super::*;
     use crate::cloud::CloudManager;
@@ -699,14 +818,18 @@ pub mod handlers {
     use crate::hardware::usb::storage::{
         self as storage_mod, FileTransferState, FileTransferTarget,
     };
-    use crate::module::rtc_request_params::{LocalFileDownloadParams, SshKeyParam, TailscaleParams};
+    use crate::module::rtc_request_params::{
+        LocalFileDownloadParams, SshKeyParam, TailscaleParams,
+    };
     use crate::module::rtc_response_params::{GuiSettingsResponse, StartDownloadResponse};
     use crate::network::{self, NetworkInterfaceState, RpcIPv6Address, RpcNetworkState};
-    use crate::services::local_file::{
-        self, ByteRange, DataChannelBackpressure,
-    };
+    use crate::services::local_file::{self, ByteRange, DataChannelBackpressure};
     use crate::web::get_global_app_state;
     use crate::{audio, config, jiggler, ota, plugin, zenoh_bus};
+
+    /// How long a device-initiated download channel may take to reach `Open`
+    /// before the transfer is abandoned (and logged).
+    const DC_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
     static USB_STATE: once_cell::sync::OnceCell<RwLock<String>> = once_cell::sync::OnceCell::new();
     static KEYBOARD_LED: once_cell::sync::OnceCell<RwLock<HidKeyboardState>> =
@@ -768,7 +891,13 @@ pub mod handlers {
         let default_config = crate::config::types::Config::default();
 
         // disable microphone emulation
-        handlers::set_microphone_emulation(SettingSwitchParams { enabled: default_config.microphone_emulation.unwrap_or(false) }).await?;
+        handlers::set_microphone_emulation(SettingSwitchParams {
+            enabled: default_config.microphone_emulation.unwrap_or(false),
+        })
+        .await?;
+
+        // MCP / SSH Forwarding off first (cascades NIC off so setUsbDevices can use default NIC=false)
+        handlers::set_mcp_enabled(SettingSwitchParams { enabled: false }).await?;
 
         // reset usb devices to default
         handlers::set_usb_devices(SetUsbDevicesParams {
@@ -778,9 +907,13 @@ pub mod handlers {
                 keyboard: default_config.usb_devices.keyboard,
                 mass_storage: default_config.usb_devices.mass_storage_vm,
                 microphone: default_config.usb_devices.microphone,
+                network_adapter: default_config.usb_devices.network_adapter.clone(),
             },
         })
         .await?;
+
+        // reset USB max_speed to high-speed (force_full_speed off)
+        handlers::set_usb_full_speed(SettingSwitchParams { enabled: false }).await?;
 
         config_manager
             .update(|cfg| {
@@ -797,11 +930,13 @@ pub mod handlers {
                 cfg.local_auth_mode = default_config.local_auth_mode;
                 cfg.hashed_password = default_config.hashed_password;
                 cfg.cloud_token = default_config.cloud_token;
-                cfg.google_identity = default_config.google_identity;
+                cfg.owner_user_id = default_config.owner_user_id;
                 cfg.local_auth_token = default_config.local_auth_token;
                 cfg.dev_channel_enabled = default_config.dev_channel_enabled;
                 cfg.local_loopback_only = default_config.local_loopback_only;
                 cfg.microphone_emulation = default_config.microphone_emulation;
+                cfg.mcp_enabled = default_config.mcp_enabled;
+                cfg.ssh_forwarding_enabled = default_config.ssh_forwarding_enabled;
                 cfg.virtual_media_list = default_config.virtual_media_list;
                 cfg.file_transfer_target = default_config.file_transfer_target;
                 // TODO: Video Quality, Audio Quality, Device Display, HTTPS mode, Troubleshooting mode;
@@ -821,11 +956,7 @@ pub mod handlers {
     }
 
     pub async fn factory_reset() -> Result<Value> {
-        for path in [
-            config::CONFIG_DIR,
-            network::ssh::SSH_KEY_DIR,
-            ota::OTA_PACKAGE_ROOT_PATH,
-        ] {
+        for path in [config::CONFIG_DIR, network::ssh::SSH_KEY_DIR, ota::OTA_PACKAGE_ROOT_PATH] {
             match tokio::fs::remove_dir_all(path).await {
                 Ok(()) => info!("factory_reset: removed {path}"),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -982,10 +1113,28 @@ pub mod handlers {
     pub struct SendWOLMagicPacketParams {
         #[serde(rename = "macAddress")]
         pub mac_address: String,
+        #[serde(default, rename = "broadcastAddress")]
+        pub broadcast_address: Option<String>,
+        #[serde(default)]
+        pub port: Option<u16>,
     }
 
     pub async fn send_wol_magic_packet(params: SendWOLMagicPacketParams) -> Result<Value> {
-        crate::wol::send_magic_packet(&params.mac_address).await?;
+        let mgr = get_config_manager();
+        let cfg = mgr.get().await;
+        let stored = cfg
+            .wake_on_lan_devices
+            .iter()
+            .find(|d| d.mac_address.eq_ignore_ascii_case(&params.mac_address));
+
+        let (broadcast_address, port) = crate::wol::resolve_wol_send_target(
+            params.broadcast_address.as_deref(),
+            params.port,
+            stored.map(|d| d.broadcast_address.as_str()),
+            stored.map(|d| d.port),
+        );
+
+        crate::wol::send_magic_packet(&params.mac_address, &broadcast_address, port).await?;
         Ok(Value::Null)
     }
 
@@ -1103,8 +1252,11 @@ pub mod handlers {
         if params.force {
             cmd.arg("-f");
         }
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
 
-        match cmd.spawn() {
+        match crate::process_spawn::spawn_std(cmd) {
             Ok(_) => {
                 tokio::spawn(async {
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -1441,6 +1593,8 @@ pub mod handlers {
         pub keyboard: bool,
         pub mass_storage: bool,
         pub microphone: bool,
+        #[serde(default)]
+        pub network_adapter: crate::config::types::NetworkAdapter,
     }
 
     /// Frontend `setUsbDevices` payload: `{ "devices": { ... } }`
@@ -1509,6 +1663,11 @@ pub mod handlers {
     pub async fn set_microphone_emulation(params: SettingSwitchParams) -> Result<Value> {
         info!(enabled = params.enabled, "jsonrpc set_microphone_emulation request");
         if params.enabled {
+            if get_config_manager().get_ssh_forwarding_enabled().await {
+                return Err(anyhow!(
+                    "ssh_forwarding_active: microphone emulation is unavailable while SSH Forwarding is on"
+                ));
+            }
             let devices = get_config_manager().get_usb_devices().await;
             if !devices.microphone {
                 return Err(anyhow!("microphone device is not enabled"));
@@ -1681,9 +1840,22 @@ pub mod handlers {
             keyboard = state.keyboard,
             mass_storage = state.mass_storage,
             microphone = state.microphone,
+            network_adapter_enable = state.network_adapter.enable,
+            network_adapter_type = ?state.network_adapter.adapter_type,
             "jsonrpc set_usb_devices request"
         );
-        let mut devices = get_config_manager().get_usb_devices().await;
+        let config = get_config_manager();
+        let ssh = config.get_ssh_forwarding_enabled().await;
+        if state.network_adapter.enable != ssh {
+            return Err(anyhow!(
+                "network_adapter_locked: USB virtual NIC is controlled by SSH Forwarding \
+                 (ssh_forwarding={}, requested enable={})",
+                ssh,
+                state.network_adapter.enable
+            ));
+        }
+
+        let mut devices = config.get_usb_devices().await;
 
         devices.absolute_mouse = state.absolute_mouse;
         devices.keyboard = state.keyboard;
@@ -1691,18 +1863,35 @@ pub mod handlers {
         devices.mass_storage_vm = state.mass_storage;
         devices.mass_storage_ft = state.mass_storage;
         devices.microphone = state.microphone;
+        devices.network_adapter = state.network_adapter;
 
-        // devices.camera = state.camera;
-        // Legacy API only exposes one mass-storage flag; do not mirror it onto FT.
-
-        info!("set_usb_devices -> apply sidecar: {:?}", devices);
-        if let Err(e) =
-            usb_mod::reboot_usb_manager_with_reason(None, Some(devices), "set_devices").await
-        {
+        // Persist preference, then apply with SSH overlay (keeps mouse/mic prefs).
+        config.set_usb_devices(&devices).await?;
+        if let Err(e) = usb_mod::mcp_ssh::reconcile_with_ssh_overlay("set_devices").await {
             error!(error = %e, "jsonrpc set_usb_devices failed");
             return Err(e);
         }
         info!("jsonrpc set_usb_devices success");
+        Ok(Value::Null)
+    }
+
+    pub async fn get_mcp_enabled() -> bool {
+        get_config_manager().get_mcp_enabled().await
+    }
+
+    pub async fn set_mcp_enabled(params: SettingSwitchParams) -> Result<Value> {
+        info!(enabled = params.enabled, "jsonrpc set_mcp_enabled");
+        usb_mod::mcp_ssh::set_mcp_enabled(params.enabled).await?;
+        Ok(Value::Null)
+    }
+
+    pub async fn get_ssh_forwarding() -> bool {
+        get_config_manager().get_ssh_forwarding_enabled().await
+    }
+
+    pub async fn set_ssh_forwarding(params: SettingSwitchParams) -> Result<Value> {
+        info!(enabled = params.enabled, "jsonrpc set_ssh_forwarding");
+        usb_mod::mcp_ssh::set_ssh_forwarding(params.enabled).await?;
         Ok(Value::Null)
     }
 
@@ -1712,6 +1901,21 @@ pub mod handlers {
 
     pub async fn set_usb_config(usb_config: UsbConfig) -> Result<Value> {
         usb_mod::reboot_usb_manager_with_reason(Some(usb_config), None, "set_config").await?;
+        Ok(Value::Null)
+    }
+
+    pub async fn get_usb_full_speed() -> bool {
+        crate::config::get_config_manager()
+            .get_usb_config()
+            .await
+            .force_full_speed
+    }
+
+    pub async fn set_usb_full_speed(params: SettingSwitchParams) -> Result<Value> {
+        info!(enabled = params.enabled, "jsonrpc set_usb_full_speed request");
+        let mut usb_config = crate::config::get_config_manager().get_usb_config().await;
+        usb_config.force_full_speed = params.enabled;
+        usb_mod::reboot_usb_manager_with_reason(Some(usb_config), None, "set_full_speed").await?;
         Ok(Value::Null)
     }
 
@@ -1982,9 +2186,14 @@ pub mod handlers {
         Ok(Value::Null)
     }
 
-    pub async fn download_ft_file(path: String, name: String, offset: u64) -> Result<Value> {
-        let Some(session) = get_global_app_state().get_current_session().await else {
-            return Err(anyhow!("Can not found current session"));
+    pub async fn download_ft_file(
+        path: String,
+        name: String,
+        offset: u64,
+        session_id: String,
+    ) -> Result<Value> {
+        let Some(session) = get_global_app_state().get_session_by_id(&session_id).await else {
+            return Err(anyhow!("Can not found session {}", session_id));
         };
 
         let file_path = format!("{}/{}", &path, &name).replace("//", "/");
@@ -2013,13 +2222,13 @@ pub mod handlers {
         let channel_clone = channel.clone();
         let bp_clone = backpressure.clone();
         info!("add open Listener on download task channel: {}", &channel_label);
-        channel.on_open(Box::new(move || {
+        let send_file: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
             let file_path = file_path_clone.clone();
             let path = path_clone.clone();
             let name = name_clone.clone();
             let channel = channel_clone.clone();
             let bp = bp_clone.clone();
-            Box::pin(async move {
+            tokio::spawn(async move {
                 info!("FT Download task loop started");
 
                 let mut reader = match storage_mod::fs_download_file(file_path.as_str()).await {
@@ -2055,7 +2264,7 @@ pub mod handlers {
                 })
                 .to_string();
 
-                if channel.send_text(info).await.is_err() {
+                if channel.send_text(&info).await.is_err() {
                     error!("FT Download failed to send header");
                     return;
                 }
@@ -2063,7 +2272,7 @@ pub mod handlers {
                 if length == 0 {
                     let _ = channel
                         .send_text(
-                            json!({
+                            &json!({
                                 "type": "file_finished",
                                 "path": &path,
                                 "name": &name,
@@ -2091,7 +2300,7 @@ pub mod handlers {
                         }
                     };
                     let chunk_len = data.len() as u64;
-                    if channel.send(&data.into()).await.is_err() {
+                    if channel.send(BytesMut::from(data.as_slice())).await.is_err() {
                         error!("FT Download send chunk error");
                         break;
                     }
@@ -2100,7 +2309,7 @@ pub mod handlers {
 
                 channel
                     .send_text(
-                        json!({
+                        &json!({
                             "type": "file_finished",
                             "path": &path,
                             "name": &name,
@@ -2114,22 +2323,40 @@ pub mod handlers {
                 if let Err(e) = reader.shutdown().await {
                     warn!("Failed to shutdown reader: {:?}", e);
                 }
-                info!("Download task finished channel: {}", &channel.label());
-            })
-        }));
+                let label = channel.label().await.unwrap_or_default();
+                info!("Download task finished channel: {}", label);
+            });
+        });
 
-        let channel_label_clone = channel.label().to_string().clone();
-        channel.on_close(Box::new(move || {
+        let channel_label_clone = channel_label.clone();
+        let session_id_on_close = session_id.clone();
+        let on_close = Box::new(move || {
             let channel_label = channel_label_clone.clone();
-            Box::pin(async move {
-                let Some(session) = get_global_app_state().get_current_session().await else {
-                    warn!("Current Session not found");
+            let session_id = session_id_on_close.clone();
+            tokio::spawn(async move {
+                let Some(session) = get_global_app_state().get_session_by_id(&session_id).await
+                else {
+                    warn!("Session {} not found", session_id);
                     return;
                 };
                 session.remove_channel(&channel_label).await;
                 info!("Download task channel closed: {}", channel_label.as_str());
-            })
-        }));
+            });
+        });
+        spawn_dc_events(
+            channel.clone(),
+            DcCallbacks { on_close: Some(on_close), ..Default::default() },
+        );
+
+        // See `download_local_file`: `on_open` is not delivered for a channel created
+        // after the SCTP association is up, so gate the transfer on the channel state.
+        let start_channel = channel.clone();
+        tokio::spawn(async move {
+            match wait_dc_open(&start_channel, DC_OPEN_TIMEOUT).await {
+                Ok(()) => send_file(),
+                Err(e) => error!("FT Download channel never opened: {:?}", e),
+            }
+        });
 
         info!("Cache download task channel: {}", &channel_label);
         session.cache_channel(channel.clone()).await;
@@ -2147,9 +2374,42 @@ pub mod handlers {
         Ok(Value::Null)
     }
 
-    pub async fn download_local_file(path: String, offset: u64) -> Result<Value> {
-        let Some(session) = get_global_app_state().get_current_session().await else {
-            return Err(anyhow!("Can not found current session"));
+    pub async fn start_ip_forward(
+        params: crate::ip_forward::StartIpForwardParams,
+        session_id: String,
+    ) -> Result<Value> {
+        let Some(_session) = get_global_app_state().get_session_by_id(&session_id).await else {
+            return Err(anyhow!("Can not found session {}", session_id));
+        };
+        let resp = crate::ip_forward::start(session_id, params).await?;
+        Ok(serde_json::to_value(resp)?)
+    }
+
+    pub async fn get_usb_network_leases() -> Result<Value> {
+        let usb =
+            crate::services::get_usb().ok_or_else(|| anyhow!("USB service not initialized"))?;
+        let leases = usb.get_network_adapter_leases().await?;
+        let list: Vec<Value> = leases
+            .into_iter()
+            .map(|l| {
+                json!({
+                    "ip": l.ip,
+                    "mac": l.mac,
+                    "hostname": l.hostname,
+                    "expiresInSecs": l.expires_in_secs,
+                })
+            })
+            .collect();
+        Ok(Value::Array(list))
+    }
+
+    pub async fn download_local_file(
+        path: String,
+        offset: u64,
+        session_id: String,
+    ) -> Result<Value> {
+        let Some(session) = get_global_app_state().get_session_by_id(&session_id).await else {
+            return Err(anyhow!("Can not found session {}", session_id));
         };
 
         let info = local_file::get_local_file_info(&path).await?;
@@ -2170,12 +2430,12 @@ pub mod handlers {
         let channel_clone = channel.clone();
         let bp_clone = backpressure.clone();
 
-        channel.on_open(Box::new(move || {
+        let send_file: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
             let path = path_clone.clone();
             let name = name.clone();
             let channel = channel_clone.clone();
             let bp = bp_clone.clone();
-            Box::pin(async move {
+            tokio::spawn(async move {
                 let length = file_size.saturating_sub(offset);
                 let byte_range = if file_size == 0 {
                     ByteRange { start: 0, end: 0 }
@@ -2200,7 +2460,7 @@ pub mod handlers {
                 })
                 .to_string();
 
-                if channel.send_text(header).await.is_err() {
+                if channel.send_text(&header).await.is_err() {
                     error!("Local file download failed to send header");
                     return;
                 }
@@ -2208,7 +2468,7 @@ pub mod handlers {
                 if length == 0 {
                     let _ = channel
                         .send_text(
-                            json!({
+                            &json!({
                                 "type": "file_finished",
                                 "path": path,
                                 "name": name,
@@ -2221,14 +2481,14 @@ pub mod handlers {
                     return;
                 }
 
-                let mut reader = match local_file::open_local_file_reader(&path, Some(byte_range)).await
-                {
-                    Ok(reader) => reader,
-                    Err(e) => {
-                        error!("Local file download open reader error: {:?}", e);
-                        return;
-                    }
-                };
+                let mut reader =
+                    match local_file::open_local_file_reader(&path, Some(byte_range)).await {
+                        Ok(reader) => reader,
+                        Err(e) => {
+                            error!("Local file download open reader error: {:?}", e);
+                            return;
+                        }
+                    };
 
                 let mut bytes_sent = 0u64;
                 loop {
@@ -2244,7 +2504,7 @@ pub mod handlers {
                     };
 
                     let chunk_len = chunk.len() as u64;
-                    if channel.send(&chunk.into()).await.is_err() {
+                    if channel.send(BytesMut::from(chunk.as_slice())).await.is_err() {
                         error!("Local file download send error");
                         break;
                     }
@@ -2257,7 +2517,7 @@ pub mod handlers {
 
                 let _ = channel
                     .send_text(
-                        json!({
+                        &json!({
                             "type": "file_finished",
                             "path": path,
                             "name": name,
@@ -2267,21 +2527,47 @@ pub mod handlers {
                         .to_string(),
                     )
                     .await;
-            })
-        }));
 
-        let channel_label_clone = channel.label().to_string();
-        channel.on_close(Box::new(move || {
+                if bytes_sent < length {
+                    warn!("Local file download incomplete: {bytes_sent} of {length} bytes");
+                } else {
+                    info!("Local file download finished: {bytes_sent} bytes");
+                }
+            });
+        });
+
+        let channel_label_clone = channel_label.clone();
+        let session_id_on_close = session_id.clone();
+        let on_close = Box::new(move || {
             let channel_label = channel_label_clone.clone();
-            Box::pin(async move {
-                let Some(session) = get_global_app_state().get_current_session().await else {
-                    warn!("Current Session not found");
+            let session_id = session_id_on_close.clone();
+            tokio::spawn(async move {
+                let Some(session) = get_global_app_state().get_session_by_id(&session_id).await
+                else {
+                    warn!("Session {} not found", session_id);
                     return;
                 };
                 session.remove_channel(&channel_label).await;
                 info!("Local file download channel closed: {}", channel_label);
-            })
-        }));
+            });
+        });
+        // The `on_open` callback never fires for a channel created while the SCTP
+        // association is already established: webrtc 0.17 invoked it immediately when
+        // the channel was already `Open`, while rtc 0.20 only reports `OnOpen` for
+        // channels accepted from the peer or dialed by the SCTP connected procedure.
+        // Start the transfer off the channel state instead.
+        spawn_dc_events(
+            channel.clone(),
+            DcCallbacks { on_close: Some(on_close), ..Default::default() },
+        );
+
+        let start_channel = channel.clone();
+        tokio::spawn(async move {
+            match wait_dc_open(&start_channel, DC_OPEN_TIMEOUT).await {
+                Ok(()) => send_file(),
+                Err(e) => error!("Local file download channel never opened: {:?}", e),
+            }
+        });
 
         session.cache_channel(channel.clone()).await;
         Ok(serde_json::to_value(StartDownloadResponse { data_channel: channel_label })?)
@@ -2380,6 +2666,31 @@ pub mod handlers {
         Ok(StorageSpaceResponse { bytes_used: s.bytes_used, bytes_free: s.bytes_free })
     }
 
+    pub async fn get_storage_details() -> Result<Value> {
+        let d = storage_mod::get_storage_details().await?;
+        Ok(serde_json::to_value(d).expect("StorageDetails serialization failed"))
+    }
+
+    pub async fn clear_storage_logs() -> Result<Value> {
+        storage_mod::clear_storage_logs().await?;
+        Ok(Value::Null)
+    }
+
+    pub async fn clear_storage_images() -> Result<Value> {
+        storage_mod::clear_storage_images().await?;
+        Ok(Value::Null)
+    }
+
+    pub async fn get_ft_storage_details() -> Result<Value> {
+        let d = storage_mod::get_ft_storage_details().await?;
+        Ok(serde_json::to_value(d).expect("FT StorageDetails serialization failed"))
+    }
+
+    pub async fn clear_ft_user_files() -> Result<Value> {
+        storage_mod::clear_ft_user_files().await?;
+        Ok(Value::Null)
+    }
+
     #[derive(Deserialize)]
     pub struct MountBuiltInImageParams {
         pub filename: String,
@@ -2471,14 +2782,12 @@ pub mod handlers {
     }
 }
 
-/// Broadcast helpers to current session over RPC
+/// Broadcast helpers to the user-role session over RPC
 pub async fn broadcast_usb_state(state: String) {
     let _ = handlers::set_usb_state(state.clone());
-    if let Some(session) = get_global_app_state().get_current_session().await {
-        // let mut session = Session::new(session_id.clone());
-        // if let Some(rpc_channel) = get_rpc_channel(&session_id).await {
-        //     session.rpc_channel = Some(rpc_channel);
-        // }
+    if let Some(session) =
+        get_global_app_state().get_session_for_role(crate::session::SessionRole::User).await
+    {
         let params = serde_json::Value::String(state);
         if let Err(e) = PROCESSOR.send_event("usbState", Some(params), session).await {
             warn!("Failed to send usbState event: {}", e);
@@ -2488,11 +2797,9 @@ pub async fn broadcast_usb_state(state: String) {
 
 pub async fn broadcast_keyboard_led_state(state: HidKeyboardState) {
     let _ = handlers::set_keyboard_led_state(state);
-    if let Some(session) = get_global_app_state().get_current_session().await {
-        // let mut session = Session::new(session_id.clone());
-        // if let Some(rpc_channel) = get_rpc_channel(&session_id).await {
-        //     session.rpc_channel = Some(rpc_channel);
-        // }
+    if let Some(session) =
+        get_global_app_state().get_session_for_role(crate::session::SessionRole::User).await
+    {
         let params = serde_json::to_value(state).unwrap_or(serde_json::json!({}));
         if let Err(e) = PROCESSOR.send_event("keyboardLedState", Some(params), session).await {
             warn!("Failed to send keyboardLedState event: {}", e);
@@ -2516,11 +2823,9 @@ pub async fn broadcast_keyboard_led_state(state: HidKeyboardState) {
 // }
 
 pub async fn broadcast_atx_led_state(state: &ATXLedState) -> Result<()> {
-    if let Some(session) = get_global_app_state().get_current_session().await {
-        // let mut session = Session::new(session_id.clone());
-        // if let Some(rpc_channel) = get_rpc_channel(&session_id).await {
-        //     session.rpc_channel = Some(rpc_channel);
-        // }
+    if let Some(session) =
+        get_global_app_state().get_session_for_role(crate::session::SessionRole::User).await
+    {
         let params = serde_json::to_value(state).unwrap_or(serde_json::json!({}));
         if let Err(e) = PROCESSOR.send_event("atxState", Some(params), session).await {
             warn!("Failed to send atxState event: {:?}", e);
@@ -2532,16 +2837,13 @@ pub async fn broadcast_atx_led_state(state: &ATXLedState) -> Result<()> {
 }
 
 pub async fn broadcast_ota_state(state: OtaState) {
-    if let Some(session) = get_global_app_state().get_current_session().await {
-        // let mut session = Session::new(session_id.clone());
-        // if let Some(rpc_channel) = get_rpc_channel(&session_id).await {
-        //     session.rpc_channel = Some(rpc_channel);
-        // }
+    if let Some(session) =
+        get_global_app_state().get_session_for_role(crate::session::SessionRole::User).await
+    {
         let params = serde_json::to_value(&state).unwrap_or(serde_json::json!({}));
         if let Err(e) = PROCESSOR.send_event("otaState", Some(params), session).await {
             warn!("Failed to send OTA State event: {:?}", e);
         }
-        // info!("broadcast_ota_state Send OTA State: {:?}, finished", &state);
     }
 }
 
@@ -2674,6 +2976,41 @@ pub fn create_default_registry() -> RpcRegistry {
         })
     });
 
+    // Control lease (View vs Control arbitration)
+    registry.register_async_with_session("getControlState", |_params, _session_id| {
+        Box::pin(async move {
+            let state = crate::control_lease::get_control_state().await;
+            Ok(serde_json::to_value(state)?)
+        })
+    });
+    registry.register_async_with_session("requestControl", |_params, session_id| {
+        Box::pin(async move { crate::control_lease::request_control(&session_id).await })
+    });
+    registry.register_async_with_session("grantControl", |params, session_id| {
+        Box::pin(async move {
+            let request_id = params
+                .as_ref()
+                .and_then(|v| v.get("requestId"))
+                .and_then(|v| v.as_str());
+            crate::control_lease::grant_control(&session_id, request_id).await
+        })
+    });
+    registry.register_async_with_session("denyControl", |params, session_id| {
+        Box::pin(async move {
+            let request_id = params
+                .as_ref()
+                .and_then(|v| v.get("requestId"))
+                .and_then(|v| v.as_str());
+            crate::control_lease::deny_control(&session_id, request_id).await
+        })
+    });
+    registry.register_async_with_session("takeOverControl", |_params, session_id| {
+        Box::pin(async move { crate::control_lease::take_over_control(&session_id).await })
+    });
+    registry.register_async_with_session("releaseControl", |_params, session_id| {
+        Box::pin(async move { crate::control_lease::release_control(&session_id).await })
+    });
+
     // Keyboard layout
     registry.register_no_params("getKeyboardLayout", handlers::get_keyboard_layout);
     registry.register_typed("setKeyboardLayout", handlers::set_keyboard_layout);
@@ -2798,6 +3135,38 @@ pub fn create_default_registry() -> RpcRegistry {
             info!("Setting USB config: {:?}", &inner);
             let usb_config: UsbConfig = serde_json::from_value(inner)?;
             handlers::set_usb_config(usb_config).await
+        })
+    });
+
+    registry.register_async("getUsbFullSpeed", |_params| {
+        Box::pin(async move { Ok(serde_json::to_value(handlers::get_usb_full_speed().await)?) })
+    });
+    registry.register_async("setUsbFullSpeed", |params| {
+        Box::pin(async move {
+            let params: SettingSwitchParams =
+                serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
+            handlers::set_usb_full_speed(params).await
+        })
+    });
+
+    registry.register_async("getMcpEnabled", |_params| {
+        Box::pin(async move { Ok(serde_json::to_value(handlers::get_mcp_enabled().await)?) })
+    });
+    registry.register_async("setMcpEnabled", |params| {
+        Box::pin(async move {
+            let params: SettingSwitchParams =
+                serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
+            handlers::set_mcp_enabled(params).await
+        })
+    });
+    registry.register_async("getSshForwarding", |_params| {
+        Box::pin(async move { Ok(serde_json::to_value(handlers::get_ssh_forwarding().await)?) })
+    });
+    registry.register_async("setSshForwarding", |params| {
+        Box::pin(async move {
+            let params: SettingSwitchParams =
+                serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
+            handlers::set_ssh_forwarding(params).await
         })
     });
 
@@ -2972,9 +3341,9 @@ pub fn create_default_registry() -> RpcRegistry {
     registry.register_no_params("getVirtualMediaState", handlers::get_virtual_media_state);
 
     registry.register_async("getVirtualMediaList", |_params| {
-        Box::pin(async move {
-            Ok(serde_json::to_value(handlers::get_virtual_media_list().await?)?)
-        })
+        Box::pin(
+            async move { Ok(serde_json::to_value(handlers::get_virtual_media_list().await?)?) },
+        )
     });
     registry.register_async("addVirtualMediaItem", |params| {
         Box::pin(async move {
@@ -2996,7 +3365,7 @@ pub fn create_default_registry() -> RpcRegistry {
         Box::pin(async move {
             let params: VirtualMediaListParams =
                 serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
-                handlers::update_virtual_media_list(params).await?;
+            handlers::update_virtual_media_list(params).await?;
             Ok(Value::Null)
         })
     });
@@ -3106,11 +3475,12 @@ pub fn create_default_registry() -> RpcRegistry {
         })
     });
 
-    registry.register_async("startFtFsDownload", |params| {
+    // startFtFsDownload / startLocalFileDownload — session_id from DataChannel initiator
+    registry.register_async_with_session("startFtFsDownload", |params, session_id| {
         Box::pin(async move {
             let params: FtFileDownloadParams =
                 serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
-            handlers::download_ft_file(params.path, params.name, params.offset).await
+            handlers::download_ft_file(params.path, params.name, params.offset, session_id).await
         })
     });
 
@@ -3172,6 +3542,26 @@ pub fn create_default_registry() -> RpcRegistry {
             let result = handlers::get_storage_space().await?;
             Ok(serde_json::to_value(result)?)
         })
+    });
+
+    registry.register_async("getStorageDetails", |_params| {
+        Box::pin(async move { handlers::get_storage_details().await })
+    });
+
+    registry.register_async("clearStorageLogs", |_params| {
+        Box::pin(async move { handlers::clear_storage_logs().await })
+    });
+
+    registry.register_async("clearStorageImages", |_params| {
+        Box::pin(async move { handlers::clear_storage_images().await })
+    });
+
+    registry.register_async("getFtStorageDetails", |_params| {
+        Box::pin(async move { handlers::get_ft_storage_details().await })
+    });
+
+    registry.register_async("clearFtUserFiles", |_params| {
+        Box::pin(async move { handlers::clear_ft_user_files().await })
     });
 
     registry.register_async("mountBuiltInImage", |params| {
@@ -3278,9 +3668,9 @@ pub fn create_default_registry() -> RpcRegistry {
     });
 
     registry.register_async("collectEvidence", |_params| {
-        Box::pin(async move {
-            Ok(serde_json::to_value(crate::common::log::collect_evidence().await?)?)
-         })
+        Box::pin(
+            async move { Ok(serde_json::to_value(crate::common::log::collect_evidence().await?)?) },
+        )
     });
 
     registry.register_async("getLocalFileInfo", |params| {
@@ -3291,12 +3681,24 @@ pub fn create_default_registry() -> RpcRegistry {
         })
     });
 
-    registry.register_async("startLocalFileDownload", |params| {
+    registry.register_async_with_session("startLocalFileDownload", |params, session_id| {
         Box::pin(async move {
             let params: LocalFileDownloadParams =
                 serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
-            handlers::download_local_file(params.path, params.offset).await
+            handlers::download_local_file(params.path, params.offset, session_id).await
         })
+    });
+
+    registry.register_async_with_session("startIpForward", |params, session_id| {
+        Box::pin(async move {
+            let params: crate::ip_forward::StartIpForwardParams =
+                serde_json::from_value(params.ok_or(anyhow!("Missing required parameters"))?)?;
+            handlers::start_ip_forward(params, session_id).await
+        })
+    });
+
+    registry.register_async("getUsbNetworkLeases", |_params| {
+        Box::pin(async move { handlers::get_usb_network_leases().await })
     });
 
     registry.register_async("deleteCollectedEvidence", |params| {

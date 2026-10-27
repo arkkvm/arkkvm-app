@@ -80,13 +80,22 @@ pub async fn reset_network_to_factory() -> Result<()> {
     let defaults = NetworkConfig::default();
     let old = get_config_manager().get().await.network_config.clone();
 
-    get_cloud_manager().reconnect_after_network_change().await;
-
-    apply_non_l3_settings(Some(&old), &defaults).await?;
-    network_conf::write_network_conf(NETWORK_CONF, &defaults, "committed").await?;
-    network_conf::remove_pending().await?;
-    nwu_bridge::vlan_cleanup_pending().await?;
-    nwu_bridge::refresh_committed(None).await?;
+    // Suspend cloud reconnects until the refresh below has actually applied
+    // the factory networking; reconnecting mid-refresh would bind the new WS
+    // to the address that is about to be replaced (zombie connection).
+    let transition = get_cloud_manager().begin_network_transition().await;
+    let apply_result = (async {
+        apply_non_l3_settings(Some(&old), &defaults).await?;
+        network_conf::write_network_conf(NETWORK_CONF, &defaults, "committed").await?;
+        network_conf::remove_pending().await?;
+        nwu_bridge::vlan_cleanup_pending().await?;
+        nwu_bridge::refresh_committed(None).await
+    })
+    .await;
+    // Always release the gate, even on failure: the pre-existing network is
+    // still in place then, and the cloud loop should reconnect onto it.
+    get_cloud_manager().end_network_transition(transition).await;
+    apply_result?;
 
     get_config_manager()
         .update(|config| {
@@ -194,10 +203,20 @@ async fn apply_flat_network(config: &NetworkConfig) -> Result<()> {
     validate_flat_ipv4(config)?;
     validate_flat_ipv6(config)?;
 
-    get_cloud_manager().reconnect_after_network_change().await;
+    // Suspend cloud reconnects until the refresh below has actually applied
+    // the new L3 config; reconnecting mid-refresh would bind the new WS to
+    // the address that is about to be replaced (zombie connection).
+    let transition = get_cloud_manager().begin_network_transition().await;
+    let apply_result = (async {
+        network_conf::write_network_conf(NETWORK_CONF, config, "committed").await?;
+        nwu_bridge::refresh_committed(None).await
+    })
+    .await;
+    // Always release the gate, even on failure: the pre-existing network is
+    // still in place then, and the cloud loop should reconnect onto it.
+    get_cloud_manager().end_network_transition(transition).await;
+    apply_result?;
 
-    network_conf::write_network_conf(NETWORK_CONF, config, "committed").await?;
-    nwu_bridge::refresh_committed(None).await?;
     mdns::schedule_refresh_for_network_channels();
     Ok(())
 }
